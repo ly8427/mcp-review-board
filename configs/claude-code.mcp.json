@@ -1,0 +1,9 @@
+{
+  "_comment": "Claude Code (inside WSL). Save this AS '.mcp.json' at the ROOT of the project Claude Code is opened in. localhost works because WSL2 is in mirrored networking mode. CLI equivalent: claude mcp add --transport http --scope project review-board http://localhost:8765/mcp",
+  "mcpServers": {
+    "review-board": {
+      "type": "http",
+      "url": "http://localhost:8765/mcp"
+    }
+  }
+}

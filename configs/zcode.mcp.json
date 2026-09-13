@@ -1,0 +1,12 @@
+{
+  "_comment": "ZCode (Windows). Merge this 'mcp' block into %USERPROFILE%\\.zcode\\cli\\config.json at the TOP LEVEL (alongside your existing provider/model/plugins keys). ZCode silently drops a server on any UNKNOWN key, so use ONLY type/url/timeoutMs — no 'transport', no 'command'.",
+  "mcp": {
+    "servers": {
+      "review-board": {
+        "type": "http",
+        "url": "http://localhost:8765/mcp",
+        "timeoutMs": 60000
+      }
+    }
+  }
+}

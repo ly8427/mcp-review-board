@@ -1,0 +1,11 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime data (SQLite db auto-created on first start)
+data/
+
+# OS noise
+Thumbs.db
+.DS_Store

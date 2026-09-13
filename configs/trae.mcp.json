@@ -1,0 +1,10 @@
+{
+  "_comment": "Trae CN (Windows). Save this AS '.trae/mcp.json' at the ROOT of the project Trae is opened in. GOTCHAS: (1) 'mcpServers' is an ARRAY of {name,type,url} here, NOT an object keyed by name like Claude/ZCode. (2) type MUST be camelCase 'streamableHttp' — a hyphenated 'streamable-http' or wrong value makes Trae silently drop the ENTIRE file. If the server's tools don't appear in Trae, first try type 'http' as a fallback.",
+  "mcpServers": [
+    {
+      "name": "review-board",
+      "type": "streamableHttp",
+      "url": "http://localhost:8765/mcp"
+    }
+  ]
+}
