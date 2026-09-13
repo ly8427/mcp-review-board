@@ -1,0 +1,24 @@
+# systemd user service for the MCP Review Board server (WSL side).
+# Install:
+#   cp review-board.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now review-board.service
+# Manage:
+#   systemctl --user status|restart|stop review-board.service
+#
+# The server then stays up for the whole WSL lifetime (survives ZCode
+# restarts, terminal closes, etc.). Requires /etc/wsl.conf [boot] systemd=true
+# (already set on this machine's Ubuntu-24.04).
+
+[Unit]
+Description=MCP Review Board server (shared review board for ZCode/Claude/Trae)
+After=network.target
+
+[Service]
+WorkingDirectory=<REPO_ROOT>
+ExecStart=<REPO_ROOT>/.venv/bin/python <REPO_ROOT>/server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

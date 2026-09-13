@@ -12,19 +12,30 @@
 
 ---
 
-## 启动(在 WSL 里)
+## 启动
 
+### 常驻方式(推荐,已配置)
+server 已装成 WSL 的 **systemd user service**(见 `systemd/review-board.service`)。WSL 活着,server 就活着——不怕终端关闭、ZCode 重启、会话结束。
+
+```bash
+systemctl --user status review-board    # 看状态
+systemctl --user restart review-board   # 改代码后重启
+systemctl --user stop review-board      # 停
+```
+(本机已 `enable --now`,WSL 启动自动跑。前提:`/etc/wsl.conf` 有 `[boot] systemd=true`,已确认。)
+
+⚠️ **唯一注意**:WSL 本身没跑的话 server 自然不通。Windows 重启后第一次用之前,开一下 WSL 终端或随便跑一条 `wsl.exe` 命令即可(你用 Claude Code 时 WSL 必然活着,日常无感)。
+
+### 手动方式(调试用)
 ```bash
 cd <REPO_ROOT>
 ./run.sh
 ```
-首次会自动用项目内 `.venv` 装 `fastmcp`(已装好)。看到 `Uvicorn running on http://127.0.0.1:8765` 就 OK。
+前台跑,看实时日志,Ctrl+C 停。
 
 **自检**:
 - 浏览器开 `http://localhost:8765/` → 看到"📋 MCP Review Board"看板(空)
 - `curl http://localhost:8765/mcp` → 返回 406(正常,MCP 端点拒绝裸 GET)
-
-Server 一直跑着就行,三个工具各自连接。
 
 ## 三工具配置
 
