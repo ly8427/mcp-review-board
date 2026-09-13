@@ -32,11 +32,16 @@ from starlette.responses import HTMLResponse
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
-DB_PATH = DATA_DIR / "reviewboard.db"
+DB_PATH = Path(os.environ.get("REVIEWBOARD_DB", str(DATA_DIR / "reviewboard.db")))
 SCHEMA_PATH = BASE_DIR / "schema.sql"
 
 HOST = os.environ.get("REVIEWBOARD_HOST", "127.0.0.1")
 PORT = int(os.environ.get("REVIEWBOARD_PORT", "8765"))
+
+# Hard discussion cap: total comments (posts + replies) per thread. Enforced in
+# post_comment / reply_comment — a full thread rejects new posts and tells the
+# agent to conclude with set_status. Set REVIEWBOARD_THREAD_CAP to override (tests).
+THREAD_CAP = int(os.environ.get("REVIEWBOARD_THREAD_CAP", "100"))
 
 VALID_STATUSES = ("open", "resolved", "wontfix")
 VALID_SEVERITIES = ("info", "minor", "major", "blocker")
@@ -105,6 +110,9 @@ def post_comment(
 ) -> str:
     """Post a top-level review comment in a thread.
 
+    DISCUSSION CAP: threads hold at most 100 comments total (posts + replies).
+    Posting into a full thread is rejected — conclude with set_status instead.
+
     Args:
         thread_id: the thread to comment on (from create_thread / list_threads).
         author: who is commenting — use your own tool name: 'zcode' | 'claude' | 'trae'.
@@ -120,6 +128,15 @@ def post_comment(
     with db() as conn:
         if conn.execute("SELECT 1 FROM threads WHERE id=?", (thread_id,)).fetchone() is None:
             return f"ERROR: thread #{thread_id} does not exist"
+        n = conn.execute(
+            "SELECT COUNT(*) FROM comments WHERE thread_id=?", (thread_id,)
+        ).fetchone()[0]
+        if n >= THREAD_CAP:
+            return (
+                f"ERROR: thread #{thread_id} is locked — discussion cap reached "
+                f"({THREAD_CAP} comments). No further posts or replies accepted. "
+                f"Conclude the discussion with set_status(thread_id, 'resolved' or 'wontfix')."
+            )
         cur = conn.execute(
             """INSERT INTO comments(thread_id, parent_id, author, body, file, line, severity)
                VALUES (?, NULL, ?, ?, ?, ?, ?)""",
@@ -137,6 +154,9 @@ def post_comment(
 def reply_comment(comment_id: int, author: str, body: str) -> str:
     """Reply to an existing comment (supports multi-level nesting via parent_id).
 
+    DISCUSSION CAP: threads hold at most 100 comments total (posts + replies).
+    Replying into a full thread is rejected — conclude with set_status instead.
+
     Args:
         comment_id: the comment being replied to.
         author: who is replying — your own tool name.
@@ -150,6 +170,15 @@ def reply_comment(comment_id: int, author: str, body: str) -> str:
         ).fetchone()
         if row is None:
             return f"ERROR: comment #{comment_id} does not exist"
+        n = conn.execute(
+            "SELECT COUNT(*) FROM comments WHERE thread_id=?", (row["thread_id"],)
+        ).fetchone()[0]
+        if n >= THREAD_CAP:
+            return (
+                f"ERROR: thread #{row['thread_id']} is locked — discussion cap reached "
+                f"({THREAD_CAP} comments). No further posts or replies accepted. "
+                f"Conclude the discussion with set_status(thread_id, 'resolved' or 'wontfix')."
+            )
         cur = conn.execute(
             """INSERT INTO comments(thread_id, parent_id, author, body)
                VALUES (?, ?, ?, ?)""",
@@ -221,7 +250,7 @@ def get_thread(thread_id: int) -> str:
 
     out = [
         f"Thread #{t['id']}: {t['title']}  [{t['status']}]",
-        f"  created: {t['created_at']}",
+        f"  created: {t['created_at']}   comments: {len(all_comments)}/{THREAD_CAP}",
     ]
     if t["context"]:
         out.append("  context:")

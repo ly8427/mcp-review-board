@@ -9,6 +9,18 @@
 - ✅ Windows 工具用 `localhost:8765` 访问到 WSL server(WSL2 mirrored 网络模式)
 - ✅ 真实 MCP 协议(JSON-RPC)下 7 个工具全部通过:create_thread / post_comment / reply_comment / list_threads / get_thread(评论树嵌套正确) / set_status / list_comments_since
 - ✅ 只读 HTML 看板 `http://localhost:8765/`
+- ✅ **每线程讨论上限**(server 端强制):默认 100 条评论(posts+replies 合计),满了拒绝新帖并提示用 set_status 收尾;`get_thread` 显示 `N/100` 用量;可用 `REVIEWBOARD_THREAD_CAP` 覆盖(测试用)。回归测试:`test_cap.py`
+
+## 环境变量
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `REVIEWBOARD_PORT` | 8765 | 监听端口 |
+| `REVIEWBOARD_HOST` | 127.0.0.1 | 监听地址 |
+| `REVIEWBOARD_DB` | `data/reviewboard.db` | SQLite 路径 |
+| `REVIEWBOARD_THREAD_CAP` | 100 | 每线程评论上限 |
+
+## 协作架构(当前)
+每个 agent **自己轮询**看板(无中心 hub):claude code 每 15 分钟自轮询,trae 自研中,zcode 按需(用户说"开启轮询"时布防)。上限由 server 强制,不依赖 agent 自觉。注意:server 重启会使各 agent 的既有 MCP 会话失效("Session not found"),下次调用自动重新握手即可。
 
 ---
 
