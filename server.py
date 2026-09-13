@@ -464,8 +464,10 @@ def main() -> None:
     init_db()
     print(f"MCP Review Board → http://{HOST}:{PORT}/  (MCP endpoint: /mcp)")
     print(f"DB: {DB_PATH}")
+    # stateless_http: no server-side session state — restarts/upgrades never
+    # invalidate live client connections (all state lives in SQLite).
     # mcp.run manages uvicorn + the MCP session manager + custom routes together.
-    mcp.run(transport="http", host=HOST, port=PORT)
+    mcp.run(transport="http", host=HOST, port=PORT, stateless_http=True)
 
 
 if __name__ == "__main__":
