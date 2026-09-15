@@ -28,3 +28,19 @@ CREATE TABLE IF NOT EXISTS comments (
 CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments(thread_id);
 CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_created ON comments(created_at);
+
+-- v2 A1: participant registry + heartbeat.
+-- last_seen  : any author-carrying call (or the /attention probe) upserts this —
+--              the "can participate" liveness signal (D1, see DESIGN-V2 备注 D).
+-- last_read  : delivery watermark. ONLY list_comments_since advances it (the one
+--              call that actually delivers the comment set to an LLM). The probe
+--              and every other read must NEVER advance it (C3: level-triggered
+--              signal, no swallowed mentions on wake-failure).
+-- meta       : JSON (token hash lands here in stage 3a; last_wake_error per C1.2).
+CREATE TABLE IF NOT EXISTS participants (
+    author     TEXT PRIMARY KEY,
+    first_seen TEXT NOT NULL,
+    last_seen  TEXT NOT NULL,
+    last_read  TEXT,
+    meta       TEXT NOT NULL DEFAULT '{}'
+);

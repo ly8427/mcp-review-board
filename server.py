@@ -17,6 +17,7 @@ Run:  python3 server.py      (WSL)
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -26,7 +27,7 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import HTMLResponse
+from starlette.responses import HTMLResponse, JSONResponse
 
 # --- paths -----------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
@@ -45,6 +46,137 @@ THREAD_CAP = int(os.environ.get("REVIEWBOARD_THREAD_CAP", "100"))
 
 VALID_STATUSES = ("open", "resolved", "wontfix")
 VALID_SEVERITIES = ("info", "minor", "major", "blocker")
+
+# v2 A1 liveness knobs. Display tier (⚠️ in list_participants / board) uses
+# DISPLAY_IDLE_MIN; the functional suspension threshold (24h, stage 3b) uses
+# SUSPEND_AFTER_HOURS. Both read the same last_seen via is_active() — one
+# shared pure function, no per-callsite drift (claude #52 条件:口径单点化).
+DISPLAY_IDLE_MIN = 30
+SUSPEND_AFTER_HOURS = 24
+
+
+# --- v2 A1: participant registry / heartbeat --------------------------------
+mcp = FastMCP("ReviewBoard")
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _touch(conn: sqlite3.Connection, author: str | None) -> None:
+    """Heartbeat: upsert last_seen (the D1 'can participate' signal).
+    Registering is free — any author-carrying call does it, polling included.
+    NEVER advances last_read (that is list_comments_since's exclusive job, C3)."""
+    if not author:
+        return
+    now = _now_iso()
+    cur = conn.execute(
+        "UPDATE participants SET last_seen=? WHERE author=?", (now, author)
+    )
+    if cur.rowcount == 0:
+        conn.execute(
+            "INSERT INTO participants(author, first_seen, last_seen, last_read, meta)"
+            " VALUES (?,?,?,NULL,'{}')",
+            (author, now, now),
+        )
+
+
+def _relative(utc: str) -> str:
+    """Duration-based display ('3 分钟前') — timezone-agnostic by construction."""
+    try:
+        then = datetime.strptime(utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return utc
+    secs = max(0, (datetime.now(timezone.utc) - then).total_seconds())
+    if secs < 60:
+        return f"{int(secs)} 秒前"
+    if secs < 3600:
+        return f"{int(secs // 60)} 分钟前"
+    if secs < 86400:
+        return f"{int(secs // 3600)} 小时前"
+    return f"{int(secs // 86400)} 天前"
+
+
+def _is_active(last_seen: str | None, now: datetime | None = None) -> bool:
+    """The one shared activity predicate (claude #52: 单点口径). Stage 1 uses it
+    for display; stage 3b wires it into every governance write path."""
+    if not last_seen:
+        return False
+    try:
+        then = datetime.strptime(last_seen, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    now = now or datetime.now(timezone.utc)
+    return (now - then).total_seconds() < SUSPEND_AFTER_HOURS * 3600
+
+
+# --- v2 A2: the protocol ----------------------------------------------------
+PROTOCOL_VERSION = "2.0-stage1"
+PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
+
+## 成员
+- 开放成员制:首次带 author 的调用即注册(轮询即可,无需发帖)。
+- 身份分两层:展示层(发帖/回复)零仪式;治理层(判定/改 quorum,阶段 3 上线)需 token。
+- 心跳语义 =「可参与性信号」(备注 D):LLM 调用与带失败闸门的 watcher 探针都续 last_seen;
+  连续 3 次唤醒失败后 watcher 停止心跳,成员自然衰减为暂缓(≥24h 无心跳)。
+- 暂缓 = 冻结计票参与(非清除),心跳恢复即自动复权。
+
+## 讨论帖
+- review 帖建议传 quorum(阶段 2 起生效)并在 context 写明对象/目的;发言表态后须落判定(阶段 3)。
+- 预算默认 20/人/线程(阶段 2 强制);线程总上限 {THREAD_CAP} 条。
+- resolved 帖不触发回应义务;非 quorum 发言 = advisory(可说服、不可计票)。
+- wontfix 为争议终态,仅人类可翻回。
+
+## 轮询契约(每个成员)
+- 轮询 = list_comments_since(author=自己, since="now")——游标决定窗口(恰好=全部未投递);
+  显式传更长的 since 可重读该窗口(union 语义:窗口 = since ∪ 未投递积压,永不漏)。
+  该调用是 last_read 游标的唯一推进者:游标 =「已投递给 LLM 的水位线」。
+  get_thread/探针/其它读取永不推进(C3)。
+- needs_attention 为空转时一句话终止,不读全帖;优先级 awaiting > mentions > new。
+- @点名是送达信号;被点名或被期待判定时应尽快回应(契约 (b) 成员由用户唤起,沉默不计超时)。
+"""
+
+
+@mcp.tool
+def get_protocol() -> str:
+    """Return the board protocol (versioned). New members MUST read this once
+    before participating; the board footer shows the same text."""
+    return PROTOCOL
+
+
+@mcp.tool
+def list_participants() -> str:
+    """List registered participants with liveness status.
+
+    Returns one line per participant: author, status (活跃/空闲/⚠️停摆 — display
+    tier, 30min idle threshold), last heartbeat (relative time), and any
+    last_wake_error from meta (watcher failure gate, C1.2) so a human can tell
+    'waiting for the member' from 'fix its watcher'.
+    """
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT author, first_seen, last_seen, meta FROM participants ORDER BY last_seen DESC"
+        ).fetchall()
+    if not rows:
+        return "No participants registered yet. Any author-carrying call registers."
+    lines = ["Participants:"]
+    for r in rows:
+        try:
+            meta = json.loads(r["meta"] or "{}")
+        except (ValueError, TypeError):
+            meta = {}
+        last = r["last_seen"]
+        try:
+            then = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            idle_secs = (datetime.now(timezone.utc) - then).total_seconds()
+        except ValueError:
+            idle_secs = float("inf")
+        status = "活跃" if idle_secs < DISPLAY_IDLE_MIN * 60 else "⚠️停摆"
+        extra = ""
+        if meta.get("last_wake_error"):
+            extra = f"  [wake-error: {meta['last_wake_error']}]"
+        lines.append(
+            f"  {r['author']} [{status}] heartbeat {_relative(last)} (first seen {_relative(r['first_seen'])}){extra}"
+        )
+    return "\n".join(lines)
 
 
 # --- db helpers ------------------------------------------------------------
@@ -74,10 +206,7 @@ def db():
         conn.close()
 
 
-# --- MCP server ------------------------------------------------------------
-mcp = FastMCP("ReviewBoard")
-
-
+# --- MCP tools ---------------------------------------------------------------
 @mcp.tool
 def create_thread(title: str, context: str | None = None) -> str:
     """Start a new review topic.
@@ -96,7 +225,10 @@ def create_thread(title: str, context: str | None = None) -> str:
             (title, context),
         )
         tid = cur.lastrowid
-    return f"Created thread #{tid}: {title}\nShare this id with the other reviewers."
+    return (
+        f"Created thread #{tid}: {title}\n"
+        f"Share this id with the other reviewers. New members: read get_protocol first."
+    )
 
 
 @mcp.tool
@@ -126,6 +258,7 @@ def post_comment(
     if severity is not None and severity not in VALID_SEVERITIES:
         return f"ERROR: severity must be one of {VALID_SEVERITIES}, got {severity!r}"
     with db() as conn:
+        _touch(conn, author)
         if conn.execute("SELECT 1 FROM threads WHERE id=?", (thread_id,)).fetchone() is None:
             return f"ERROR: thread #{thread_id} does not exist"
         n = conn.execute(
@@ -165,6 +298,7 @@ def reply_comment(comment_id: int, author: str, body: str) -> str:
     Returns: the new reply comment id.
     """
     with db() as conn:
+        _touch(conn, author)
         row = conn.execute(
             "SELECT id, thread_id FROM comments WHERE id=?", (comment_id,)
         ).fetchone()
@@ -303,6 +437,7 @@ def set_status(
     if (thread_id is None) == (comment_id is None):
         return "ERROR: pass exactly one of thread_id or comment_id"
     with db() as conn:
+        _touch(conn, author)
         if thread_id is not None:
             cur = conn.execute("UPDATE threads SET status=? WHERE id=?", (status, thread_id))
             if cur.rowcount == 0:
@@ -336,18 +471,39 @@ def _parse_since(since: str) -> str:
 
 
 @mcp.tool
-def list_comments_since(since: str = "1h") -> str:
-    """List comments posted after a given time — lets an agent poll for "what
-    did the OTHER agents say since I last looked".
+def list_comments_since(since: str = "1h", author: str | None = None) -> str:
+    """Poll for new comments — the ONE call that advances your last_read cursor.
+
+    Passing `author` (always pass your own tool name when polling):
+    - registers/heartbeats you (D1 liveness), and
+    - computes the window as the UNION of `since` and your undelivered backlog
+      (server-side last_read cursor): nothing already-undelivered is ever
+      missed even if `since` is shorter (dsh-2). The cursor advances to this
+      call's snapshot moment only here — get_thread/the probe/anything else
+      never advances it (C3: cursor = "delivered to an LLM" watermark).
+
+    Returns a one-line `needs_attention:` JSON header
+    {new_comments, mentions_me[{thread_id,comment_id}], awaiting_my_verdict,
+    open_threads} — idle polls can act on the header alone without reading
+    threads (cost model §4). awaiting_my_verdict is "not_implemented" until
+    stage 3b (explicit sentinel per dsh-6, never a bare []).
 
     Args:
-        since: either an absolute timestamp matching the server's format
-            (e.g. '2026-08-07 21:30:00'), or a relative spec: '30m', '2h',
-            '1d', or 'now'. Defaults to '1h' (last hour).
-
-    Returns: one line per comment with id, thread, author, file:line, and body.
+        since: absolute timestamp or relative '30m'/'2h'/'1d'/'now' (first-round
+            fallback when no cursor exists yet).
+        author: your tool name — poll WITH it, always.
     """
-    cutoff = _parse_since(since)
+    snapshot = _now_iso()  # watermark captured BEFORE the read (no swallow race)
+    parsed_since = _parse_since(since)
+    delivered = None
+    if author:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT last_read FROM participants WHERE author=?", (author,)
+            ).fetchone()
+            if row and row["last_read"]:
+                delivered = row["last_read"]
+    cutoff = min(parsed_since, delivered) if delivered else parsed_since
     with db() as conn:
         rows = conn.execute(
             """SELECT c.id, c.thread_id, c.parent_id, c.author, c.body,
@@ -357,9 +513,34 @@ def list_comments_since(since: str = "1h") -> str:
                ORDER BY c.created_at ASC""",
             (cutoff,),
         ).fetchall()
+        if author:
+            # AFTER computing delivery (claude #52 order rule), single txn (C1.1):
+            _touch(conn, author)
+            conn.execute(
+                "UPDATE participants SET last_read=? WHERE author=?", (snapshot, author)
+            )
+    mentions = []
+    if author:
+        marker = f"@{author}"
+        mentions = [
+            {"thread_id": r["thread_id"], "comment_id": r["id"]}
+            for r in rows
+            if marker in (r["body"] or "")
+        ]
+    with _connect() as conn:
+        open_threads = conn.execute(
+            "SELECT COUNT(*) FROM threads WHERE status='open'"
+        ).fetchone()[0]
+    needs = {
+        "new_comments": len(rows),
+        "mentions_me": mentions,
+        "awaiting_my_verdict": "not_implemented",
+        "open_threads": open_threads,
+    }
+    header = "needs_attention: " + json.dumps(needs, ensure_ascii=False)
     if not rows:
-        return f"No comments since {cutoff}."
-    lines = [f"Comments since {cutoff} ({len(rows)}):"]
+        return f"{header}\nNo comments since {cutoff}."
+    lines = [header, f"Comments since {cutoff} ({len(rows)}):"]
     for r in rows:
         loc = ""
         if r["file"]:
