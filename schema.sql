@@ -48,3 +48,31 @@ CREATE TABLE IF NOT EXISTS participants (
     last_read  TEXT,
     meta       TEXT NOT NULL DEFAULT '{}'
 );
+
+-- v2 A5 (3a): current-state verdicts (frozen-not-cleared by suspension;
+-- cleared by bump_revision so a new revision must be re-voted).
+CREATE TABLE IF NOT EXISTS verdicts (
+    thread_id  INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    author     TEXT    NOT NULL,
+    verdict    TEXT    NOT NULL CHECK (verdict IN ('pass','object')),
+    note       TEXT,
+    updated_at TEXT    NOT NULL,
+    PRIMARY KEY (thread_id, author)
+);
+
+-- v2 A5 (3a): append-only governance audit — verdict sets/flips (with cost),
+-- bump_revision, set_quorum, token issue/reissue (dsh-5, claude note ①),
+-- and stage-3b state-machine transitions (auto_resolve / auto_reopen /
+-- unfreeze_restore / human_override). NEVER updated or deleted.
+CREATE TABLE IF NOT EXISTS verdict_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id  INTEGER,
+    author     TEXT    NOT NULL,
+    action     TEXT    NOT NULL,
+    from_v     TEXT,
+    to_v       TEXT,
+    revision   INTEGER,
+    costed     INTEGER NOT NULL DEFAULT 0,
+    note       TEXT,
+    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);

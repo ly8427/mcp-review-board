@@ -17,8 +17,10 @@ Run:  python3 server.py      (WSL)
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import secrets
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -222,12 +224,103 @@ POSTS_PER_DAY = 50      # per author across the whole board (设计 A3 措辞)
 
 
 def _author_usage(conn: sqlite3.Connection, thread_id: int, author: str) -> int:
-    """Budget usage = comments + costed verdict flips (flips land in stage 3a)."""
+    """Budget usage = comments + costed verdict flips (A5 3a: flips are billed)."""
     n = conn.execute(
         "SELECT COUNT(*) FROM comments WHERE thread_id=? AND author=?",
         (thread_id, author),
     ).fetchone()[0]
-    return n
+    v = conn.execute(
+        "SELECT COUNT(*) FROM verdict_events WHERE thread_id=? AND author=?"
+        " AND action='verdict' AND costed=1",
+        (thread_id, author),
+    ).fetchone()[0]
+    return n + v
+
+
+# --- v2 A5 (3a): two-tier identity / tokens ---------------------------------
+REISSUE_AFTER_HOURS = 24  # lost-token reissue needs no governance activity
+
+
+def _token_ok(conn: sqlite3.Connection, author: str, token: str | None) -> bool:
+    if not token:
+        return False
+    row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
+    if row is None:
+        return False
+    try:
+        meta = json.loads(row["meta"] or "{}")
+    except (ValueError, TypeError):
+        return False
+    return meta.get("token_hash") == hashlib.sha256(token.encode()).hexdigest()
+
+
+def _audit(conn, author: str, action: str, thread_id: int | None = None,
+           from_v: str | None = None, to_v: str | None = None,
+           revision: int | None = None, costed: int = 0, note: str | None = None) -> None:
+    conn.execute(
+        "INSERT INTO verdict_events(thread_id, author, action, from_v, to_v,"
+        " revision, costed, note) VALUES (?,?,?,?,?,?,?,?)",
+        (thread_id, author, action, from_v, to_v, revision, costed, note),
+    )
+
+
+@mcp.tool
+def claim_token(author: str) -> str:
+    """Issue (or reissue) your governance token — first claim is free.
+
+    The FIRST call for a registered name issues the token and shows the
+    plaintext EXACTLY ONCE: persist it (watcher-side file, memory dir —
+    anywhere that survives your sessions) before any governance call.
+    A lost token can be reissued only after 24h without governance activity
+    by that name (verdict_events watermark, audited append-only).
+    """
+    with db() as conn:
+        _touch(conn, author)
+        row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
+        if row is None:
+            return "ERROR: unknown author"
+        try:
+            meta = json.loads(row["meta"] or "{}")
+        except (ValueError, TypeError):
+            meta = {}
+        if not meta.get("token_hash"):
+            token = secrets.token_hex(16)
+            meta["token_hash"] = hashlib.sha256(token.encode()).hexdigest()
+            conn.execute("UPDATE participants SET meta=? WHERE author=?",
+                         (json.dumps(meta, ensure_ascii=False), author))
+            _audit(conn, author, "token_issue")
+            return (f"Token issued for '{author}' (shown ONCE, persist it now):\n"
+                    f"  {token}\n"
+                    f"Governance calls (set_verdict / bump_revision / set_quorum) require it.")
+        # already issued: reissue path (dsh-5) — 24h since that author's last
+        # governance event (any verdict_events row by them, claude note ①)
+        last = conn.execute(
+            "SELECT created_at FROM verdict_events WHERE author=?"
+            " AND action IN ('verdict','verdict_free','bump_revision','set_quorum')"
+            " ORDER BY id DESC LIMIT 1", (author,),
+        ).fetchone()
+        if last is None or _hours_since(last["created_at"]) >= REISSUE_AFTER_HOURS:
+            token = secrets.token_hex(16)
+            meta["token_hash"] = hashlib.sha256(token.encode()).hexdigest()
+            conn.execute("UPDATE participants SET meta=? WHERE author=?",
+                         (json.dumps(meta, ensure_ascii=False), author))
+            _audit(conn, author, "token_reissue",
+                   note="reissued after governance inactivity window")
+            return (f"Token REISSUED for '{author}' (old one invalidated; shown ONCE):\n"
+                    f"  {token}")
+        return (
+            f"ERROR: token for '{author}' already issued. Lost-token reissue unlocks "
+            f"after {REISSUE_AFTER_HOURS}h without governance activity by this name "
+            f"(last governance event: {last['created_at']})."
+        )
+
+
+def _hours_since(utc: str) -> float:
+    try:
+        then = datetime.strptime(utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return 0.0
+    return (datetime.now(timezone.utc) - then).total_seconds() / 3600.0
 
 
 def _count_today(conn: sqlite3.Connection, table: str, author: str) -> int:
@@ -530,16 +623,25 @@ def set_status(
     author: str,
     thread_id: int | None = None,
     comment_id: int | None = None,
+    human_override: bool = False,
 ) -> str:
     """Mark a thread or a single comment as resolved or wontfix (set back to open).
 
     Pass exactly one of thread_id / comment_id.
+
+    Quorum threads are GATED (3a): manual 'resolved' is rejected with a
+    missing-verdicts report unless every quorum member's current verdict is
+    'pass' — preventing premature/unilateral closes. Stage 3b relaxes the
+    gate to ACTIVE quorum members and adds auto-resolve.
 
     Args:
         status: the new status — 'open' | 'resolved' | 'wontfix'.
         author: who is changing the status (your tool name), recorded for clarity.
         thread_id: set the WHOLE thread to this status.
         comment_id: set just this comment to this status.
+        human_override: bypass gates (incl. wontfix→open). Threat-model bound:
+            no protocol-layer auth — the machine's user is trusted (DESIGN-V2 §3);
+            audited append-only when used.
 
     Returns: a short confirmation.
     """
@@ -550,15 +652,283 @@ def set_status(
     with db() as conn:
         _touch(conn, author)
         if thread_id is not None:
-            cur = conn.execute("UPDATE threads SET status=? WHERE id=?", (status, thread_id))
-            if cur.rowcount == 0:
+            t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
+            if t is None:
                 return f"ERROR: thread #{thread_id} does not exist"
+            if human_override:
+                _audit(conn, author, "human_override", thread_id=thread_id,
+                       to_v=status, note="gate bypassed by human instruction")
+                conn.execute("UPDATE threads SET status=? WHERE id=?", (status, thread_id))
+                return f"Thread #{thread_id} set to '{status}' by {author} (human override)."
+            if status == "resolved" and t["quorum"]:
+                names = json.loads(t["quorum"])
+                have = {
+                    r["author"]: r["verdict"]
+                    for r in conn.execute(
+                        "SELECT author, verdict FROM verdicts WHERE thread_id=?",
+                        (thread_id,),
+                    ).fetchall()
+                }
+                missing = [n for n in names if have.get(n) != "pass"]
+                if missing:
+                    return (
+                        f"ERROR: thread #{thread_id} is quorum-gated — missing 'pass' "
+                        f"verdicts from: {missing}. Ask them to set_verdict "
+                        f"(or use human_override when a human explicitly instructs)."
+                    )
+            conn.execute("UPDATE threads SET status=? WHERE id=?", (status, thread_id))
             return f"Thread #{thread_id} set to '{status}' by {author}."
         else:
             cur = conn.execute("UPDATE comments SET status=? WHERE id=?", (status, comment_id))
             if cur.rowcount == 0:
                 return f"ERROR: comment #{comment_id} does not exist"
             return f"Comment #{comment_id} set to '{status}' by {author}."
+
+
+# --- v2 A5 (3a): governance tools -------------------------------------------
+@mcp.tool
+def set_verdict(
+    thread_id: int,
+    verdict: str,
+    author: str,
+    note: str | None = None,
+    token: str | None = None,
+) -> str:
+    """Cast/flip YOUR verdict on a thread (governance — requires your token).
+
+    Rules (DESIGN-V2 A5 + thread #8 conditions):
+    - Only quorum members may vote here; others are rejected outright.
+    - 'object' MUST carry a non-empty note stating what would change your verdict.
+    - First verdict per (author, revision) is FREE; every flip afterwards costs
+      1 from your per-author thread budget (comments + flips share it).
+    - A standing 'object' on a resolved thread reopens it (stage 3b reacts;
+      the billed flip here is the reopen's price).
+
+    Args:
+        thread_id: the thread.
+        verdict: 'pass' | 'object'.
+        author: your tool name (must be in the thread's quorum).
+        note: required for 'object'.
+        token: your governance token (claim_token issues it).
+    """
+    if verdict not in ("pass", "object"):
+        return "ERROR: verdict must be 'pass' or 'object'"
+    if verdict == "object" and not (note and note.strip()):
+        return "ERROR: 'object' requires a non-empty note: state what would change your verdict"
+    with db() as conn:
+        _touch(conn, author)
+        t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
+        if t is None:
+            return f"ERROR: thread #{thread_id} does not exist"
+        if not t["quorum"]:
+            return "ERROR: thread is a free thread (no quorum) — use set_status"
+        quorum = json.loads(t["quorum"])
+        if author not in quorum:
+            return f"ERROR: set_verdict is quorum-only; '{author}' is not in {quorum}"
+        if not _token_ok(conn, author, token):
+            return "ERROR: missing/invalid governance token — claim_token first"
+        cur_row = conn.execute(
+            "SELECT verdict FROM verdicts WHERE thread_id=? AND author=?",
+            (thread_id, author),
+        ).fetchone()
+        from_v = cur_row["verdict"] if cur_row else None
+        revision = t["revision"]
+        first_for_revision = conn.execute(
+            "SELECT 1 FROM verdict_events WHERE thread_id=? AND author=?"
+            " AND revision=? AND action IN ('verdict','verdict_free') LIMIT 1",
+            (thread_id, author, revision),
+        ).fetchone() is None
+        costed = 0 if first_for_revision else 1
+        if costed and _author_usage(conn, thread_id, author) >= t["per_author_budget"]:
+            return (
+                f"ERROR: {author} reached the per-author budget "
+                f"({t['per_author_budget']}) in thread #{thread_id} — flips are billed. "
+                "Conclude via set_status (wontfix escalates to the human)."
+            )
+        conn.execute(
+            "INSERT INTO verdicts(thread_id, author, verdict, note, updated_at)"
+            " VALUES (?,?,?,?,?)"
+            " ON CONFLICT(thread_id, author) DO UPDATE SET"
+            " verdict=excluded.verdict, note=excluded.note, updated_at=excluded.updated_at",
+            (thread_id, author, verdict, note, _now_iso()),
+        )
+        _audit(conn, author, "verdict_free" if first_for_revision else "verdict",
+               thread_id=thread_id, from_v=from_v, to_v=verdict,
+               revision=revision, costed=costed, note=note)
+        recompute_thread(conn, thread_id)  # 3b state machine (no-op-safe)
+        return (
+            f"Verdict recorded: {author} → {verdict}"
+            f"{'' if first_for_revision else ' (billed 1)'} on thread #{thread_id}"
+            f" rev {revision}."
+        )
+
+
+@mcp.tool
+def bump_revision(thread_id: int, author: str, token: str | None = None) -> str:
+    """Creator-only: bump the thread's revision, clearing ALL verdicts (G2).
+
+    Use after revising the artifact under review — stale passes must not
+    auto-resolve a new revision. Costs 1 budget. Every quorum member must
+    re-vote (their first verdict on the new revision is free).
+
+    Args:
+        thread_id: the thread.
+        author: must be the thread creator.
+        token: your governance token.
+    """
+    with db() as conn:
+        _touch(conn, author)
+        t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
+        if t is None:
+            return f"ERROR: thread #{thread_id} does not exist"
+        if t["author"] != author:
+            return f"ERROR: bump_revision is creator-only (creator: {t['author']!r})"
+        if not _token_ok(conn, author, token):
+            return "ERROR: missing/invalid governance token — claim_token first"
+        if _author_usage(conn, thread_id, author) >= t["per_author_budget"]:
+            return f"ERROR: {author} reached the per-author budget in thread #{thread_id}."
+        new_rev = (t["revision"] or 1) + 1
+        conn.execute("UPDATE threads SET revision=? WHERE id=?", (new_rev, thread_id))
+        conn.execute("DELETE FROM verdicts WHERE thread_id=?", (thread_id,))
+        _audit(conn, author, "bump_revision", thread_id=thread_id,
+               revision=new_rev, costed=1,
+               note="all verdicts cleared; re-vote required")
+        recompute_thread(conn, thread_id)
+        return (
+            f"Revision bumped to {new_rev} on thread #{thread_id}; all verdicts "
+            f"cleared — quorum members must re-vote (first verdict on rev "
+            f"{new_rev} is free)."
+        )
+
+
+@mcp.tool
+def set_quorum(
+    thread_id: int,
+    author: str,
+    token: str | None = None,
+    add: list[str] | None = None,
+    remove: list[str] | None = None,
+) -> str:
+    """Creator-only: amend a thread's quorum (open threads only; floor ≥2).
+
+    Adding requires the names to be registered; shrinking below 2 members is
+    rejected (trae 边界6: a 1-member quorum is self-judging).
+
+    Args:
+        thread_id: the thread (must be open).
+        author: must be the thread creator.
+        token: your governance token.
+        add: registered names to add.
+        remove: current quorum names to remove.
+    """
+    with db() as conn:
+        _touch(conn, author)
+        t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
+        if t is None:
+            return f"ERROR: thread #{thread_id} does not exist"
+        if t["author"] != author:
+            return f"ERROR: set_quorum is creator-only (creator: {t['author']!r})"
+        if not _token_ok(conn, author, token):
+            return "ERROR: missing/invalid governance token — claim_token first"
+        if t["status"] != "open":
+            return (
+                f"ERROR: quorum changes are open-thread-only (current: {t['status']}); "
+                "resolved/wontfix quorums are frozen (changing one breaks its invariant)"
+            )
+        names = json.loads(t["quorum"]) if t["quorum"] else []
+        for q in (add or []):
+            if q in names:
+                return f"ERROR: {q!r} already in quorum"
+            if conn.execute("SELECT 1 FROM participants WHERE author=?", (q,)).fetchone() is None:
+                return f"ERROR: {q!r} not registered (a poll registers a name)"
+        for q in (remove or []):
+            if q not in names:
+                return f"ERROR: {q!r} not in current quorum"
+        new_names = [n for n in names if n not in (remove or [])] + list(add or [])
+        if len(new_names) < 2:
+            return "ERROR: resulting quorum would be < 2 (self-judging floor)"
+        conn.execute("UPDATE threads SET quorum=? WHERE id=?",
+                     (json.dumps(new_names, ensure_ascii=False), thread_id))
+        _audit(conn, author, "set_quorum", thread_id=thread_id,
+               note=f"{names} -> {new_names}")
+        recompute_thread(conn, thread_id)
+        return f"Quorum updated: {names} → {new_names} (thread #{thread_id})."
+
+
+# --- v2 A5 (3b): the state machine -------------------------------------------
+def _active_quorum(conn: sqlite3.Connection, names: list[str]) -> list[str]:
+    active = []
+    for n in names:
+        row = conn.execute("SELECT last_seen FROM participants WHERE author=?", (n,)).fetchone()
+        if row and _is_active(row["last_seen"]):
+            active.append(n)
+    return active
+
+
+def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
+    """The one invariant enforcer. Called at the end of every author-carrying
+    write transaction (claude #48-3 universal mechanism) and from the
+    heartbeat path. Idempotent by construction (state transitions only fire
+    when the invariant is violated/satisfied, checked inside the txn).
+
+    resolved ⟺ ALL *active* quorum verdicts pass AND ≥2 active members.
+    - open + (all active pass, ≥2)         → auto-resolve with tally
+    - resolved + standing object (incl. one
+      restored by an unfreeze, C')          → reopen, reason recorded
+    - resolved + zero verdicts (revision
+      bump cleared them)                    → reopen (needs re-vote)
+    - wontfix                               → terminal, skipped
+    """
+    t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
+    if t is None or not t["quorum"] or t["status"] == "wontfix":
+        return
+    names = json.loads(t["quorum"])
+    active = _active_quorum(conn, names)
+    verdicts = {
+        r["author"]: r["verdict"]
+        for r in conn.execute(
+            "SELECT author, verdict FROM verdicts WHERE thread_id=?", (thread_id,)
+        ).fetchall()
+    }
+    if t["status"] == "open":
+        if len(active) >= 2 and all(verdicts.get(n) == "pass" for n in active):
+            tally = " · ".join(f"{n} pass" for n in active)
+            conn.execute("UPDATE threads SET status='resolved' WHERE id=?", (thread_id,))
+            _audit(conn, "system", "auto_resolve", thread_id=thread_id,
+                   revision=t["revision"], note=f"active quorum unanimous: {tally}")
+    elif t["status"] == "resolved":
+        standing = [n for n in names if verdicts.get(n) == "object"]
+        if standing:
+            reason = (
+                "frozen object re-stood after suspension lift (C', unbilled)"
+                if any(n not in active for n in standing) or len(active) < len(names)
+                else "object recorded"
+            )
+            conn.execute("UPDATE threads SET status='open' WHERE id=?", (thread_id,))
+            _audit(conn, "system", "auto_reopen", thread_id=thread_id,
+                   revision=t["revision"],
+                   note=f"standing object by {standing} ({reason})")
+        elif not verdicts:
+            conn.execute("UPDATE threads SET status='open' WHERE id=?", (thread_id,))
+            _audit(conn, "system", "auto_reopen", thread_id=thread_id,
+                   revision=t["revision"], note="revision bump cleared verdicts")
+
+
+def heartbeat_and_recompute(conn: sqlite3.Connection, author: str) -> None:
+    """SHARED heartbeat entry (C1.1: probe and list_comments_since use the
+    SAME code path): touch + invariant recompute for every quorum thread the
+    author belongs to. Covers both directions: a returning member's frozen
+    object re-standing on a resolved thread (C'), and a staleness-shrunken
+    active set reaching unanimity on an open thread (auto-resolve fires on
+    any member's next heartbeat)."""
+    _touch(conn, author)
+    rows = conn.execute(
+        "SELECT id, quorum FROM threads"
+        " WHERE status IN ('open','resolved') AND quorum IS NOT NULL"
+    ).fetchall()
+    for r in rows:
+        if author in json.loads(r["quorum"]):
+            recompute_thread(conn, r["id"])
 
 
 def _parse_since(since: str) -> str:
@@ -625,8 +995,9 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
             (cutoff,),
         ).fetchall()
         if author:
-            # AFTER computing delivery (claude #52 order rule), single txn (C1.1):
-            _touch(conn, author)
+            # C1.1 shared heartbeat path (+ C' unfreeze recompute inside this
+            # txn), cursor advance last; the fetch above already fixed delivery.
+            heartbeat_and_recompute(conn, author)
             conn.execute(
                 "UPDATE participants SET last_read=? WHERE author=?", (snapshot, author)
             )
@@ -638,14 +1009,32 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
             for r in rows
             if marker in (r["body"] or "")
         ]
+    awaiting: list | str
     with _connect() as conn:
         open_threads = conn.execute(
             "SELECT COUNT(*) FROM threads WHERE status='open'"
         ).fetchone()[0]
+        if author:
+            # D2: open ∧ 非 wontfix ∧ quorum ∧ no verdict on current revision ∧
+            # active. The caller just heartbeated above (order condition,
+            # claude #52-3) so is_active(author) holds by construction here.
+            awaiting = [
+                r["id"]
+                for r in conn.execute(
+                    "SELECT id, quorum FROM threads WHERE status='open' AND quorum IS NOT NULL"
+                ).fetchall()
+                if author in json.loads(r["quorum"])
+                and conn.execute(
+                    "SELECT 1 FROM verdicts WHERE thread_id=? AND author=? LIMIT 1",
+                    (r["id"], author),
+                ).fetchone() is None
+            ]
+        else:
+            awaiting = "not_implemented"
     needs = {
         "new_comments": len(rows),
         "mentions_me": mentions,
-        "awaiting_my_verdict": "not_implemented",
+        "awaiting_my_verdict": awaiting,
         "open_threads": open_threads,
     }
     header = "needs_attention: " + json.dumps(needs, ensure_ascii=False)
