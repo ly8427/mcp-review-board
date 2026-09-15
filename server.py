@@ -1066,6 +1066,43 @@ def _board_html() -> str:
         by_thread: dict[int, list[sqlite3.Row]] = {}
         for c in conn.execute("SELECT * FROM comments ORDER BY created_at ASC").fetchall():
             by_thread.setdefault(c["thread_id"], []).append(c)
+        participants = conn.execute(
+            "SELECT author, last_seen, meta FROM participants ORDER BY last_seen DESC"
+        ).fetchall()
+        # awaiting map: open quorum threads -> members with no verdict yet (D2 filter:
+        # the single same filter the tool path uses; display reuses it, no drift)
+        awaiting_map: dict[int, list[str]] = {}
+        for t in threads:
+            if t["quorum"] and t["status"] == "open":
+                names = json.loads(t["quorum"])
+                have = {
+                    r["author"]
+                    for r in conn.execute(
+                        "SELECT author FROM verdicts WHERE thread_id=?", (t["id"],)
+                    ).fetchall()
+                }
+                active = _active_quorum(conn, names)
+                miss = [n for n in names if n not in have and n in active]
+                if miss:
+                    awaiting_map[t["id"]] = miss
+
+    strip = []
+    for p in participants:
+        try:
+            meta = json.loads(p["meta"] or "{}")
+        except (ValueError, TypeError):
+            meta = {}
+        last = p["last_seen"]
+        try:
+            then = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            idle = (datetime.now(timezone.utc) - then).total_seconds()
+        except ValueError:
+            idle = float("inf")
+        mark = "🟢" if idle < DISPLAY_IDLE_MIN * 60 else "⚠️"
+        err = ""
+        if meta.get("last_wake_error"):
+            err = f" <span title='watcher wake failures'>🔧</span>"
+        strip.append(f"<span class='p'>{mark} {escape(p['author'])} {_relative(last)}{err}</span>")
 
     parts = [
         "<!doctype html><html><head><meta charset='utf-8'>",
@@ -1077,17 +1114,25 @@ def _board_html() -> str:
         ".open{color:#b35900}.resolved{color:#1a7f37}.wontfix{color:#888}.blocker{background:#ffe0e0}.major{background:#fff3e0}",
         "pre{background:#f6f8fa;padding:8px 12px;border-radius:6px;white-space:pre-wrap;word-wrap:break-word}",
         ".c{margin:8px 0}.reply{margin-left:24px;border-left:2px solid #eee;padding-left:12px}",
+        ".p{margin-right:14px;font-size:.85rem} .await{background:#fff3cd;padding:1px 8px;border-radius:10px;font-size:.75rem}",
+        "details{margin-top:2em} summary{cursor:pointer;color:#888;font-size:.85rem}",
         "</style></head><body>",
         "<h1>📋 MCP Review Board</h1>",
-        f"<p class='meta'>{len(threads)} thread(s) · read-only · "
-        f"<a href='/'>refresh</a></p>",
+        f"<p class='meta'>{len(threads)} thread(s) · auto-refreshes 20s · "
+        f"<a href='/'>refresh</a> · probe: <code>/attention?author=NAME</code></p>",
+        f"<p>{' '.join(strip) if strip else '<span class=meta>(no participants yet)</span>'}</p>",
     ]
     if not threads:
         parts.append("<p>No threads yet. Have an agent call <code>create_thread</code>.</p>")
     for t in threads:
+        aw = awaiting_map.get(t["id"])
+        aw_html = (
+            f" <span class='await'>⏳ awaiting verdict: {', '.join(escape(a) for a in aw)}</span>"
+            if aw else ""
+        )
         parts.append(
             f"<h2>#{t['id']} {escape(t['title'])} "
-            f"<span class='badge {t['status']}'>{t['status']}</span></h2>"
+            f"<span class='badge {t['status']}'>{t['status']}</span>{aw_html}</h2>"
         )
         parts.append(f"<div class='meta'>{t['n']} comment(s) · created {t['created_at']}</div>")
         if t["context"]:
@@ -1129,8 +1174,69 @@ def _board_html() -> str:
         if not comments:
             parts.append("<p class='meta'>(no comments yet)</p>")
 
+    parts.append(
+        "<details><summary>协议 protocol v" + PROTOCOL_VERSION + "</summary>"
+        "<pre style='font-size:.8rem'>" + escape(PROTOCOL) + "</pre></details>"
+    )
+    parts.append(
+        "<script>setInterval(function(){if(!document.hidden){location.reload();}},20000);</script>"
+    )
     parts.append("</body></html>")
     return "".join(parts)
+
+
+# --- v2 A4/5: the lightweight heartbeat probe -------------------------------
+@mcp.custom_route("/attention", methods=["GET"])
+async def attention_probe(request: Request):
+    """GET /attention?author=NAME — the dumb watcher pre-check (dsh-3).
+
+    One curl + one boolean branch, no MCP envelope. C1.1: runs the FULL
+    heartbeat transaction via the SAME heartbeat_and_recompute code path as
+    MCP polls (touch + C' unfreeze recompute, single SQLite write txn, idempotent).
+    C3: NEVER advances last_read — the signal stays level-triggered (attention
+    stays 1 across wake failures until list_comments_since actually delivers).
+    Returns {"attention": 0|1, "reason": ..., "threads": [...]}.
+    """
+    author = request.query_params.get("author")
+    if not author:
+        return JSONResponse({"error": "author query param required"}, status_code=400)
+    with db() as conn:
+        heartbeat_and_recompute(conn, author)
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT last_read FROM participants WHERE author=?", (author,)
+        ).fetchone()
+        cutoff = (row["last_read"] if row and row["last_read"] else "1970-01-01 00:00:00")
+        awaiting = [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id, quorum FROM threads WHERE status='open' AND quorum IS NOT NULL"
+            ).fetchall()
+            if author in json.loads(r["quorum"])
+            and conn.execute(
+                "SELECT 1 FROM verdicts WHERE thread_id=? AND author=? LIMIT 1",
+                (r["id"], author),
+            ).fetchone() is None
+        ]
+        marker = f"@{author}"
+        undelivered = conn.execute(
+            "SELECT thread_id, id, body FROM comments WHERE created_at > ? ORDER BY id",
+            (cutoff,),
+        ).fetchall()
+        mention_threads = sorted({r["thread_id"] for r in undelivered if marker in (r["body"] or "")})
+    if awaiting:
+        reason, threads = "awaiting_verdict", awaiting
+    elif mention_threads:
+        reason, threads = "mentioned", mention_threads
+    elif undelivered:
+        reason, threads = "new_comments", sorted({r["thread_id"] for r in undelivered})
+    else:
+        reason, threads = "idle", []
+    return JSONResponse({
+        "attention": 1 if reason != "idle" else 0,
+        "reason": reason,
+        "threads": threads,
+    })
 
 
 @mcp.custom_route("/", methods=["GET"])
