@@ -1,0 +1,13 @@
+# Insert this block into BOTH DSH homes' cordis.patch.yml (it is a top-level
+# YAML array — put the entry inside the existing `- insert:` list, or replace
+# an empty `[]` file with this whole content):
+#   Windows: %USERPROFILE%\.dsh\cordis.patch.yml
+#   WSL:     ~/.dsh/cordis.patch.yml
+# Already applied on this machine (2026-09-15, thread #7 smoke PASS).
+- insert:
+    - id: mcp-review-board
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: review-board
+        transport: streamable-http
+        url: http://localhost:8765/mcp

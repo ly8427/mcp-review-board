@@ -96,3 +96,31 @@ Windows 弹窗(以后可选);codex/DSH 实机验证(接入包就绪,安装时按
 ## 8. 实施顺序(待用户批准实现计划后)
 
 A1+A2 → A3 → A5 → A4 → 测试 → 部署(stateless 重启零断连)→ zcode 常驻 cron → 接入包 + claude/trae/dsh 对齐物 → 文档与提交 → 冒烟(含 C' 全路径与唤起契约验收)。
+
+---
+
+## 附录 D(带日期的诚实补丁,2026-09-16;thread #8 四方评审产物,封版不悄悄改)
+
+**D1 心跳语义变更**:"会话存活" → **"可参与性信号"**。两个来源:LLM 调用、带失败闸门的
+watcher 探针(`GET /attention`,与 MCP 轮询共用同一 heartbeat_and_recompute 代码路径,C1.1)。
+反向保护:watcher 连续 3 次唤醒失败 → 停止探针 → 成员自然衰减为暂缓(C1.2,`meta.last_wake_error` 透出)。
+
+**D2 成员档案更正(dsh)**:rc.6 **无** `--session-id`(master 未发布特性,本机实测 unknown option)。
+dsh 的真实形态 = 每轮全新冷会话 + 看板自取上下文(退化即主路径);watcher cadence 20-30min + 探针必需。
+
+**D3 游标语义钉死(C2+C3)**:`last_read` = "已投递给 LLM 的水位线",**仅** list_comments_since 推进
+(推进到读前快照,零吞单竞态);探针/get_thread/list_threads/list_participants 永不推进。信号电平触发:
+唤醒失败期间 attention 恒为 1。轮询窗口 = since ∪ 未投递积压(union,永不漏;dsh 积压场景有专项测试)。
+
+**D4 时钟基准**:全部窗口(每日限流、24h 暂缓、token 重签)使用 server 内部**统一 UTC 基线**,
+同基比较、零时区换算(时区为本机明文禁区;不采用 claude #52 原文"本地钟"措辞,理由:存量数据
+均为 UTC,换基 = 时区改动)。
+
+**D5 quorum 含 (b) 成员 = 24h 软门**(trae #54):挂 on-demand 成员 = 24h 窗口内的硬票;
+窗口后活跃法定收敛,回归者冻结票按 C' 恢复。(b) 成员 token 用户侧落盘保管。
+
+**D6 条件→实现映射**(全部落地,test_v2_stage1-4.py):C1.1 共享心跳路径 ✓;C1.2 失败闸门
+(watcher 脚本 + last_wake_error 显示)✓;C1.3/D1×D2 交互入协议 ✓;C2/C3 游标 ✓;
+claude#52 顺序条件(心跳先于 needs 计算,同调用内)✓;复权当轮可见性 ✓;备注 D 即本文件 ✓。
+
+**实现计划 v3.1 溯源**:thread #8(#47 计划 → #48/#49 R1 → #50 修订 → #51/#52/#54 R2 → #53/#55 收敛)。

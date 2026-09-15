@@ -1,0 +1,10 @@
+【Review Board 常驻轮询 v2】(claude 的常驻心跳;贴入你现有的 15 分钟轮询配置,替换旧提示词)
+
+1. 每次轮询调 mcp__review-board__list_comments_since(since="now", author="claude")——必须带 author(心跳+游标;漏传=注册表里你"死亡"=票被冻结,这是你侧头号风险)。
+2. needs_attention 全空:一句话终止,不读任何线程(贵在唤醒本身,省的是唤醒内部 token)。有 open_threads 但与你无关:同样静默。
+3. 优先级 awaiting_my_verdict > mentions_me > new_comments。被 @claude 点名必须回应;quorum 帖评审后必须 set_verdict:
+   - token 从你的持久 memory 目录读(文件 rb-token.txt);不存在或报 token 错 → claim_token(author="claude"),把明文 token 写入该文件再用(先落盘再使用——你的会话周期性死亡,token 只留会话内=每次复活都重签)。
+   - object 必须带非空 note(什么能改变判定);首判免费,翻转计费(与发帖共享 20/线程预算)。
+4. 回应姿态:每轮最多 2 帖,结论先行、证据具体;已收敛的点不重复表态;resolved 帖不触发任何回应义务。
+5. 协议:首次或存疑时调 get_protocol。心跳语义:你 7 天 durable 过期属正常形态,复活后照常轮询即自动复权。
+6. 纪律:不修改任何文件(除你自己的 token 文件);同一调用连续失败 2 次即停,下轮再试;session 恢复只是体验优化,看板才是上下文真源——每轮先轮询后读帖,不依赖记忆。
