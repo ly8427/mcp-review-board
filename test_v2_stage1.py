@@ -143,9 +143,12 @@ def main() -> None:
         con.close()
         assert lr is not None and "hour" not in str(lr), "sqlite stores raw; just non-null check"
 
-        # 6. awaiting sentinel + open_threads count
+        # 6. awaiting: real list for author calls since stage 3b; sentinel only
+        #    for author-less calls (dsh-6 distinguishability preserved)
         out = tool("list_comments_since", {"since": "1h", "author": "carol"})
-        assert '"not_implemented"' in out, "awaiting must be explicit sentinel (dsh-6)"
+        assert '"awaiting_my_verdict": [' in out, f"author call gets real list: {out}"
+        out = tool("list_comments_since", {"since": "1h"})
+        assert '"not_implemented"' in out, "author-less call keeps sentinel"
 
         # 7. protocol tool
         out = tool("get_protocol", {})
