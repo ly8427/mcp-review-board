@@ -194,6 +194,16 @@ def _connect() -> sqlite3.Connection:
 def init_db() -> None:
     with _connect() as conn:
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        # v2 migrations for pre-v2 DBs (SQLite has no ADD COLUMN IF NOT EXISTS)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(threads)")}
+        for col, ddl in (
+            ("author", "TEXT"),
+            ("quorum", "TEXT"),
+            ("per_author_budget", "INTEGER NOT NULL DEFAULT 20"),
+            ("revision", "INTEGER NOT NULL DEFAULT 1"),
+        ):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE threads ADD COLUMN {col} {ddl}")
 
 
 @contextmanager
@@ -206,23 +216,87 @@ def db():
         conn.close()
 
 
+# --- v2 A3 helpers ----------------------------------------------------------
+THREADS_PER_DAY = 5     # per author (claude #48: 每人每天建帖 ≤5)
+POSTS_PER_DAY = 50      # per author across the whole board (设计 A3 措辞)
+
+
+def _author_usage(conn: sqlite3.Connection, thread_id: int, author: str) -> int:
+    """Budget usage = comments + costed verdict flips (flips land in stage 3a)."""
+    n = conn.execute(
+        "SELECT COUNT(*) FROM comments WHERE thread_id=? AND author=?",
+        (thread_id, author),
+    ).fetchone()[0]
+    return n
+
+
+def _count_today(conn: sqlite3.Connection, table: str, author: str) -> int:
+    """Rows by author created 'today'. Clock basis: the server's one internal
+    UTC clock — same-basis comparison, zero timezone conversion (design rule)."""
+    return conn.execute(
+        f"SELECT COUNT(*) FROM {table} WHERE author=? AND created_at >= date('now')",
+        (author,),
+    ).fetchone()[0]
+
+
 # --- MCP tools ---------------------------------------------------------------
 @mcp.tool
-def create_thread(title: str, context: str | None = None) -> str:
+def create_thread(
+    title: str,
+    context: str | None = None,
+    author: str | None = None,
+    quorum: list[str] | None = None,
+    per_author_budget: int | None = None,
+) -> str:
     """Start a new review topic.
 
     Args:
-        title: short name of the review topic (e.g. "三方 review: auth 模块").
-        context: optional background — a code snippet, PR description, or link
-            that all reviewers should read first.
+        title: short name of the review topic.
+        context: optional background — snippet / PR description / link.
+        author: your tool name — ALWAYS pass it (registers you; enables
+            rate limits and creator rights like bump_revision in stage 3).
+        quorum: list of voter names for verdict-gated resolution (stage 3).
+            Every name must already be registered (any author-carrying call
+            registers — a poll is enough). NULL/omitted = free thread
+            (creator closes it manually, v1 behaviour).
+        per_author_budget: budget per author per thread (default 20; covers
+            posts + replies + costed verdict flips).
 
-    Returns: the new thread id (an integer), which the other agents use in
-        post_comment / get_thread / set_status.
+    Returns: the new thread id and a nudge to get_protocol for new members.
     """
+    if per_author_budget is not None and (per_author_budget < 1 or per_author_budget > 100):
+        return "ERROR: per_author_budget must be in [1, 100]"
     with db() as conn:
+        _touch(conn, author)  # ORDER: register the creator BEFORE quorum check
+        if author:
+            if _count_today(conn, "threads", author) >= THREADS_PER_DAY:
+                return f"ERROR: daily thread-creation limit reached ({THREADS_PER_DAY}/day)."
+        if quorum is not None:
+            if not isinstance(quorum, list) or not all(isinstance(q, str) and q.strip() for q in quorum):
+                return "ERROR: quorum must be a list of non-empty name strings"
+            names = [q.strip() for q in quorum]
+            if len(set(names)) != len(names):
+                return "ERROR: quorum contains duplicate names"
+            missing = [
+                q for q in names
+                if conn.execute(
+                    "SELECT 1 FROM participants WHERE author=?", (q,)
+                ).fetchone() is None
+            ]
+            if missing:
+                return (
+                    f"ERROR: quorum name(s) not registered: {missing}. "
+                    "A name registers on its first author-carrying call — a bare "
+                    "poll (list_comments_since with author) is enough; no post needed."
+                )
+            quorum_json = json.dumps(names, ensure_ascii=False)
+        else:
+            quorum_json = None
+        budget = per_author_budget if per_author_budget is not None else 20
         cur = conn.execute(
-            "INSERT INTO threads(title, context) VALUES (?, ?)",
-            (title, context),
+            "INSERT INTO threads(title, context, author, quorum, per_author_budget)"
+            " VALUES (?,?,?,?,?)",
+            (title, context, author, quorum_json, budget),
         )
         tid = cur.lastrowid
     return (
@@ -270,6 +344,19 @@ def post_comment(
                 f"({THREAD_CAP} comments). No further posts or replies accepted. "
                 f"Conclude the discussion with set_status(thread_id, 'resolved' or 'wontfix')."
             )
+        budget = conn.execute(
+            "SELECT per_author_budget FROM threads WHERE id=?", (thread_id,)
+        ).fetchone()[0]
+        if _author_usage(conn, thread_id, author) >= budget:
+            return (
+                f"ERROR: {author} reached the per-author budget ({budget}) in "
+                f"thread #{thread_id}. Conclude via set_verdict / set_status."
+            )
+        if _count_today(conn, "comments", author) >= POSTS_PER_DAY:
+            return (
+                f"ERROR: {author} reached the daily post limit "
+                f"({POSTS_PER_DAY}/day across the board)."
+            )
         cur = conn.execute(
             """INSERT INTO comments(thread_id, parent_id, author, body, file, line, severity)
                VALUES (?, NULL, ?, ?, ?, ?, ?)""",
@@ -312,6 +399,19 @@ def reply_comment(comment_id: int, author: str, body: str) -> str:
                 f"ERROR: thread #{row['thread_id']} is locked — discussion cap reached "
                 f"({THREAD_CAP} comments). No further posts or replies accepted. "
                 f"Conclude the discussion with set_status(thread_id, 'resolved' or 'wontfix')."
+            )
+        budget = conn.execute(
+            "SELECT per_author_budget FROM threads WHERE id=?", (row["thread_id"],)
+        ).fetchone()[0]
+        if _author_usage(conn, row["thread_id"], author) >= budget:
+            return (
+                f"ERROR: {author} reached the per-author budget ({budget}) in "
+                f"thread #{row['thread_id']}. Conclude via set_verdict / set_status."
+            )
+        if _count_today(conn, "comments", author) >= POSTS_PER_DAY:
+            return (
+                f"ERROR: {author} reached the daily post limit "
+                f"({POSTS_PER_DAY}/day across the board)."
             )
         cur = conn.execute(
             """INSERT INTO comments(thread_id, parent_id, author, body)
@@ -377,15 +477,26 @@ def get_thread(thread_id: int) -> str:
             """SELECT * FROM comments WHERE thread_id=? ORDER BY created_at ASC""",
             (thread_id,),
         ).fetchall()
+        usage_rows = conn.execute(
+            "SELECT author, COUNT(*) AS c FROM comments WHERE thread_id=? GROUP BY author",
+            (thread_id,),
+        ).fetchall()
+    out = [
+        f"Thread #{t['id']}: {t['title']}  [{t['status']}]",
+        f"  created: {t['created_at']}   comments: {len(all_comments)}/{THREAD_CAP}",
+    ]
+    if t["quorum"]:
+        try:
+            names = json.loads(t["quorum"])
+        except (ValueError, TypeError):
+            names = []
+        usage = " · ".join(f"{r['author']} {r['c']}/{t['per_author_budget']}" for r in usage_rows)
+        out.append(f"  quorum: {names}   revision: {t['revision']}   budget: {usage or '—'}")
 
     by_parent: dict[int | None, list[sqlite3.Row]] = {}
     for c in all_comments:
         by_parent.setdefault(c["parent_id"], []).append(c)
 
-    out = [
-        f"Thread #{t['id']}: {t['title']}  [{t['status']}]",
-        f"  created: {t['created_at']}   comments: {len(all_comments)}/{THREAD_CAP}",
-    ]
     if t["context"]:
         out.append("  context:")
         for line in str(t["context"]).splitlines():

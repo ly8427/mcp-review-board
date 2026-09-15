@@ -3,11 +3,15 @@
 
 -- A review topic, e.g. "三方 review: auth 模块"
 CREATE TABLE IF NOT EXISTS threads (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    title      TEXT    NOT NULL,
-    context    TEXT,                          -- optional: code snippet / PR desc / link under review
-    status     TEXT    NOT NULL DEFAULT 'open', -- open | resolved | wontfix
-    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    title              TEXT    NOT NULL,
+    context            TEXT,                          -- optional: code snippet / PR desc / link under review
+    status             TEXT    NOT NULL DEFAULT 'open', -- open | resolved | wontfix
+    created_at         TEXT    NOT NULL DEFAULT (datetime('now')),
+    author             TEXT,                          -- v2 A3: creator (optional for v1-compat callers)
+    quorum             TEXT,                          -- v2 A3: JSON array of voter names (NULL = free thread)
+    per_author_budget  INTEGER NOT NULL DEFAULT 20,   -- v2 A3: posts+replies+costed verdict flips per author
+    revision           INTEGER NOT NULL DEFAULT 1     -- v2 A5: bumped on revision; clears verdicts
 );
 
 -- Comments in a thread. parent_id self-reference forms the reply tree
