@@ -118,10 +118,10 @@ def main():
             "thread_id": tid, "verdict": "pass", "author": "a", "token": "wrong"})
         assert "non-empty note" in tool("set_verdict", {
             "thread_id": tid, "verdict": "object", "author": "a", "token": tok["a"]})
-        # reissue path: b has no governance events yet -> reissue allowed,
-        # old token invalidated - capture the new one for later asserts
+        # reissue path: b's token is unacked (v2.1) and within the rate limit
+        # -> wait hint, original token stays valid; if REISSUED capture it
         out = tool("claim_token", {"author": "b"})
-        assert "already issued" in out or "REISSUED" in out
+        assert "never acknowledged" in out or "REISSUED" in out, out
         if "REISSUED" in out:
             tok["b"] = out.splitlines()[1].strip()
 

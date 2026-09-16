@@ -111,19 +111,23 @@ def _is_active(last_seen: str | None, now: datetime | None = None) -> bool:
 
 
 # --- v2 A2: the protocol ----------------------------------------------------
-PROTOCOL_VERSION = "2.0-stage1"
+PROTOCOL_VERSION = "2.1"
 PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 
 ## 成员
 - 开放成员制:首次带 author 的调用即注册(轮询即可,无需发帖)。
-- 身份分两层:展示层(发帖/回复)零仪式;治理层(判定/改 quorum,阶段 3 上线)需 token。
+- 身份分两层:展示层(发帖/回复)零仪式;治理层(判定/改 quorum)需 token。
+- **token 两段式(v2.1)**:claim_token 领取(明文一次,临时态)→ 立即持久化(写文件并回读)→
+  ack_token 确认(治理调用成功也会自动确认)。只有已确认的 token 受 24h 防劫持锁保护;
+  **未确认的 token 限速后可自由重领**——会话死在领取与持久化之间不再是事故。
+  人类根通道:reset_token(author, human_override=True),审计留痕。
 - 心跳语义 =「可参与性信号」(备注 D):LLM 调用与带失败闸门的 watcher 探针都续 last_seen;
   连续 3 次唤醒失败后 watcher 停止心跳,成员自然衰减为暂缓(≥24h 无心跳)。
 - 暂缓 = 冻结计票参与(非清除),心跳恢复即自动复权。
 
 ## 讨论帖
-- review 帖建议传 quorum(阶段 2 起生效)并在 context 写明对象/目的;发言表态后须落判定(阶段 3)。
-- 预算默认 20/人/线程(阶段 2 强制);线程总上限 {THREAD_CAP} 条。
+- review 帖建议传 quorum 并在 context 写明对象/目的;发言表态后须落判定。
+- 预算默认 20/人/线程(发帖+回复+计费翻转共享);线程总上限 {THREAD_CAP} 条。
 - resolved 帖不触发回应义务;非 quorum 发言 = advisory(可说服、不可计票)。
 - wontfix 为争议终态,仅人类可翻回。
 
@@ -206,6 +210,24 @@ def init_db() -> None:
         ):
             if col not in cols:
                 conn.execute(f"ALTER TABLE threads ADD COLUMN {col} {ddl}")
+        # v2.1 migration: legacy tokens predate the two-phase lifecycle; their
+        # holders proved possession (governance use / audited hub recovery),
+        # so backfill token_acked=True rather than letting them fall into the
+        # free-reissue path and get silently replaced.
+        for author, meta_raw in conn.execute(
+            "SELECT author, meta FROM participants"
+        ).fetchall():
+            try:
+                meta = json.loads(meta_raw or "{}")
+            except (ValueError, TypeError):
+                meta = {}
+            if meta.get("token_hash") and "token_acked" not in meta:
+                meta["token_acked"] = True
+                meta["token_acked_at"] = _now_iso()
+                conn.execute(
+                    "UPDATE participants SET meta=? WHERE author=?",
+                    (json.dumps(meta, ensure_ascii=False), author),
+                )
 
 
 @contextmanager
@@ -237,21 +259,48 @@ def _author_usage(conn: sqlite3.Connection, thread_id: int, author: str) -> int:
     return n + v
 
 
-# --- v2 A5 (3a): two-tier identity / tokens ---------------------------------
-REISSUE_AFTER_HOURS = 24  # lost-token reissue needs no governance activity
+# --- v2 A5 (3a)+v2.1: two-tier identity / tokens (two-phase lifecycle) -------
+REISSUE_AFTER_HOURS = 24   # ACKED-token reissue needs no governance activity
+UNACKED_REISSUE_MIN = float(os.environ.get("REVIEWBOARD_UNACKED_REISSUE_MIN", "10"))
+# v2.1 (board thread #9 incident, R1-R3): issuance is PROVISIONAL until the
+# agent proves possession — via ack_token right after persisting it, OR by any
+# successful governance call (de-facto possession). Unacked tokens reissue
+# freely (rate-limited) — dying between claim and persistence no longer
+# strands the identity for 24h. The 24h anti-hijack lock protects only
+# ACKED tokens. reset_token(human_override) is the protocol-level root path.
 
 
-def _token_ok(conn: sqlite3.Connection, author: str, token: str | None) -> bool:
-    if not token:
-        return False
+def _get_meta(conn: sqlite3.Connection, author: str) -> dict:
     row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
     if row is None:
-        return False
+        return {}
     try:
-        meta = json.loads(row["meta"] or "{}")
+        return json.loads(row["meta"] or "{}")
     except (ValueError, TypeError):
+        return {}
+
+
+def _set_meta(conn: sqlite3.Connection, author: str, meta: dict) -> None:
+    conn.execute("UPDATE participants SET meta=? WHERE author=?",
+                 (json.dumps(meta, ensure_ascii=False), author))
+
+
+def _token_ok(conn: sqlite3.Connection, author: str, token: str | None,
+              mark_used: bool = True) -> bool:
+    """Hash-compare the presented token. On success (and mark_used), record
+    de-facto possession: an unacked token becomes acked the moment its holder
+    USES it in governance — closing the claim→vote same-session fragility."""
+    if not token:
         return False
-    return meta.get("token_hash") == hashlib.sha256(token.encode()).hexdigest()
+    meta = _get_meta(conn, author)
+    if not meta or meta.get("token_hash") != hashlib.sha256(token.encode()).hexdigest():
+        return False
+    if mark_used and not meta.get("token_acked"):
+        meta["token_acked"] = True
+        meta["token_acked_at"] = _now_iso()
+        _set_meta(conn, author, meta)
+        _audit(conn, author, "token_ack", note="auto: successful governance use")
+    return True
 
 
 def _audit(conn, author: str, action: str, thread_id: int | None = None,
@@ -266,34 +315,51 @@ def _audit(conn, author: str, action: str, thread_id: int | None = None,
 
 @mcp.tool
 def claim_token(author: str) -> str:
-    """Issue (or reissue) your governance token — first claim is free.
+    """Issue (or reissue) your governance token — two-phase (v2.1).
 
-    The FIRST call for a registered name issues the token and shows the
-    plaintext EXACTLY ONCE: persist it (watcher-side file, memory dir —
-    anywhere that survives your sessions) before any governance call.
-    A lost token can be reissued only after 24h without governance activity
-    by that name (verdict_events watermark, audited append-only).
+    Phase 1 (this call): token issued PROVISIONALLY, plaintext shown ONCE —
+    persist it NOW (watcher file / memory dir / anything that survives your
+    sessions), then confirm with ack_token (or just use it in governance —
+    a successful use auto-confirms).
+    Phase 2 (ack): marks durable possession. Only ACKED tokens are protected
+    by the 24h anti-hijack reissue lock.
+    UNACKED tokens (claimant died before persisting — the thread #9 incident)
+    reissue freely after a short rate limit; no lock, no human reset needed.
+    ACKED-token reissue unlocks after 24h without governance activity.
     """
     with db() as conn:
-        _touch(conn, author)
-        row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
-        if row is None:
-            return "ERROR: unknown author"
-        try:
-            meta = json.loads(row["meta"] or "{}")
-        except (ValueError, TypeError):
-            meta = {}
+        if not author:
+            return "ERROR: author required"
+        _touch(conn, author)  # registers the name if new ({} meta is fine)
+        meta = _get_meta(conn, author)
+        hint = ("persist it now, then ack_token (a successful governance call "
+                "also auto-acks)")
         if not meta.get("token_hash"):
             token = secrets.token_hex(16)
-            meta["token_hash"] = hashlib.sha256(token.encode()).hexdigest()
-            conn.execute("UPDATE participants SET meta=? WHERE author=?",
-                         (json.dumps(meta, ensure_ascii=False), author))
-            _audit(conn, author, "token_issue")
-            return (f"Token issued for '{author}' (shown ONCE, persist it now):\n"
-                    f"  {token}\n"
+            meta.update(token_hash=hashlib.sha256(token.encode()).hexdigest(),
+                        token_acked=False, token_issued_at=_now_iso())
+            _set_meta(conn, author, meta)
+            _audit(conn, author, "token_issue", note="provisional (unacked)")
+            return (f"Token issued for '{author}' (shown ONCE; {hint}):\n  {token}\n"
                     f"Governance calls (set_verdict / bump_revision / set_quorum) require it.")
-        # already issued: reissue path (dsh-5) — 24h since that author's last
-        # governance event (any verdict_events row by them, claude note ①)
+        if not meta.get("token_acked"):
+            # v2.1: unacked → free reissue, rate-limited only
+            issued_at = meta.get("token_issued_at")
+            waited_min = 0.0 if not issued_at else _hours_since(issued_at) * 60
+            if waited_min < UNACKED_REISSUE_MIN:
+                return (f"ERROR: previous token for '{author}' was never acknowledged "
+                        f"(claimant may have died before persisting). Free reissue "
+                        f"available in {UNACKED_REISSUE_MIN - waited_min:.0f} min "
+                        f"(rate limit), or ask the human for reset_token.")
+            token = secrets.token_hex(16)
+            meta.update(token_hash=hashlib.sha256(token.encode()).hexdigest(),
+                        token_acked=False, token_issued_at=_now_iso())
+            _set_meta(conn, author, meta)
+            _audit(conn, author, "token_reissue",
+                   note="unacked free reissue (v2.1: claimant never persisted)")
+            return (f"Token REISSUED for '{author}' — previous unacked token "
+                    f"invalidated ({hint}):\n  {token}")
+        # acked: the dsh-5 anti-hijack window (24h governance inactivity)
         last = conn.execute(
             "SELECT created_at FROM verdict_events WHERE author=?"
             " AND action IN ('verdict','verdict_free','bump_revision','set_quorum')"
@@ -301,18 +367,72 @@ def claim_token(author: str) -> str:
         ).fetchone()
         if last is None or _hours_since(last["created_at"]) >= REISSUE_AFTER_HOURS:
             token = secrets.token_hex(16)
-            meta["token_hash"] = hashlib.sha256(token.encode()).hexdigest()
-            conn.execute("UPDATE participants SET meta=? WHERE author=?",
-                         (json.dumps(meta, ensure_ascii=False), author))
+            meta.update(token_hash=hashlib.sha256(token.encode()).hexdigest(),
+                        token_acked=False, token_issued_at=_now_iso())
+            _set_meta(conn, author, meta)
             _audit(conn, author, "token_reissue",
-                   note="reissued after governance inactivity window")
-            return (f"Token REISSUED for '{author}' (old one invalidated; shown ONCE):\n"
-                    f"  {token}")
+                   note="acked reissue after governance inactivity window")
+            return (f"Token REISSUED for '{author}' (acked path; {hint}):\n  {token}")
         return (
-            f"ERROR: token for '{author}' already issued. Lost-token reissue unlocks "
-            f"after {REISSUE_AFTER_HOURS}h without governance activity by this name "
-            f"(last governance event: {last['created_at']})."
+            f"ERROR: token for '{author}' is issued AND acknowledged (durable "
+            f"possession proven). Reissue unlocks after {REISSUE_AFTER_HOURS}h "
+            f"without governance activity (last: {last['created_at']}); for an "
+            f"urgent human-authorized reset use reset_token(human_override=True)."
         )
+
+
+@mcp.tool
+def ack_token(author: str, token: str) -> str:
+    """Confirm you PERSISTED your governance token (v2.1 phase 2).
+
+    Call this right after writing the plaintext to durable storage (and
+    reading it back — onboarding R4). Acks are audited; a successful
+    governance call auto-acks too. Only acked tokens get the 24h lock —
+    unacked ones reissue freely (rate-limited), so a session dying between
+    claim and persistence no longer strands the identity.
+    """
+    with db() as conn:
+        _touch(conn, author)
+        meta = _get_meta(conn, author)
+        if not meta or not meta.get("token_hash"):
+            return "ERROR: no token issued for this name — claim_token first"
+        if meta.get("token_hash") != hashlib.sha256(token.encode()).hexdigest():
+            return "ERROR: token mismatch"
+        if meta.get("token_acked"):
+            return f"Token for '{author}' already acknowledged at {meta.get('token_acked_at')}."
+        meta["token_acked"] = True
+        meta["token_acked_at"] = _now_iso()
+        _set_meta(conn, author, meta)
+        _audit(conn, author, "token_ack", note="explicit ack_token after persistence")
+        return (f"Token acknowledged for '{author}' — durable possession recorded. "
+                f"This token is now protected by the {REISSUE_AFTER_HOURS}h reissue lock.")
+
+
+@mcp.tool
+def reset_token(author: str, human_override: bool = False) -> str:
+    """Human-authorized token reset (v2.1, R3): the protocol-level root path.
+
+    Clears the named identity's token so its next claim_token issues fresh —
+    no DB surgery, audited append-only. Threat-model bound: like
+    set_status's human_override, there is no protocol-layer auth; the flag is
+    to be set ONLY when the machine's user explicitly instructs it.
+    """
+    if not human_override:
+        return "ERROR: reset_token requires human_override=True (set it only when the human explicitly instructs)"
+    with db() as conn:
+        _touch(conn, author)
+        meta = _get_meta(conn, author)
+        if not meta:
+            return "ERROR: unknown author"
+        had = bool(meta.get("token_hash"))
+        meta.pop("token_hash", None)
+        meta.pop("token_acked", None)
+        meta.pop("token_acked_at", None)
+        meta.pop("token_issued_at", None)
+        _set_meta(conn, author, meta)
+        _audit(conn, author, "token_reset_human", note="human_override reset; next claim issues fresh")
+        return (f"Token cleared for '{author}' ({'had one' if had else 'had none'}). "
+                f"The identity's next claim_token issues a fresh token.")
 
 
 def _hours_since(utc: str) -> float:

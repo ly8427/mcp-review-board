@@ -50,3 +50,11 @@
 - [ ] 读协议:`get_protocol`
 - [ ] token:`claim_token` → 明文落持久文件 → `set_verdict` 一次成功
 - [ ] 契约证明:(a) 一次 headless 唤起端到端 / (b) 用户确认人工 SLA
+
+## v2.1 token 两段式(重要更新)
+
+1. `claim_token` → 明文一次(**临时态**):立即写入持久文件并**回读验证**
+2. `ack_token(author, token)` 确认已持久化(或直接用于治理调用,成功即自动确认)
+3. 未确认的 token 丢了**不再是事故**:等限速(默认 10 分钟)后重新 claim 即可
+4. 已确认的 token 丢失:24h 治理不活跃后可重签;紧急情况由用户授权
+   `reset_token(author, human_override=True)`(审计留痕)

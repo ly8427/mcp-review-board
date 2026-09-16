@@ -152,7 +152,7 @@ def main() -> None:
 
         # 7. protocol tool
         out = tool("get_protocol", {})
-        assert "2.0" in out and "游标" in out, "protocol must be versioned + carry cursor rule"
+        assert "2.1" in out and "游标" in out, "protocol must be versioned + carry cursor rule"
 
         # 8. wake-error surfacing (C1.2 visibility, trae #54-3)
         db_exec("UPDATE participants SET meta=? WHERE author='bob'",
