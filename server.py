@@ -37,6 +37,72 @@ DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = Path(os.environ.get("REVIEWBOARD_DB", str(DATA_DIR / "reviewboard.db")))
 SCHEMA_PATH = BASE_DIR / "schema.sql"
+# Mirror of schema.sql for pipx/wheel-installed layouts: a top-level module
+# ships alone, so schema.sql does not exist next to it. The repo file stays
+# authoritative — when both exist, the file wins. Keep the two in sync when
+# editing schema.sql.
+_SCHEMA_FALLBACK = """
+-- MCP Review Board schema (embedded fallback — see schema.sql, authoritative)
+CREATE TABLE IF NOT EXISTS threads (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    title              TEXT    NOT NULL,
+    context            TEXT,
+    status             TEXT    NOT NULL DEFAULT 'open',
+    created_at         TEXT    NOT NULL DEFAULT (datetime('now')),
+    author             TEXT,
+    quorum             TEXT,
+    per_author_budget  INTEGER NOT NULL DEFAULT 20,
+    revision           INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS comments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id  INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    parent_id  INTEGER REFERENCES comments(id) ON DELETE CASCADE,
+    author     TEXT    NOT NULL,
+    body       TEXT    NOT NULL,
+    file       TEXT,
+    line       INTEGER,
+    severity   TEXT,
+    status     TEXT    NOT NULL DEFAULT 'open',
+    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments(thread_id);
+CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments(parent_id);
+CREATE INDEX IF NOT EXISTS idx_comments_created ON comments(created_at);
+CREATE TABLE IF NOT EXISTS participants (
+    author     TEXT PRIMARY KEY,
+    first_seen TEXT NOT NULL,
+    last_seen  TEXT NOT NULL,
+    last_read  TEXT,
+    meta       TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS verdicts (
+    thread_id  INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+    author     TEXT    NOT NULL,
+    verdict    TEXT    NOT NULL CHECK (verdict IN ('pass','object')),
+    note       TEXT,
+    updated_at TEXT    NOT NULL,
+    PRIMARY KEY (thread_id, author)
+);
+CREATE TABLE IF NOT EXISTS verdict_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id  INTEGER,
+    author     TEXT    NOT NULL,
+    action     TEXT    NOT NULL,
+    from_v     TEXT,
+    to_v       TEXT,
+    revision   INTEGER,
+    costed     INTEGER NOT NULL DEFAULT 0,
+    note       TEXT,
+    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+
+def _load_schema() -> str:
+    if SCHEMA_PATH.exists():
+        return SCHEMA_PATH.read_text(encoding="utf-8")
+    return _SCHEMA_FALLBACK
 
 HOST = os.environ.get("REVIEWBOARD_HOST", "127.0.0.1")
 PORT = int(os.environ.get("REVIEWBOARD_PORT", "8765"))
@@ -237,7 +303,7 @@ def _connect_ro() -> sqlite3.Connection:
 
 def init_db() -> None:
     with _connect() as conn:
-        conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        conn.executescript(_load_schema())
         # v2 migrations for pre-v2 DBs (SQLite has no ADD COLUMN IF NOT EXISTS)
         cols = {r[1] for r in conn.execute("PRAGMA table_info(threads)")}
         for col, ddl in (

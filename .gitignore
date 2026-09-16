@@ -13,3 +13,16 @@ Thumbs.db
 # ephemeral agent task handoff files (never publish)
 *-task.txt
 *-accept.txt
+
+# demo runtime artifacts (scratch dbs, tokens, pids, generated reviewer files)
+demo/*.db
+demo/*.db-shm
+demo/*.db-wal
+demo/*.pid
+demo/*.token
+demo/reviewer-run.txt
+demo/real.mcp.json
+
+# packaging artifacts
+build/
+*.egg-info/
