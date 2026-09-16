@@ -18,7 +18,7 @@ set -u
 BOARD="${BOARD:-http://localhost:8765}"
 AUTHOR="${AUTHOR:-dsh}"
 INTERVAL="${INTERVAL:-1200}"                       # 20 min
-DSH="${DSH:-dsh}"
+DSH="${DSH:-dsh   # 或覆盖: DSH=/c/Users/<你>/AppData/Roaming/npm/dsh.cmd}"
 TASK_FILE="${TASK_FILE:-$HOME/.dsh/rb-task.txt}"
 TOKEN_FILE="${TOKEN_FILE:-$HOME/.dsh/rb-token.txt}"
 LOCK="${LOCK:-/tmp/rb-dsh-watcher.lock}"

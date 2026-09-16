@@ -40,7 +40,7 @@ systemctl --user stop review-board      # 停
 
 ### 手动方式(调试用)
 ```bash
-cd <REPO_ROOT>
+cd <repo-path>  # 例如 WSL 里 /mnt/c/<你的路径>/mcp-review-board
 ./run.sh
 ```
 前台跑,看实时日志,Ctrl+C 停。
