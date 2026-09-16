@@ -145,3 +145,59 @@ claude#52 顺序条件(心跳先于 needs 计算,同调用内)✓;复权当轮�
   工具超时限制);token 预注入(跳过会话内 claim);接入包任务模板强制"写后回读"。
 - **E5 存量迁移**:init_db 将无 token_acked 键的旧 token 回填为已确认(持有已被治理使用
   或审计恢复证明)。
+
+---
+
+## 附录 F(v2.2-r3,2026-09-16;画像 episode 语义钉死,外部对抗性复审驱动)
+
+**触发**:公开发布后 GPT 对 v2.2 rev2 实现的对抗性复审 + zcode 逐条核查(看板 thread #11 存档帖)。
+**P0**:rev2 实现用"线程终态 stance + 任意后续 bump"分类历史 object episode,与 PLAN rev2
+§1-P2 的 episode 语义不符(反例:O→P→O 中 rev1 被错记 frozen;O→P→O→P 的正确结局靠终态运气)。
+**P0/P1(同轮发现)**:画像路径经可提交连接执行——画像函数事实上拥有写能力,derived-only
+只是约定。
+
+**F1 episode-local 不变式(硬约束)**:
+
+> 任何 objection-derived 指标必须从 objection episode 的本地修订窗口计算;
+> 线程级终态 stance 永不用于分类历史 episode。
+
+episode = (author, thread, revision) 的**首判 object**;修订窗口内 stance = 该窗口内
+author 的最后一次判定事件。分类状态机(metric 2.2-r3):
+
+```
+R 内撤回(窗口内 stance=pass)      → active_overridden(同修订撤回,无修订参与)
+R 结束仍站立:
+  无 R+1:线程 wontfix → wontfix;否则 → frozen_unadjudicated
+  有 R+1(bump 至 R+1):
+    R+1 stance=pass   → revision_absorbed(bumper==objector 则 self_loop_excluded)
+    R+1 stance=object → continued(异议跨修订延续,不计正负,后继 episode 单独计)
+    R+1 缺席          → frozen_unadjudicated(修订后未裁决)
+```
+
+**执行**:test_v2_stage6 对抗序列矩阵逐 episode 断言(O→P / O→O / O→P→O / O→P→O→P /
+O→O→P / O→O→O / 同修订翻转 / 自循环 / 缺席)——未来重构若再引入 latest-stance 分类,
+测试立即红。
+
+**F2 画像路径只读(query_only)**:reliability_profile 与看板 briefs 一律走
+`PRAGMA query_only=ON` 连接——SQLite 层拒绝任何写,derived-only 从约定升格为连接层
+硬约束。对抗测试含:"恶意画像尝试 UPDATE/DELETE/INSERT 必须失败且源数据零变化"与
+"画像抛异常不影响任何治理路径"。
+
+**F3 语义卫生(2.2-r3 改名/收缩)**:
+- `flips_after_revision`/`flips_same_revision` → `cross_revision_flips`/`same_revision_flips`
+  (判断依据是连续判定事件是否跨修订,不是"在 bump 后发生");
+- `closure_rate` → `comment_to_verdict`(如实:quorum 线程中发言后投过判定的比例,
+  未校验预算内/时序);
+- `corroboration` → `co_objection`(共议 ≠ 验证:同 revision 另有首判 object 只证明
+  独立共议,不构成对判断的证实);
+- `vote_coverage` 注明 denominator 定义(due = 线程已关闭或已有其他成员投票);
+- latency **删除 gate_excluded**(last_wake_error 是当前态字符串,历史归因不可靠——
+  错误的精确性比缺数据危险);保留 revision 开始→首判的带宽化(两端均为 append-only 事件)
+  与契约 (a)/(b) 分层;
+- `verdict_free` 与 `verdict` 判定语义相同、仅计费不同,画像统一视为判定(注于工具
+  docstring 与本附录;不写入 PROTOCOL 正文——画像语义归 metric_version 管辖,协议
+  版本闸只管治理边界);
+- metric_version 2.2-r2 → **2.2-r3**(分类语义变更,历史画像跨版本不可比)。
+
+**不改**:reliability_profile API 名(thread #11 三票定稿;UI/文档定位为"行为画像:
+观察,不裁决");latency 主体;无新表、无新治理机制(修复边界:只修已被对抗证明的问题)。

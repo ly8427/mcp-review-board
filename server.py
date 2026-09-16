@@ -111,7 +111,7 @@ def _is_active(last_seen: str | None, now: datetime | None = None) -> bool:
 
 
 # --- v2 A2: the protocol ----------------------------------------------------
-PROTOCOL_VERSION = "2.1"
+PROTOCOL_VERSION = "2.2"
 PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 
 ## 成员
@@ -138,6 +138,14 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
   get_thread/探针/其它读取永不推进(C3)。
 - needs_attention 为空转时一句话终止,不读全帖;优先级 awaiting > mentions > new。
 - @点名是送达信号;被点名或被期待判定时应尽快回应(契约 (b) 成员由用户唤起,沉默不计超时)。
+
+## 可靠性画像(v2.2,版本闸条款)
+- reliability_profile(author) 是**只读派生视图**:从 verdict_events/comments 现算,
+  无表、无持久化字段(derived-only),输出原始分量——**没有复合分**。
+- 画像描述行为,**不改变任何一票的权重,不进入任何判定路径**;needs_attention/
+  quorum 列表/排序键/治理工具返回体一律不含画像;判断画像的真值是内生的,仅供参考。
+- pull-only:画像变化不推送、不进 attention 经济;不可删除/重置(永久行为记录的派生)。
+- **本条款即版本闸**:任何修改都要求 bump 本协议版本——一次公开的审计事件。
 """
 
 
@@ -194,6 +202,17 @@ def _connect() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
     conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
+
+
+def _connect_ro() -> sqlite3.Connection:
+    """Read-only connection for derived views (v2.2 附录 F2): query_only makes
+    SQLite REFUSE any INSERT/UPDATE/DELETE on this connection, so a buggy or
+    hostile profile aggregation is structurally unable to mutate governance
+    data — derived-only as a connection-layer constraint, not a convention.
+    Callers must not wrap this in a committing `with conn:` block."""
+    conn = _connect()
+    conn.execute("PRAGMA query_only=ON;")
     return conn
 
 
@@ -1176,6 +1195,307 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
     return "\n".join(lines)
 
 
+# --- v2.2 P2: reliability profile (derived-only, zero governance weight) ------
+METRIC_VERSION = "2.2-r3"
+INSUFFICIENT_AT = 5  # judgment section flags 数据不足 below this many first verdicts
+
+
+def _ts(utc: str | None) -> datetime | None:
+    if not utc:
+        return None
+    try:
+        return datetime.strptime(utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _lag_band(secs: float) -> str:
+    if secs < 86400:
+        return "当天内"
+    if secs < 3 * 86400:
+        return "3 天内"
+    return "更久"
+
+
+_LAG_ORDER = {"当天内": 0, "3 天内": 1, "更久": 2}
+
+
+def _profile_numbers(conn: sqlite3.Connection, author: str) -> dict:
+    """v2.2 reliability profile — THE one aggregation (tool and board share it).
+
+    Derived-only: pure reads; callers pass a query_only connection (附录 F2)
+    so even a buggy or hostile aggregation cannot write. Zero governance
+    weight — test_v2_stage6 part B enforces it by randomizing/attacking this
+    function and asserting identical governance outcomes.
+
+    Appendix F1 invariant: every objection-derived metric is computed from the
+    episode's LOCAL revision window; thread-level terminal stance NEVER
+    classifies a historical episode. Episode = (author, thread, revision)
+    first-verdict object — enforced by the adversarial sequence matrix
+    (O→P / O→O / O→P→O / O→P→O→P / O→O→P / O→O→O …) in test_v2_stage6.
+
+    Participation facts the board deliberately does NOT persist (heartbeat
+    history, watcher-gate periods) are reported as CURRENT state only, never
+    fabricated from comment gaps — a silent-but-alive member must not be
+    misread as stalled (the attribution error the v2.2 review rejected).
+    """
+    p = conn.execute(
+        "SELECT author, first_seen, last_seen, meta FROM participants WHERE author=?",
+        (author,),
+    ).fetchone()
+    if p is None:
+        return {"author": author, "error": "not registered — any author-carrying call registers"}
+    try:
+        meta = json.loads(p["meta"] or "{}")
+    except (ValueError, TypeError):
+        meta = {}
+
+    now = datetime.now(timezone.utc)
+    threads = conn.execute(
+        "SELECT id, status, quorum, created_at FROM threads WHERE quorum IS NOT NULL"
+    ).fetchall()
+    thread_created = {t["id"]: t["created_at"] for t in threads}
+    thread_status = {t["id"]: t["status"] for t in threads}
+
+    # ---- participation (observable facts, no endogenous ground truth) ----
+    suspended = not _is_active(p["last_seen"])
+    wake_err = meta.get("last_wake_error") or None
+
+    awaiting_threads: list[int] = []
+    oldest_pending_band = None
+    commented_tids = {
+        r[0] for r in conn.execute(
+            "SELECT DISTINCT thread_id FROM comments WHERE author=?", (author,))
+    }
+    ctv_n = ctv_d = vote_n = vote_d = 0
+    for t in threads:
+        if author not in json.loads(t["quorum"]):
+            continue
+        has_own = conn.execute(
+            "SELECT 1 FROM verdicts WHERE thread_id=? AND author=?", (t["id"], author)
+        ).fetchone() is not None
+        if t["id"] in commented_tids:
+            ctv_d += 1
+            if has_own:
+                ctv_n += 1
+        others_voted = conn.execute(
+            "SELECT 1 FROM verdicts WHERE thread_id=? AND author != ? LIMIT 1",
+            (t["id"], author),
+        ).fetchone() is not None
+        if t["status"] != "open" or others_voted:
+            vote_d += 1
+            if has_own:
+                vote_n += 1
+        if t["status"] == "open" and not has_own:
+            awaiting_threads.append(t["id"])
+            last_act = conn.execute(
+                "SELECT MAX(created_at) FROM comments WHERE thread_id=?", (t["id"],)
+            ).fetchone()[0]
+            ts = _ts(last_act) or _ts(thread_created.get(t["id"]))
+            if ts:
+                band = _lag_band((now - ts).total_seconds())
+                if oldest_pending_band is None or _LAG_ORDER[band] > _LAG_ORDER[oldest_pending_band]:
+                    oldest_pending_band = band
+    participation = {
+        "heartbeat": {
+            "suspended_now": suspended,
+            "last_seen": _relative(p["last_seen"]),
+            "first_seen": _relative(p["first_seen"]),
+        },
+        "watcher_gate": {"currently_gated": bool(wake_err)},
+        "awaiting_verdict": {
+            "threads": awaiting_threads,
+            "oldest_pending_band": oldest_pending_band,
+        },
+        "comment_to_verdict": {
+            "n": ctv_n, "d": ctv_d,
+            "note": "quorum 线程中发过言的,最终投过判定(任意修订)的比例;未校验预算内/时序",
+        },
+        "vote_coverage": {
+            "n": vote_n, "d": vote_d,
+            "due": "线程已关闭(status≠open)或已有其他成员投票",
+        },
+        "note": ("历史停摆次数/闸门区间未持久化(derived-only,无新表)——只报当前态;"
+                 "A1 ⚠️ 徽章即同一信号,画像不吞掉它"),
+    }
+    if wake_err:
+        participation["watcher_gate"]["last_wake_error"] = wake_err
+
+    # ---- judgment (endogenous ground truth — display only) ----
+    # verdict_free and verdict carry the SAME judgment semantics (only the
+    # billing differs — first verdict per (author, revision) is free); the
+    # profile treats them uniformly as verdicts (附录 F3).
+    events = conn.execute(
+        "SELECT id, thread_id, revision, to_v, created_at FROM verdict_events"
+        " WHERE author=? AND action IN ('verdict','verdict_free') ORDER BY id",
+        (author,),
+    ).fetchall()
+    first_by_tr: dict[tuple[int, int], sqlite3.Row] = {}
+    stance_by_tr: dict[tuple[int, int], str] = {}   # window-final stance per (tid, rev)
+    for e in events:
+        first_by_tr.setdefault((e["thread_id"], e["revision"]), e)
+        stance_by_tr[(e["thread_id"], e["revision"])] = e["to_v"]
+    total_firsts = len(first_by_tr)
+    object_firsts = sum(1 for e in first_by_tr.values() if e["to_v"] == "object")
+
+    # stance flips: consecutive verdict events on a thread where the stance
+    # changed. Split by whether the two events sit in DIFFERENT revisions —
+    # an object withdrawn after a revision is evidence-driven (healthy);
+    # withdrawn within the same revision is stance instability (claude #68:
+    # G2 义务性改判 ≠ 立场不稳).
+    per_thread: dict[int, list[sqlite3.Row]] = {}
+    for e in events:
+        per_thread.setdefault(e["thread_id"], []).append(e)
+    flips_cross = flips_same = 0
+    for evs in per_thread.values():
+        for prev, cur in zip(evs, evs[1:]):
+            if prev["to_v"] != cur["to_v"]:
+                if cur["revision"] > prev["revision"]:
+                    flips_cross += 1
+                else:
+                    flips_same += 1
+
+    # prefetches (keeps the loop O(1) per episode instead of O(episodes) SQL):
+    # bump (author, time) by the revision it CREATED; every member's first
+    # stance per (thread, revision) — for co-objection.
+    bump_by_tr: dict[tuple[int, int], tuple[str, str]] = {}
+    for b in conn.execute(
+        "SELECT thread_id, revision, author, created_at FROM verdict_events"
+        " WHERE action='bump_revision' ORDER BY id"
+    ).fetchall():
+        bump_by_tr.setdefault((b["thread_id"], b["revision"]), (b["author"], b["created_at"]))
+    first_stance_all: dict[tuple[int, int], dict[str, str]] = {}
+    for o in conn.execute(
+        "SELECT thread_id, revision, author, to_v FROM verdict_events"
+        " WHERE action IN ('verdict','verdict_free') ORDER BY id"
+    ).fetchall():
+        first_stance_all.setdefault((o["thread_id"], o["revision"]), {}).setdefault(
+            o["author"], o["to_v"])
+
+    outcomes = {"revision_absorbed": 0, "active_overridden": 0,
+                "frozen_unadjudicated": 0, "wontfix": 0, "self_loop_excluded": 0,
+                "continued": 0}
+    co_obj = lone = 0
+    latency = {"当天内": 0, "3 天内": 0, "更久": 0}   # gate_excluded dropped in 2.2-r3
+    for (tid, rev), e in first_by_tr.items():
+        # latency band for every first verdict (revision start → verdict — both
+        # append-only events; no gate-period attribution, it was unreliable)
+        t0 = None
+        if rev and rev > 1:
+            b = bump_by_tr.get((tid, rev))
+            if b:
+                t0 = _ts(b[1])
+        if t0 is None:
+            t0 = _ts(thread_created.get(tid))
+        t1 = _ts(e["created_at"])
+        if t0 and t1:
+            latency[_lag_band((t1 - t0).total_seconds())] += 1
+        if e["to_v"] != "object":
+            continue
+        # --- episode-local state machine (附录 F1): classify THIS episode from
+        # ITS revision window only; thread-terminal stance never reaches here.
+        if stance_by_tr.get((tid, rev)) == "pass":
+            outcomes["active_overridden"] += 1   # withdrawn inside R, no revision involved
+        else:                                     # still standing when R ended
+            bump = bump_by_tr.get((tid, rev + 1))
+            if bump is None:
+                # no successor revision: episode standing at the thread's end
+                if thread_status.get(tid) == "wontfix":
+                    outcomes["wontfix"] += 1
+                else:
+                    outcomes["frozen_unadjudicated"] += 1
+            else:
+                next_stance = stance_by_tr.get((tid, rev + 1))
+                if next_stance == "pass":
+                    if bump[0] == author:
+                        outcomes["self_loop_excluded"] += 1
+                    else:
+                        outcomes["revision_absorbed"] += 1
+                elif next_stance == "object":
+                    outcomes["continued"] += 1     # objection carried into R+1
+                else:
+                    outcomes["frozen_unadjudicated"] += 1  # absent on R+1
+        # co-objection (NOT verification): another member's FIRST verdict on
+        # the same (thread, revision) also landed 'object' — the anti-self-play
+        # antibody; co-objection proves independent agreement to object only.
+        stances = first_stance_all.get((tid, rev), {})
+        if any(a != author and v == "object" for a, v in stances.items()):
+            co_obj += 1
+        else:
+            lone += 1
+
+    judgment = {
+        "first_verdicts": total_firsts,
+        "object_firsts": object_firsts,
+        "object_rate": f"{object_firsts}/{total_firsts}",
+        "outcomes": outcomes,
+        "stance_flips": {"cross_revision_flips": flips_cross,
+                         "same_revision_flips": flips_same},
+        "co_objection": {"co_objected": co_obj, "lone": lone},
+        "insufficient": total_firsts < INSUFFICIENT_AT,
+    }
+
+    latency["contract"] = meta.get("contract") if meta.get("contract") in ("a", "b") else None
+    latency["note"] = ("revision 开始→首判,带宽化展示(无中位数,防速判激励);"
+                       "契约 (a)/(b) 分层读 meta.contract(未记录为 null);"
+                       "无闸门期归因(2.2-r3 起移除 gate_excluded——last_wake_error "
+                       "为当前态,历史归因不可靠)")
+    return {
+        "author": author,
+        "metric_version": METRIC_VERSION,
+        "derived_only": True,
+        "governance_weight": 0,
+        "participation": participation,
+        "judgment": judgment,
+        "latency": latency,
+    }
+
+
+def _profile_brief(prof: dict) -> str:
+    """One-line board summary — raw components only, NEVER a composite score
+    (protocol v2.2: ✓78%-style rankable scalars are the red line made UI).
+    Defensive .get access so a stubbed/broken aggregation can never 500 the
+    board — display layer states facts, it does not propagate profile errors."""
+    j = prof.get("judgment") if isinstance(prof, dict) else None
+    if not isinstance(j, dict) or j.get("first_verdicts", 0) < INSUFFICIENT_AT:
+        return "画像:数据不足"
+    o = j.get("outcomes") or {}
+    return (f"首判{j.get('first_verdicts', 0)}"
+            f" 吸收{o.get('revision_absorbed', 0)}"
+            f"/否决{o.get('active_overridden', 0)}"
+            f"/冻结{o.get('frozen_unadjudicated', 0)} v{prof.get('metric_version')}")
+
+
+@mcp.tool
+def reliability_profile(author: str) -> str:
+    """Read-only derived behavior profile for a member (v2.2, metric 2.2-r3).
+
+    An OBSERVATIONAL statistic, not a verdict on anyone: `participation`
+    (observable facts — heartbeat/gate state, awaiting verdicts,
+    comment_to_verdict & vote_coverage rates; no endogenous ground truth) and
+    `judgment` (episode-local five-way classification of every objection:
+    revision_absorbed / active_overridden / frozen_unadjudicated / wontfix /
+    continued, self-loops excluded from the positive; object_rate with the
+    numerator pinned to first-verdict stance per (author, revision); stance
+    flips split by whether they cross a revision; co_objection vs lone).
+    verdict_free and verdict are the same judgment event (billing differs).
+
+    Raw components only — NO composite score, by protocol. Zero governance
+    weight: never enters any decision path (behavior-invariance tested);
+    pull-only; derived on read over a query_only connection (no writes
+    possible at the SQLite layer, 附录 F2).
+
+    Args:
+        author: the member to profile (your own name or another's).
+    """
+    conn = _connect_ro()
+    try:
+        data = _profile_numbers(conn, author)
+    finally:
+        conn.close()
+    return json.dumps(data, ensure_ascii=False, indent=1)
+
+
 # --- read-only HTML board --------------------------------------------------
 def _board_html() -> str:
     with _connect() as conn:
@@ -1205,6 +1525,24 @@ def _board_html() -> str:
                 miss = [n for n in names if n not in have and n in active]
                 if miss:
                     awaiting_map[t["id"]] = miss
+        # v2.2: per-participant profile briefs — same aggregation the tool uses
+        # (_profile_numbers), raw components only, on a query_only connection
+        # (附录 F2): a broken/hostile aggregation can never mutate data from
+        # the display path either.
+        briefs: dict[str, str] = {pp["author"]: "" for pp in participants}
+        try:
+            roc = _connect_ro()
+            try:
+                for pp in participants:
+                    try:
+                        briefs[pp["author"]] = _profile_brief(
+                            _profile_numbers(roc, pp["author"]))
+                    except Exception:
+                        briefs[pp["author"]] = ""  # display never breaks on profile errors
+            finally:
+                roc.close()
+        except Exception:
+            pass
 
     strip = []
     for p in participants:
@@ -1222,7 +1560,11 @@ def _board_html() -> str:
         err = ""
         if meta.get("last_wake_error"):
             err = f" <span title='watcher wake failures'>🔧</span>"
-        strip.append(f"<span class='p'>{mark} {escape(p['author'])} {_relative(last)}{err}</span>")
+        brief = briefs.get(p["author"], "")
+        brief_html = f" <span class='meta'>{escape(brief)}</span>" if brief else ""
+        strip.append(
+            f"<span class='p'>{mark} {escape(p['author'])} {_relative(last)}{err}{brief_html}</span>"
+        )
 
     parts = [
         "<!doctype html><html><head><meta charset='utf-8'>",
