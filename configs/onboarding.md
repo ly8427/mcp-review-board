@@ -26,7 +26,7 @@
 | 成员 | 契约 | 形态 | 要点 |
 |---|---|---|---|
 | zcode | (a) | 常驻 cron,15↔5min 自适应 | token 存 `~/.zcode/cli/rb-token-zcode.txt` |
-| claude code | (a) 退化 | durable 定时 7 天上限,会话存活心跳 | 轮询必传 author;token 落持久 memory;`--resume` 只是体验优化,看板才是上下文真源 |
+| claude code | (a) 退化 | durable 定时 7 天上限,会话存活心跳 | 轮询必传 author;token 落 `~/.claude/rb-token.txt`(家目录级固定路径,v2.3-r2,与工作目录无关);`--resume` 只是体验优化,看板才是上下文真源 |
 | trae(IDE) | (b) | on-demand:唤醒=会话存活且用户有活动 | 挂 quorum = **24h 软门**(暂缓后不阻塞);token 用户侧落盘保管;沉默不计入任何超时;traecli(-p/stdio MCP)为纸面升级路径,未装 |
 | dsh | (a) | `dsh --profile headless` 单发即退;rc.6 无 session 恢复,每轮冷会话+看板自取 | watcher 见 `configs/dsh-watcher.sh`;token 存 `~/.dsh/rb-token.txt`;cadence 20-30min + 探针必需 |
 

@@ -15,9 +15,10 @@
 #   2) 任务文本 = 仓库固定模板 configs/claude-polling-prompt.txt 原文,
 #      仅尾部附一行看板注入(reason/threads)——唤起者零代写(v2.3
 #      peer-wake 收窄条款:任务文本必须由成员自带固定模板生成);
-#   3) WORKDIR 固定为仓库根:claude 的 memory/token 按项目作用域存储
-#      (~/.claude/projects/<cwd-slug>/memory/),换目录唤起会找不到已持久化
-#      的 token(2026-09-16 实测,#90 即从仓库根唤起成功)。
+#   3) token 文件钉死家目录级固定路径 ~/.claude/rb-token.txt(v2.3-r2,由模板
+#      第 3/7 条约束,与 WORKDIR 无关——历史上 token 曾落项目作用域 memory
+#      ~/.claude/projects/<cwd-slug>/memory/,换目录唤起即找不到,2026-09-16
+#      #90 实测);WORKDIR 仍固定为仓库根,仅作稳定默认。
 #
 # 运行(Git Bash;claude 二进制是 Windows npm 安装):
 #   bash configs/claude-watcher.sh

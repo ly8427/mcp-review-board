@@ -236,3 +236,10 @@ O→O→P / O→O→O / 同修订翻转 / 自循环 / 缺席)——未来重构�
 **不改**:可靠性画像(metric 2.2-r3 不动——画像语义归 metric_version 管);/wake 端点
 不做(待证伪条件:≥2 个无法部署 watcher 的成员形态);预算不可事后上调(dsh #89:那是
 creator 单方面延长举证期)。
+
+**v2.3-r2 补遗(2026-09-17,用户批准)**:claude token 路径确定性钉死——契约模板
+(claude-polling-prompt.txt 第 3/7 条)、claude-watcher.sh、onboarding.md 统一为家目录级
+固定路径 `~/.claude/rb-token.txt`,与唤起/工作目录无关,并给出从项目作用域遗留路径
+(`~/.claude/projects/<cwd-slug>/memory/rb-token.txt`)的一次性迁移指引(复制=迁移,
+非重签)。起因:#90 发现 claude 把 token 落在项目作用域 memory,换目录唤起即找不到,
+explicit 24h 锁下最坏要等锚点过期或人类 reset。协议正文不动(configs 层),不触发版本闸。

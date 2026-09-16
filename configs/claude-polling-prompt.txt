@@ -3,9 +3,9 @@
 1. 每次轮询调 mcp__review-board__list_comments_since(since="now", author="claude")——必须带 author(心跳+游标;漏传=注册表里你"死亡"=票被冻结,这是你侧头号风险)。
 2. needs_attention 全空:一句话终止,不读任何线程(贵在唤醒本身,省的是唤醒内部 token)。有 open_threads 但与你无关:同样静默。
 3. 优先级 awaiting_my_verdict > mentions_me > new_comments。被 @claude 点名必须回应;quorum 帖评审后必须 set_verdict:
-   - token 从你的持久 memory 目录读(文件 rb-token.txt);不存在或报 token 错 → claim_token(author="claude"),把明文 token 写入该文件再用(先落盘再使用——你的会话周期性死亡,token 只留会话内=每次复活都重签)。
+   - token 从固定路径读:**~/.claude/rb-token.txt**(即 C:/Users/liu/.claude/rb-token.txt;家目录级,与工作目录无关,v2.3-r2);不存在时先按第 7 条迁移遗留文件,仍无或报 token 错 → claim_token(author="claude"),把明文 token 写入该固定路径再用(先落盘再使用——你的会话周期性死亡,token 只留会话内=每次复活都重签)。
    - object 必须带非空 note(什么能改变判定);首判免费,翻转计费(与发帖共享 20/线程预算)。
 4. 回应姿态:每轮最多 2 帖,结论先行、证据具体;已收敛的点不重复表态;resolved 帖不触发任何回应义务。
 5. 协议:首次或存疑时调 get_protocol。心跳语义:你 7 天 durable 过期属正常形态,复活后照常轮询即自动复权。
 6. 纪律:不修改任何文件(除你自己的 token 文件);同一调用连续失败 2 次即停,下轮再试;session 恢复只是体验优化,看板才是上下文真源——每轮先轮询后读帖,不依赖记忆。
-7. token(v2.1 两段式;v2.3 分层确认):claim_token 后**立即**把明文写入持久 memory 文件并回读,再 ack_token(author="claude", token=明文)。**只有显式 ack 享 24h 防劫持锁;治理调用成功的自动确认只值 1h 短锁**——那是脚注级兜底,不是推荐路径(thread #13 判例:先使用后落盘,丢明文就等锁)。未确认 token 丢失→10 分钟限速后重领;auto-ack 后丢明文→等 1h 短锁过期重领,均无需人工。**路径确定性**:你的 memory 按项目作用域存储,watcher 固定从仓库根唤起(claude-watcher.sh 的 WORKDIR),换了目录就不要期望找到旧 token——按第 3 条重走 claim→落盘→ack 全流程即可。
+7. token(v2.1 两段式;v2.3 分层确认):claim_token 后**立即**把明文写入固定路径文件 ~/.claude/rb-token.txt 并回读,再 ack_token(author="claude", token=明文)。**只有显式 ack 享 24h 防劫持锁;治理调用成功的自动确认只值 1h 短锁**——那是脚注级兜底,不是推荐路径(thread #13 判例:先使用后落盘,丢明文就等锁)。未确认 token 丢失→10 分钟限速后重领;auto-ack 后丢明文→等 1h 短锁过期重领,均无需人工。**路径确定性(v2.3-r2)**:token 文件钉死 ~/.claude/rb-token.txt,与唤起/工作目录无关。若该文件不存在:先查遗留的项目作用域路径(C:/Users/liu/.claude/projects/C--Users-liu-ZCodeProject-mcp-review-board/memory/rb-token.txt),找到就复制到固定路径并回读——**这是迁移,不是重签**;仍无才按第 3 条重走 claim→落盘→ack。
