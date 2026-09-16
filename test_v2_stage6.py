@@ -204,9 +204,11 @@ def part_a_semantics():
         sv(tg, "pass", "a"); sv(tg, "pass", "b")
         assert "resolved" in tool("get_thread", {"thread_id": tg})
         # TI standing object + wontfix terminal
+        # (v2.3: quorum-thread wontfix is gated — only human_override lands it)
         ti = mk("TI", ["a", "b"])
         sv(ti, "object", "b", note="TI r1"); sv(ti, "pass", "a")
-        tool("set_status", {"thread_id": ti, "status": "wontfix", "author": "a"})
+        assert "ERROR" in tool("set_status", {"thread_id": ti, "status": "wontfix", "author": "a"})
+        tool("set_status", {"thread_id": ti, "status": "wontfix", "author": "a", "human_override": True})
         # TH object → bump → absent on R+1 → suspension → resolved without b
         th = mk("TH", ["a", "b", "c"])
         sv(th, "object", "b", note="TH r1"); bump(th)
@@ -261,12 +263,12 @@ def part_a_semantics():
 
         # part C (reuse this live server): protocol gate + board raw components
         proto = tool("get_protocol", {})
-        assert "v2.2" in proto.splitlines()[0] and "版本闸" in proto, proto[:120]
+        assert "v2.3" in proto.splitlines()[0] and "版本闸" in proto, proto[:120]
         page = urllib.request.urlopen(f"http://localhost:{PORT}/", timeout=10).read().decode()
         assert "画像:数据不足" in page           # c (4 firsts) → insufficient branch
         assert "首判19" in page                   # b → raw components, no composite
         assert "2.2-r3" in page                   # metric version travels with the brief
-        assert "协议 protocol v2.2" in page
+        assert "协议 protocol v2.3" in page
     finally:
         proc.send_signal(signal.SIGTERM); proc.wait(timeout=10)
     print("✅ part A+C: adversarial sequence matrix — episode-local five-way "
@@ -313,7 +315,7 @@ def run_governance_script(db, patch):
                                         "quorum": ["a", "b"]}).split("#")[1].split(":")[0])
         gov.append(sv(t3, "object", "b", note="keep"))
         gov.append(sv(t3, "pass", "a"))
-        gov.append(tool("set_status", {"thread_id": t3, "status": "wontfix", "author": "a"}))
+        gov.append(tool("set_status", {"thread_id": t3, "status": "wontfix", "author": "a", "human_override": True}))
         gov.append(tool("post_comment", {"thread_id": t3, "author": "a", "body": "close"}))
         gov.append(tool("reply_comment", {"comment_id": 3, "author": "b", "body": "ack"}))
         gov.append(sv(t1, "object", "b", note="reopen check"))    # reopen path

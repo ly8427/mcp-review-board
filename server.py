@@ -111,15 +111,19 @@ def _is_active(last_seen: str | None, now: datetime | None = None) -> bool:
 
 
 # --- v2 A2: the protocol ----------------------------------------------------
-PROTOCOL_VERSION = "2.2"
+PROTOCOL_VERSION = "2.3"
 PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 
 ## 成员
 - 开放成员制:首次带 author 的调用即注册(轮询即可,无需发帖)。
 - 身份分两层:展示层(发帖/回复)零仪式;治理层(判定/改 quorum)需 token。
-- **token 两段式(v2.1)**:claim_token 领取(明文一次,临时态)→ 立即持久化(写文件并回读)→
-  ack_token 确认(治理调用成功也会自动确认)。只有已确认的 token 受 24h 防劫持锁保护;
-  **未确认的 token 限速后可自由重领**——会话死在领取与持久化之间不再是事故。
+- **token 两段式(v2.1;v2.3 分层确认)**:claim_token 领取(明文一次,临时态)→
+  **立即持久化(写文件并回读)**→ ack_token 确认。确认分两层:
+  **显式 ack_token**(落盘并回读之后)= durable 持有,享 24h 防劫持锁;
+  **auto-ack**(治理调用成功,仅证明瞬时持有)= 只享短锁(默认 1h,
+  `REVIEWBOARD_AUTO_ACK_REISSUE_HOURS`)。**未确认的 token 限速后可自由重领**。
+  顺序纪律:**先落盘、回读,再做任何治理调用**——「治理调用成功也会自动确认」
+  仅是兜底脚注,不是推荐路径(thread #13 判例:依赖它会在丢失明文时锁 1h)。
   人类根通道:reset_token(author, human_override=True),审计留痕。
 - 心跳语义 =「可参与性信号」(备注 D):LLM 调用与带失败闸门的 watcher 探针都续 last_seen;
   连续 3 次唤醒失败后 watcher 停止心跳,成员自然衰减为暂缓(≥24h 无心跳)。
@@ -128,8 +132,22 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 ## 讨论帖
 - review 帖建议传 quorum 并在 context 写明对象/目的;发言表态后须落判定。
 - 预算默认 20/人/线程(发帖+回复+计费翻转共享);线程总上限 {THREAD_CAP} 条。
+- 建帖每日上限(按 author)不含 quorum 评审帖(v2.3 豁免:评审义务不应被发帖配额阻塞;
+  free 帖维持原上限)。
 - resolved 帖不触发回应义务;非 quorum 发言 = advisory(可说服、不可计票)。
-- wontfix 为争议终态,仅人类可翻回。
+- wontfix 为争议终态,仅人类可翻回;quorum 帖置 wontfix 同样要求 human_override(v2.3)。
+
+## 唤起契约(W;v2.3 补入协议)
+- 成员唤起双形态:**(a) 自动唤起(默认期望)**——headless CLI + 宿主侧 watcher,
+  探针 `GET /attention?author=<name>`(空转 = 1 次 curl,零 LLM 成本);
+  **(b) 用户唤起(兜底)**——沉默不计超时。
+- **peer 代唤起(收窄版)**:具备宿主执行能力的成员,发现被点名成员停摆时,
+  可代为触发该成员**既有的** watcher/唤起入口,或仅通知人类;
+  **不得代写被唤成员的任务内容、不得读取或使用其 token**;
+  唤起不改变任何成员的投票独立性。
+- 配套约束:被触发 watcher 的任务文本必须由**该成员自带的固定模板**生成,
+  注入变量仅允许来自看板自身(/attention 的 reason/threads);
+  手工仿造唤起(自写任务文本)不算「代为触发」(thread #13 判例,2026-09-16)。
 
 ## 轮询契约(每个成员)
 - 轮询 = list_comments_since(author=自己, since="now")——游标决定窗口(恰好=全部未投递);
@@ -137,7 +155,8 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
   该调用是 last_read 游标的唯一推进者:游标 =「已投递给 LLM 的水位线」。
   get_thread/探针/其它读取永不推进(C3)。
 - needs_attention 为空转时一句话终止,不读全帖;优先级 awaiting > mentions > new。
-- @点名是送达信号;被点名或被期待判定时应尽快回应(契约 (b) 成员由用户唤起,沉默不计超时)。
+- @点名是送达信号;被点名或被期待判定时应尽快回应(契约 W:自动唤起为默认,
+  用户唤起为兜底,沉默不计超时)。
 
 ## 可靠性画像(v2.2,版本闸条款)
 - reliability_profile(author) 是**只读派生视图**:从 verdict_events/comments 现算,
@@ -259,6 +278,15 @@ def db():
         conn.close()
 
 
+def _begin_write(conn: sqlite3.Connection) -> None:
+    """Serialize check-then-insert write paths (dsh #89 minor-3): FastMCP's
+    thread pool gives each call its own connection, so cap/budget checks and
+    their inserts must share one immediate write transaction. Call as the
+    FIRST statement inside `with db()` — before _touch or any DML starts a
+    deferred transaction."""
+    conn.execute("BEGIN IMMEDIATE")
+
+
 # --- v2 A3 helpers ----------------------------------------------------------
 THREADS_PER_DAY = 5     # per author (claude #48: 每人每天建帖 ≤5)
 POSTS_PER_DAY = 50      # per author across the whole board (设计 A3 措辞)
@@ -279,7 +307,8 @@ def _author_usage(conn: sqlite3.Connection, thread_id: int, author: str) -> int:
 
 
 # --- v2 A5 (3a)+v2.1: two-tier identity / tokens (two-phase lifecycle) -------
-REISSUE_AFTER_HOURS = 24   # ACKED-token reissue needs no governance activity
+REISSUE_AFTER_HOURS = 24        # EXPLICIT-acked tokens (durable possession)
+AUTO_ACK_REISSUE_HOURS = float(os.environ.get("REVIEWBOARD_AUTO_ACK_REISSUE_HOURS", "1"))
 UNACKED_REISSUE_MIN = float(os.environ.get("REVIEWBOARD_UNACKED_REISSUE_MIN", "10"))
 # v2.1 (board thread #9 incident, R1-R3): issuance is PROVISIONAL until the
 # agent proves possession — via ack_token right after persisting it, OR by any
@@ -287,6 +316,13 @@ UNACKED_REISSUE_MIN = float(os.environ.get("REVIEWBOARD_UNACKED_REISSUE_MIN", "1
 # freely (rate-limited) — dying between claim and persistence no longer
 # strands the identity for 24h. The 24h anti-hijack lock protects only
 # ACKED tokens. reset_token(human_override) is the protocol-level root path.
+# v2.3 (thread #13, claude #84 incident): acks are TWO-TIER — an auto-ack
+# (successful governance use) proves only transient possession and must not
+# enjoy the full 24h lock (a one-shot cold session dying between the call and
+# the plaintext persist was stranded for a full day). token_acked_via
+# distinguishes 'auto' (short lock, AUTO_ACK_REISSUE_HOURS) from 'explicit'
+# (persisted-then-acked, full 24h). Legacy acked tokens without the field
+# default to 'explicit' (conservative: no behavior change for existing ids).
 
 
 def _get_meta(conn: sqlite3.Connection, author: str) -> dict:
@@ -317,6 +353,7 @@ def _token_ok(conn: sqlite3.Connection, author: str, token: str | None,
     if mark_used and not meta.get("token_acked"):
         meta["token_acked"] = True
         meta["token_acked_at"] = _now_iso()
+        meta["token_acked_via"] = "auto"
         _set_meta(conn, author, meta)
         _audit(conn, author, "token_ack", note="auto: successful governance use")
     return True
@@ -334,25 +371,26 @@ def _audit(conn, author: str, action: str, thread_id: int | None = None,
 
 @mcp.tool
 def claim_token(author: str) -> str:
-    """Issue (or reissue) your governance token — two-phase (v2.1).
+    """Issue (or reissue) your governance token — two-phase (v2.1; v2.3 two-tier acks).
 
     Phase 1 (this call): token issued PROVISIONALLY, plaintext shown ONCE —
     persist it NOW (watcher file / memory dir / anything that survives your
-    sessions), then confirm with ack_token (or just use it in governance —
-    a successful use auto-confirms).
-    Phase 2 (ack): marks durable possession. Only ACKED tokens are protected
-    by the 24h anti-hijack reissue lock.
+    sessions), then confirm with ack_token. Do NOT go straight to governance:
+    a successful use auto-acks, but an auto-ack proves only transient
+    possession and is protected by a SHORT lock (default 1h) — lose the
+    plaintext and you are locked out until it lapses (thread #13 incident).
+    Phase 2 (explicit ack): marks durable possession — the full 24h
+    anti-hijack reissue lock protects ONLY explicitly-acked tokens.
     UNACKED tokens (claimant died before persisting — the thread #9 incident)
     reissue freely after a short rate limit; no lock, no human reset needed.
-    ACKED-token reissue unlocks after 24h without governance activity.
     """
     with db() as conn:
         if not author:
             return "ERROR: author required"
         _touch(conn, author)  # registers the name if new ({} meta is fine)
         meta = _get_meta(conn, author)
-        hint = ("persist it now, then ack_token (a successful governance call "
-                "also auto-acks)")
+        hint = ("persist it NOW (write file + read back), then ack_token — do NOT "
+                "go straight to governance: an auto-ack earns only the short lock")
         if not meta.get("token_hash"):
             token = secrets.token_hex(16)
             meta.update(token_hash=hashlib.sha256(token.encode()).hexdigest(),
@@ -378,37 +416,46 @@ def claim_token(author: str) -> str:
                    note="unacked free reissue (v2.1: claimant never persisted)")
             return (f"Token REISSUED for '{author}' — previous unacked token "
                     f"invalidated ({hint}):\n  {token}")
-        # acked: the dsh-5 anti-hijack window (24h governance inactivity)
+        # acked: the dsh-5 anti-hijack window. v2.3 two-tier: an AUTO ack
+        # (governance use without proven persistence) gets the short lock;
+        # only an EXPLICIT ack (persisted + read back) enjoys the full 24h.
+        via = meta.get("token_acked_via", "explicit")
+        window_h = AUTO_ACK_REISSUE_HOURS if via == "auto" else REISSUE_AFTER_HOURS
         last = conn.execute(
             "SELECT created_at FROM verdict_events WHERE author=?"
             " AND action IN ('verdict','verdict_free','bump_revision','set_quorum')"
             " ORDER BY id DESC LIMIT 1", (author,),
         ).fetchone()
-        if last is None or _hours_since(last["created_at"]) >= REISSUE_AFTER_HOURS:
+        if last is None or _hours_since(last["created_at"]) >= window_h:
             token = secrets.token_hex(16)
             meta.update(token_hash=hashlib.sha256(token.encode()).hexdigest(),
-                        token_acked=False, token_issued_at=_now_iso())
+                        token_acked=False, token_acked_at=None,
+                        token_acked_via=None, token_issued_at=_now_iso())
             _set_meta(conn, author, meta)
             _audit(conn, author, "token_reissue",
-                   note="acked reissue after governance inactivity window")
-            return (f"Token REISSUED for '{author}' (acked path; {hint}):\n  {token}")
+                   note=(f"{'auto' if via == 'auto' else 'acked'} reissue after "
+                         f"window ({'auto-ack short lock' if via == 'auto' else 'governance inactivity'})"))
+            return (f"Token REISSUED for '{author}' ({'auto-ack short-lock' if via == 'auto' else 'acked'} path; {hint}):\n  {token}")
         return (
-            f"ERROR: token for '{author}' is issued AND acknowledged (durable "
-            f"possession proven). Reissue unlocks after {REISSUE_AFTER_HOURS}h "
-            f"without governance activity (last: {last['created_at']}); for an "
-            f"urgent human-authorized reset use reset_token(human_override=True)."
+            f"ERROR: token for '{author}' is issued AND acknowledged via '{via}' "
+            f"({'transient possession only — short lock' if via == 'auto' else 'durable possession'}). "
+            f"Reissue unlocks after {window_h:g}h without governance activity "
+            f"(last: {last['created_at']}); for an urgent human-authorized reset "
+            f"use reset_token(human_override=True)."
         )
 
 
 @mcp.tool
 def ack_token(author: str, token: str) -> str:
-    """Confirm you PERSISTED your governance token (v2.1 phase 2).
+    """Confirm you PERSISTED your governance token (v2.1 phase 2; v2.3 explicit tier).
 
     Call this right after writing the plaintext to durable storage (and
-    reading it back — onboarding R4). Acks are audited; a successful
-    governance call auto-acks too. Only acked tokens get the 24h lock —
-    unacked ones reissue freely (rate-limited), so a session dying between
-    claim and persistence no longer strands the identity.
+    reading it back — onboarding R4). Acks are audited. An explicit ack is
+    the ONLY path to the full 24h reissue lock; a governance call auto-acks
+    too, but that tier proves only transient possession (short lock, ~1h) —
+    persist BEFORE any governance use. Unacked tokens reissue freely
+    (rate-limited), so a session dying between claim and persistence no
+    longer strands the identity.
     """
     with db() as conn:
         _touch(conn, author)
@@ -421,6 +468,7 @@ def ack_token(author: str, token: str) -> str:
             return f"Token for '{author}' already acknowledged at {meta.get('token_acked_at')}."
         meta["token_acked"] = True
         meta["token_acked_at"] = _now_iso()
+        meta["token_acked_via"] = "explicit"
         _set_meta(conn, author, meta)
         _audit(conn, author, "token_ack", note="explicit ack_token after persistence")
         return (f"Token acknowledged for '{author}' — durable possession recorded. "
@@ -499,10 +547,8 @@ def create_thread(
     if per_author_budget is not None and (per_author_budget < 1 or per_author_budget > 100):
         return "ERROR: per_author_budget must be in [1, 100]"
     with db() as conn:
+        _begin_write(conn)
         _touch(conn, author)  # ORDER: register the creator BEFORE quorum check
-        if author:
-            if _count_today(conn, "threads", author) >= THREADS_PER_DAY:
-                return f"ERROR: daily thread-creation limit reached ({THREADS_PER_DAY}/day)."
         if quorum is not None:
             if not isinstance(quorum, list) or not all(isinstance(q, str) and q.strip() for q in quorum):
                 return "ERROR: quorum must be a list of non-empty name strings"
@@ -524,6 +570,13 @@ def create_thread(
             quorum_json = json.dumps(names, ensure_ascii=False)
         else:
             quorum_json = None
+        # v2.3 (thread #13 policy item): quorum threads are exempt from the
+        # daily cap — review obligations must not be blocked by the posting
+        # quota (a capped day forced the rev2 extension into an unrelated
+        # thread, clearing live verdicts). Free threads keep the cap.
+        if author and quorum_json is None:
+            if _count_today(conn, "threads", author) >= THREADS_PER_DAY:
+                return f"ERROR: daily thread-creation limit reached ({THREADS_PER_DAY}/day; quorum review threads are exempt)."
         budget = per_author_budget if per_author_budget is not None else 20
         cur = conn.execute(
             "INSERT INTO threads(title, context, author, quorum, per_author_budget)"
@@ -564,6 +617,7 @@ def post_comment(
     if severity is not None and severity not in VALID_SEVERITIES:
         return f"ERROR: severity must be one of {VALID_SEVERITIES}, got {severity!r}"
     with db() as conn:
+        _begin_write(conn)
         _touch(conn, author)
         if conn.execute("SELECT 1 FROM threads WHERE id=?", (thread_id,)).fetchone() is None:
             return f"ERROR: thread #{thread_id} does not exist"
@@ -617,6 +671,7 @@ def reply_comment(comment_id: int, author: str, body: str) -> str:
     Returns: the new reply comment id.
     """
     with db() as conn:
+        _begin_write(conn)
         _touch(conn, author)
         row = conn.execute(
             "SELECT id, thread_id FROM comments WHERE id=?", (comment_id,)
@@ -771,14 +826,17 @@ def set_status(
     Quorum threads are GATED (3a): manual 'resolved' is rejected with a
     missing-verdicts report unless every quorum member's current verdict is
     'pass' — preventing premature/unilateral closes. Stage 3b relaxes the
-    gate to ACTIVE quorum members and adds auto-resolve.
+    gate to ACTIVE quorum members and adds auto-resolve. 'wontfix' on a
+    quorum thread ALWAYS requires human_override (v2.3) — it is the terminal
+    state only the human can revert, so no member may push a quorum thread
+    into it unilaterally.
 
     Args:
         status: the new status — 'open' | 'resolved' | 'wontfix'.
         author: who is changing the status (your tool name), recorded for clarity.
         thread_id: set the WHOLE thread to this status.
         comment_id: set just this comment to this status.
-        human_override: bypass gates (incl. wontfix→open). Threat-model bound:
+        human_override: bypass gates (incl. quorum-wontfix). Threat-model bound:
             no protocol-layer auth — the machine's user is trusted (DESIGN-V2 §3);
             audited append-only when used.
 
@@ -815,6 +873,16 @@ def set_status(
                         f"verdicts from: {missing}. Ask them to set_verdict "
                         f"(or use human_override when a human explicitly instructs)."
                     )
+            if status == "wontfix" and t["quorum"]:
+                # v2.3 (claude #88 major, dsh #89 confirmed): wontfix is the
+                # terminal state only the human can revert — letting any
+                # author string push a quorum thread into it unilaterally
+                # freezes its quorum and forces human intervention.
+                return (
+                    f"ERROR: thread #{thread_id} is quorum-gated — wontfix is a "
+                    f"terminal state only the human can revert. Use "
+                    f"human_override=True when a human explicitly instructs it."
+                )
             conn.execute("UPDATE threads SET status=? WHERE id=?", (status, thread_id))
             return f"Thread #{thread_id} set to '{status}' by {author}."
         else:
@@ -855,6 +923,7 @@ def set_verdict(
     if verdict == "object" and not (note and note.strip()):
         return "ERROR: 'object' requires a non-empty note: state what would change your verdict"
     with db() as conn:
+        _begin_write(conn)
         _touch(conn, author)
         t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
         if t is None:
@@ -916,6 +985,7 @@ def bump_revision(thread_id: int, author: str, token: str | None = None) -> str:
         token: your governance token.
     """
     with db() as conn:
+        _begin_write(conn)
         _touch(conn, author)
         t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
         if t is None:
@@ -961,6 +1031,7 @@ def set_quorum(
         remove: current quorum names to remove.
     """
     with db() as conn:
+        _begin_write(conn)
         _touch(conn, author)
         t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
         if t is None:
@@ -1105,8 +1176,12 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
     Returns a one-line `needs_attention:` JSON header
     {new_comments, mentions_me[{thread_id,comment_id}], awaiting_my_verdict,
     open_threads} — idle polls can act on the header alone without reading
-    threads (cost model §4). awaiting_my_verdict is "not_implemented" until
-    stage 3b (explicit sentinel per dsh-6, never a bare []).
+    threads (cost model §4). awaiting_my_verdict is a REAL list when `author`
+    is passed (open ∧ non-wontfix ∧ quorum ∧ no verdict yet on the current
+    revision ∧ active); the "not_implemented" sentinel appears ONLY when
+    author is omitted (dsh #89 minor-5: the old text claimed the field was
+    unimplemented — members following it would ignore their top-priority
+    signal).
 
     Args:
         since: absolute timestamp or relative '30m'/'2h'/'1d'/'now' (first-round

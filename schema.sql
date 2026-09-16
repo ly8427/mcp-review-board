@@ -63,7 +63,10 @@ CREATE TABLE IF NOT EXISTS verdicts (
 -- v2 A5 (3a): append-only governance audit — verdict sets/flips (with cost),
 -- bump_revision, set_quorum, token issue/reissue (dsh-5, claude note ①),
 -- and stage-3b state-machine transitions (auto_resolve / auto_reopen /
--- unfreeze_restore / human_override). NEVER updated or deleted.
+-- human_override). NEVER updated or deleted.
+-- v2.3 note (dsh #89 minor-4): no unfreeze_restore event has ever been
+-- written — unfreeze is implicit (heartbeat recovery restores voting rights;
+-- recompute writes auto_reopen + reason strings). Do not resurrect it.
 CREATE TABLE IF NOT EXISTS verdict_events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     thread_id  INTEGER,

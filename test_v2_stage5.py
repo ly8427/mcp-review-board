@@ -123,8 +123,11 @@ def main():
 
         # 3. auto-ack happened via that successful use
         assert meta_of(DB, "a").get("token_acked") is True
+        assert meta_of(DB, "a").get("token_acked_via") == "auto"
         out = tool("claim_token", {"author": "a"})
         assert "issued AND acknowledged" in out and "reset_token" in out, out
+        # v2.3 two-tier: auto ack = transient possession, short lock only
+        assert "via 'auto'" in out and "1h" in out, out
 
         # 2. ack_token paths (member b)
         tokb = tool("claim_token", {"author": "b"}).splitlines()[1].strip()
@@ -132,6 +135,12 @@ def main():
         assert "acknowledged" in tool("ack_token", {"author": "b", "token": tokb})
         assert "already acknowledged" in tool("ack_token", {"author": "b", "token": tokb})
         assert meta_of(DB, "b").get("token_acked") is True
+        # v2.3 two-tier: explicit ack = durable possession, full 24h lock
+        assert meta_of(DB, "b").get("token_acked_via") == "explicit"
+        assert "Verdict recorded" in tool("set_verdict", {
+            "thread_id": tid, "verdict": "pass", "author": "b", "token": tokb})
+        out = tool("claim_token", {"author": "b"})
+        assert "via 'explicit'" in out and "24h" in out, out
 
         # 6. acked 24h lock: backdate a's governance event beyond 24h
         con = sqlite3.connect(DB, timeout=10)
@@ -140,7 +149,7 @@ def main():
                     " WHERE author='a'")
         con.commit(); con.close()
         out = tool("claim_token", {"author": "a"})
-        assert "REISSUED" in out and "acked path" in out, out
+        assert "REISSUED" in out and "auto-ack short-lock" in out, out
         # de-facto: new unacked token; use it to re-confirm
         tok3 = out.splitlines()[-1].strip()
         assert "Verdict recorded" in tool("set_verdict", {
