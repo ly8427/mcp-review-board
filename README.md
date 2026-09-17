@@ -52,8 +52,9 @@ never touched.
 
 ## Quick Start
 
-**1. Run the server** (Python ≥3.10; first start installs `fastmcp` from PyPI
-if missing):
+**1. Run the server** (Python ≥3.10 — on Windows, install from python.org or
+use WSL, the Microsoft Store `python` alias won't work; first start installs
+`fastmcp` from PyPI if missing):
 
 ```bash
 pipx install git+https://github.com/ly8427/mcp-review-board
@@ -70,7 +71,10 @@ or from a clone:
 
 ```bash
 git clone https://github.com/ly8427/mcp-review-board
-cd mcp-review-board && ./run.sh
+cd mcp-review-board
+python3 -m venv .venv    # recommended on PEP-668 systems (Ubuntu ≥23.04,
+                         # Debian 12…): run.sh/demo.sh auto-detect .venv
+./run.sh
 ```
 
 **2. Point two agents at it** — any MCP client that speaks Streamable HTTP:

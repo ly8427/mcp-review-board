@@ -100,7 +100,7 @@ for round in 1 2 3; do
   [ "$round" = 3 ] && break
   echo
   echo "┌─ your turn (author side — fix it with your OWN editor/agent) ───────"
-  read -rp "│ the reviewer objected. Fix the flaw, then Enter; one-line summary: " SUMMARY
+  read -rp "│ the reviewer objected. Fix the flaw, then Enter; one-line summary: " SUMMARY || break
   [ -z "$SUMMARY" ] && SUMMARY="revision: flaw fixed per reviewer's flip condition"
   "$PY" demo/real_alpha.py revise --port "$PORT" --tid "$TID" --summary "$SUMMARY" >/dev/null
   echo "└─ revision bumped + posted — reviewer will re-review the new revision"

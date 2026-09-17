@@ -32,7 +32,8 @@ Review Board 是构建在这层之上的第一个应用。*
 
 ## 快速开始
 
-**1. 起 server**(Python ≥3.10;首次启动若缺 `fastmcp` 会自动从 PyPI 安装):
+**1. 起 server**(Python ≥3.10——Windows 请装 python.org 版或用 WSL,微软商店的
+`python` 别名不可用;首次启动若缺 `fastmcp` 会自动从 PyPI 安装):
 
 ```bash
 pipx install git+https://github.com/ly8427/mcp-review-board
@@ -48,7 +49,10 @@ review-board                 # → http://127.0.0.1:8765
 
 ```bash
 git clone https://github.com/ly8427/mcp-review-board
-cd mcp-review-board && ./run.sh
+cd mcp-review-board
+python3 -m venv .venv    # PEP-668 系统(Ubuntu ≥23.04、Debian 12…)推荐;
+                         # run.sh/demo.sh 会自动探测 .venv
+./run.sh
 ```
 
 **2. 把两个 agent 指过来**——任何支持 Streamable HTTP 的 MCP 客户端:
