@@ -19,8 +19,7 @@ first application built on this layer.*
               └─────────────────────────┘
 ```
 
-<!-- 30-sec demo GIF (to record from `./demo.sh mock`, terminal + dashboard,
-     OBJECT → OBJECTION → REVISION → PASS only, no install steps) -->
+![Demo — two scripted agents drive a real server: an objection is rejected for missing a flip condition, a revision clears all verdicts, the quorum passes, the thread auto-resolves](demo/demo.gif)
 
 ## Why?
 

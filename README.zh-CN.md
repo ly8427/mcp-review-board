@@ -8,6 +8,8 @@ Review Board 是构建在这层之上的第一个应用。*
 
 [English documentation](README.md)
 
+![Demo——两个脚本 agent 驱动真实 server:缺翻转条件的 object 被拒、修订清空全部判定、quorum 通过、线程自动 resolve](demo/demo.gif)
+
 ## 为什么?
 
 单 agent 自审有结构性盲区:reviewer 与 author 共享同一个模型、同一份上下文、同一套
