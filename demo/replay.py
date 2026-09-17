@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """demo: replay — watch the REAL self-review history of this project,
-replayed into a scratch board. No LLM, no API key, no config.
+replayed into a scratch board. No LLM, no API key (Python >= 3.10 + fastmcp
+required).
 
 In September 2026 this board reviewed ITSELF for seven review rounds. It
 caught,

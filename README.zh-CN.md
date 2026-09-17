@@ -20,13 +20,25 @@ Review Board 是构建在这层之上的第一个应用。*
 - 全体活跃 quorum 通过才 resolve;站立 object 自动重开;
 - 每一票、每次翻转、每个修订 **append-only 留审计**。
 
-## Demo——一条命令,三层深度
+## Demo——三层深度
+
+前提:Python ≥3.10 + fastmcp(一次性安装,无需 API key、无需 agent):
+
+```bash
+python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
+```
+
+在 WSL / Linux / macOS / Git Bash 中运行。**在 PowerShell/cmd 里 `.sh` 文件会走
+Windows 文件关联,可能静默退出且退出码为 0**——请用上述 shell。
 
 | 命令 | 耗时 | 你会看到 |
 |---|---|---|
-| `./demo.sh` | ~2 分钟,零配置 | **回放本项目真实的自审历史**(无需 API key) |
+| `./demo.sh` | ~2 分钟 | **回放本项目真实的自审历史**(无需 API key) |
 | `./demo.sh mock` | ~1 分钟 | 两个脚本 agent 在真实 server 上跑完整闭环:object(先因缺翻转条件被拒一次)→ 修订 → pass → 自动 resolve |
 | `./demo.sh real` | ~15 分钟 | 一个**真实** headless agent(如 `claude -p`)独立评审一个补丁;你修复它反对的问题;看它收敛 |
+
+依赖缺失时 `./demo.sh` **大声失败**并给出单行修复指引——它绝不自行安装任何东西
+(含 PEP-668 管制的系统 python)。
 
 所有 demo 用独立端口 + 一次性 db,**绝不碰你的 live board**。
 

@@ -8,8 +8,8 @@ objecting, and converging. Seven quorum review rounds, three defects caught
 before anyone outside saw them. Every claim below has a thread id, a flip
 record and a commit.
 
-Replay it yourself, no config needed: `./demo.sh` (condensed copy of the real
-audit log; quotes kept in the original language).
+Replay it yourself (Python ≥3.10 + fastmcp needed; no API key): `./demo.sh`
+(condensed copy of the real audit log; quotes kept in the original language).
 
 ## The arc
 
@@ -132,5 +132,5 @@ as v2.3 the same day (`56d3725`, `f7b8573`).
   协议文本本身。两位评审确认根因但反对原修法(会拆掉 quorum 独立性),收窄条款逐字采纳
   后翻转;rev2 搜虫日再抓 1 major + 5 minor,当天修复、当天上线 v2.3。
 
-一条命令回放全程(零配置、无需 API key):`./demo.sh`。完整日志:live SQLite 库的
+回放命令(需 Python ≥3.10 + fastmcp,无需 API key):`./demo.sh`。完整日志:live SQLite 库的
 append-only `verdict_events` 表。

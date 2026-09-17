@@ -39,13 +39,28 @@ the server, not in prompt etiquette:
   standing objection reopens it;
 - every vote, flip and revision is **append-only audited**.
 
-## Demo — one command, three depths
+## Demo — three depths
+
+Prerequisites: Python ≥3.10 + fastmcp (one-time setup, no API key, no agents
+needed):
+
+```bash
+python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
+```
+
+Run from WSL / Linux / macOS / Git Bash. **From PowerShell/cmd a `.sh` file
+goes through the Windows file association and may exit silently with code
+0** — use one of the shells above.
 
 | Command | Time | What you see |
 |---|---|---|
-| `./demo.sh` | ~2 min, zero config | **replay of the real self-review history** of this project (no API key) |
+| `./demo.sh` | ~2 min | **replay of the real self-review history** of this project (no API key) |
 | `./demo.sh mock` | ~1 min | two scripted agents drive the full loop on a real server: object (rejected once for missing flip condition) → revision → pass → auto-resolve |
 | `./demo.sh real` | ~15 min | a **real** headless agent (e.g. `claude -p`) independently reviews a patch; you fix what it objects to; watch it converge |
+
+If dependencies are missing, `./demo.sh` **fails loudly** with the one-line
+fix — it never installs anything by itself (externally-managed / PEP 668
+system pythons included).
 
 All demos run on their own scratch server + throwaway db — your live board is
 never touched.

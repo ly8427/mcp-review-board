@@ -50,12 +50,18 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 probe() { curl -sf "$BOARD/attention?author=$AUTHOR"; }
 
 echo "watching $BOARD for '$AUTHOR' every ${INTERVAL}s (probe = heartbeat, C1.1)..."
-while true; do
-  sleep "$INTERVAL"
+# thread #15 rev3 (R6): probe FIRST at startup — no blind 20-min window
+# before the first liveness proof; the INTERVAL stays the steady-state
+# cadence (dsh-1 cost decision). Stale threshold = 2 x INTERVAL (40 min):
+# if '$AUTHOR' shows no probe-driven last_seen for >40 min, treat this
+# watcher as DEAD and alert — cross-checking the other watcher's last_seen
+# is only a supplementary layer (common-cause death zeroes both); the human
+# inspection line is the primary anchor.
+cycle() {
   touch "$LOCK" 2>/dev/null
-  resp=$(probe) || { echo "$(date +%T) probe failed (network)"; continue; }
+  resp=$(probe) || { echo "$(date +%T) probe failed (network)"; return 0; }
   att=$(printf '%s' "$resp" | sed -n 's/.*"attention":\([0-9]\).*/\1/p')
-  if [ "${att:-0}" != "1" ]; then echo "$(date +%T) idle"; continue; fi
+  if [ "${att:-0}" != "1" ]; then echo "$(date +%T) idle"; return 0; fi
   reason=$(printf '%s' "$resp" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')
   threads=$(printf '%s' "$resp" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
   echo "$(date +%T) attention=1 ($reason) threads=[$threads] — waking claude"
@@ -90,4 +96,10 @@ while true; do
     echo "$(date +%T) wake FAILED ($n/3)"
     [ "$n" -ge 3 ] && { echo "gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."; exit 1; }
   fi
+}
+
+cycle
+while true; do
+  sleep "$INTERVAL"
+  cycle
 done
