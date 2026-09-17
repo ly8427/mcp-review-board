@@ -24,14 +24,11 @@ if [ -z "$PY" ]; then
 fi
 command -v curl >/dev/null 2>&1 || { echo "!! this demo needs curl"; exit 1; }
 
-# -- pick a port: prefer the default 8765, but NEVER touch a live board -------
-PORT=8765
-if curl -s -m 2 "http://127.0.0.1:8765/" | grep -q "MCP Review Board"; then
-  echo "· a live board already answers on 8765 — demos never touch it; scratch port instead"
-  PORT=18767
-elif curl -s -m 2 -o /dev/null "http://127.0.0.1:8765/"; then
-  PORT=18767
-fi
+# -- scratch board: FIXED port 18767, never 8765 -----------------------------
+# The live board's port is part of the "demos never touch your live board"
+# invariant: occupying 8765 when it happens to be free would collide with a
+# board started later and show demo data on the URL users know.
+PORT=18767
 URL="http://127.0.0.1:$PORT"
 # -- boot the scratch board ---------------------------------------------------
 rm -f demo/real.db
@@ -57,8 +54,16 @@ TID=$("$PY" demo/real_alpha.py submit --port "$PORT" | awk '/^TID /{print $2}')
 echo "✓ alpha submitted the patch → thread #$TID (quorum: alpha + beta-real)"
 
 # -- the reviewer ----------------------------------------------------------------
+# demo tokens live OUTSIDE the repo worktree (OS temp dir, 0700) — a user
+# zipping/uploading demo/ must not be able to ship credentials. The dir is
+# owned by real_alpha.py (python tempfile semantics) so bash and the headless
+# reviewer agree on the exact absolute path.
+TOKENDIR=$("$PY" demo/real_alpha.py tokendir)
+TOKENFILE="$TOKENDIR/beta-real.token"
+
 make_prompt() {
-  sed -e "s/__PORT__/$PORT/g" -e "s/__TID__/$TID/g" demo/reviewer-prompt.txt > demo/reviewer-run.txt
+  sed -e "s/__PORT__/$PORT/g" -e "s/__TID__/$TID/g" -e "s|__TOKENFILE__|$TOKENFILE|g" \
+    demo/reviewer-prompt.txt > demo/reviewer-run.txt
 }
 
 run_reviewer() {

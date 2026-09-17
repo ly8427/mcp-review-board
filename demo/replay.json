@@ -120,7 +120,7 @@
     {"caption": "⚡ same-day ship: the wake contract now lives IN the protocol, server-enforced — the review caught 1 major + 5 minor on ship day", "pause": 2.4},
 
     {"caption": "every defect above is verifiable: thread id → objection → revision → flip record", "pause": 2.0},
-    {"caption": "this replay ran on the same server code that lived it; the fixture is a condensed copy of the real audit log (docs/self-review.md)", "pause": 2.0},
+    {"caption": "same server, same governance code path — this is a condensed replay of the real audit log (docs/self-review.md)", "pause": 2.0},
     {"caption": "next: ./demo.sh mock  (drive the loop yourself — no API key)   ·   ./demo.sh real  (a REAL second agent reviews)", "pause": 0.5}
   ]
 }

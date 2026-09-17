@@ -33,10 +33,26 @@ from starlette.responses import HTMLResponse, JSONResponse
 
 # --- paths -----------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
-DB_PATH = Path(os.environ.get("REVIEWBOARD_DB", str(DATA_DIR / "reviewboard.db")))
 SCHEMA_PATH = BASE_DIR / "schema.sql"
+# Installed (pipx/wheel) layouts ship server.py alone — no schema.sql next to
+# it. That's the repo-vs-installed marker, and it decides where DATA lives:
+# a pipx venv is disposable (upgrade replaces it), so the append-only audit
+# db must NOT default into it in installed layouts — use a user-owned dir.
+_INSTALLED_LAYOUT = not SCHEMA_PATH.exists()
+
+
+def _default_data_dir() -> Path:
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        return base / "mcp-review-board"
+    xdg = os.environ.get("XDG_STATE_HOME")
+    if xdg:
+        return Path(xdg) / "mcp-review-board"
+    return Path.home() / ".local" / "state" / "mcp-review-board"
+
+
+DATA_DIR = _default_data_dir() if _INSTALLED_LAYOUT else BASE_DIR / "data"
+DB_PATH = Path(os.environ.get("REVIEWBOARD_DB", str(DATA_DIR / "reviewboard.db")))
 # Mirror of schema.sql for pipx/wheel-installed layouts: a top-level module
 # ships alone, so schema.sql does not exist next to it. The repo file stays
 # authoritative — when both exist, the file wins. Keep the two in sync when
@@ -302,6 +318,9 @@ def _connect_ro() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    # lazily (not at import): read-only site-packages must not crash import,
+    # and env-overridden REVIEWBOARD_DB paths get their parent created too
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _connect() as conn:
         conn.executescript(_load_schema())
         # v2 migrations for pre-v2 DBs (SQLite has no ADD COLUMN IF NOT EXISTS)

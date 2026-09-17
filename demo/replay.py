@@ -2,7 +2,8 @@
 """demo: replay — watch the REAL self-review history of this project,
 replayed into a scratch board. No LLM, no API key, no config.
 
-In September 2026 this board reviewed ITSELF for seven rounds. It caught,
+In September 2026 this board reviewed ITSELF for seven review rounds. It
+caught,
 before anyone outside saw them: a missing LICENSE, a username leaked across
 the entire git history, a regression introduced by the fix itself, a metric
 that would have scored the board's best work as failure, and a protocol text
@@ -33,7 +34,7 @@ def main() -> None:
     board.start()
     banner("MCP Review Board — replay of the real self-review history",
            board,
-           ["7 rounds, 3 defect threads, every flip on the audit log.",
+           ["7 review rounds, 3 defect threads, every flip on the audit log.",
             "Nothing is faked: quotes are from the real threads (#9 #11 #13),",
             "condensed for the terminal. Your live board is not touched."])
     try:

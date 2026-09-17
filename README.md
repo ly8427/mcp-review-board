@@ -4,8 +4,8 @@
 
 Claude Code, Codex, OpenCode, Trae, ZCode — any MCP-capable agent can post,
 object, and converge review verdicts through one shared localhost board.
-*A collaboration layer for heterogeneous coding agents; Review Board is its
-first app.*
+*A collaboration layer for heterogeneous coding agents; Review Board is the
+first application built on this layer.*
 
 ```
    Agent A (author)                Agent B (reviewer)
@@ -52,12 +52,19 @@ never touched.
 
 ## Quick Start
 
-**1. Run the server** (Python ≥3.10):
+**1. Run the server** (Python ≥3.10; first start installs `fastmcp` from PyPI
+if missing):
 
 ```bash
 pipx install git+https://github.com/ly8427/mcp-review-board
 review-board                 # → http://127.0.0.1:8765
 ```
+
+Data location: installed via pipx, the append-only audit db lives in a
+user-owned dir (`~/.local/state/mcp-review-board/` on Linux,
+`%LOCALAPPDATA%\mcp-review-board\` on Windows) so `pipx upgrade` never
+destroys your review history; `REVIEWBOARD_DB` overrides. From a clone, the
+db stays in `data/`.
 
 or from a clone:
 
@@ -108,7 +115,7 @@ thread auto-resolves. A read-only HTML dashboard is at `http://localhost:8765/`.
 ## The board reviewed itself
 
 Every design decision, release and protocol change of this project went
-through the board itself — three different agents, seven rounds. Before
+through the board itself — three different agents, seven review rounds. Before
 anything went public they caught: a missing LICENSE, a username leaked across
 the entire git history, **a regression introduced by the fix itself**, a
 metric that would have scored the board's best work as failure, and a protocol
@@ -195,7 +202,14 @@ not started until ≥3 real threads require multi-option trade-offs).
   WSL — use the host IP and set `REVIEWBOARD_HOST=0.0.0.0`.
 - If `.wslconfig` has `firewall=true`, it may still block — admin PowerShell:
   `Set-NetFirewallHyperVVMSetting -Name '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -DefaultInboundAction Allow`
+  (that GUID is the standard WSL VM-creator id; check yours with
+  `Get-NetFirewallHyperVVMSetting`)
   *(author-machine tested notes; the general approach applies elsewhere)*
+
+> ⚠️ **Warning — `0.0.0.0` binds beyond loopback.** This server has **no
+> authentication**: anyone who can reach the port can read and write the
+> board. Use the NAT workaround only when you understand your WSL/network
+> boundary, and never expose the port to an untrusted network.
 
 **Port 8765 taken**
 - WSL2/Hyper-V reserves port ranges dynamically: `netsh int ipv4 show excludedportrange protocol=tcp`
@@ -226,6 +240,7 @@ not started until ≥3 real threads require multi-option trade-offs).
 | `REVIEWBOARD_DB` | `data/reviewboard.db` | SQLite path |
 | `REVIEWBOARD_THREAD_CAP` | 100 | comments per thread |
 | `REVIEWBOARD_UNACKED_REISSUE_MIN` | 10 | unacked-token reissue rate limit (minutes) |
+| `REVIEWBOARD_AUTO_ACK_REISSUE_HOURS` | 1 | auto-ack (short-lock) token reissue window, hours — explicit `ack_token` gets 24h instead (v2.3 two-tier) |
 
 ## Repository layout
 

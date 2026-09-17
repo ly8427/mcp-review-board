@@ -6,23 +6,37 @@ scripted so the demo always has one known, genuinely reviewable flaw —
 the real reviewer still has to find it on its own.
 
 Token handling follows the protocol's two-phase ritual for real: the
-plaintext is persisted to demo/alpha.token and read back across the
-separate invocations of this script (a fresh claim would hit the 24h
-reissue lock).
+plaintext is persisted OUTSIDE the repo worktree (OS temp dir, 0700/0600 —
+a user zipping or uploading demo/ cannot ship credentials) and read back
+across the separate invocations of this script (a fresh claim would hit
+the 24h reissue lock).
 """
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _board import Board, REPO  # noqa: E402
 from mock import PATCH_REV1  # noqa: E402  (same deliberately-flawed patch)
 
-TOKEN_FILE = REPO / "demo" / "alpha.token"
-BETA_TOKEN_FILE = REPO / "demo" / "beta-real.token"
+
+def token_dir() -> Path:
+    d = Path(tempfile.gettempdir()) / "mcp-review-board-demo"
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)  # effective on POSIX; no-op-ish on Windows
+    except OSError:
+        pass
+    return d
+
+
+TOKEN_FILE = token_dir() / "alpha.token"
+BETA_TOKEN_FILE = token_dir() / "beta-real.token"
 
 
 def board_for(port: int) -> Board:
@@ -38,8 +52,16 @@ def alpha_token(b: Board) -> str:
         raise SystemExit(f"claim_token did not return a token:\n{out}")
     token = m.group(1)
     TOKEN_FILE.write_text(token, encoding="utf-8")
+    try:
+        os.chmod(TOKEN_FILE, 0o600)
+    except OSError:
+        pass
     b.call("ack_token", author="alpha", token=token)
     return token
+
+
+def cmd_tokendir() -> None:
+    print(token_dir())
 
 
 def cmd_submit(port: int) -> None:
@@ -78,13 +100,15 @@ def cmd_status(port: int, tid: int) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("tokendir", help="print the demo token dir (owned here, 0700)")
     s = sub.add_parser("submit"); s.add_argument("--port", type=int, required=True)
     r = sub.add_parser("revise"); r.add_argument("--port", type=int, required=True)
     r.add_argument("--tid", type=int, required=True); r.add_argument("--summary", required=True)
     t = sub.add_parser("status"); t.add_argument("--port", type=int, required=True)
     t.add_argument("--tid", type=int, required=True)
     a = p.parse_args()
-    {"submit": lambda: cmd_submit(a.port),
+    {"tokendir": cmd_tokendir,
+     "submit": lambda: cmd_submit(a.port),
      "revise": lambda: cmd_revise(a.port, a.tid, a.summary),
      "status": lambda: cmd_status(a.port, a.tid)}[a.cmd]()
 

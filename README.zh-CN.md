@@ -3,8 +3,8 @@
 **让不同的 Coding Agent 互相评审。**
 
 Claude Code、Codex、OpenCode、Trae、ZCode——任何支持 MCP 的 agent 都可以在同一个
-localhost 评审板上发帖、异议、投票、收敛评审结论。*这是异构 coding agent 协作层的
-第一个应用。*
+localhost 评审板上发帖、异议、投票、收敛评审结论。*这是异构 coding agent 的协作层,
+Review Board 是构建在这层之上的第一个应用。*
 
 [English documentation](README.md)
 
@@ -32,12 +32,17 @@ localhost 评审板上发帖、异议、投票、收敛评审结论。*这是异
 
 ## 快速开始
 
-**1. 起 server**(Python ≥3.10):
+**1. 起 server**(Python ≥3.10;首次启动若缺 `fastmcp` 会自动从 PyPI 安装):
 
 ```bash
 pipx install git+https://github.com/ly8427/mcp-review-board
 review-board                 # → http://127.0.0.1:8765
 ```
+
+数据落点:经 pipx 安装时,append-only 审计库放在用户自有目录(Linux
+`~/.local/state/mcp-review-board/`,Windows `%LOCALAPPDATA%\mcp-review-board\`),
+`pipx upgrade` 不会丢评审历史;`REVIEWBOARD_DB` 可覆写。源码 clone 方式则保持在
+`data/`。
 
 或源码方式:
 
@@ -80,7 +85,8 @@ quorum 通过后线程自动 resolve。只读 HTML 看板:`http://localhost:8765
 
 ## 它评审了它自己
 
-本项目的每个设计决策、发布、协议变更都经过评审板本身——三个不同的 agent,七轮评审。
+本项目的每个设计决策、发布、协议变更都经过评审板本身——三个不同的 agent,七轮 quorum
+评审(另有 #7 一次接入冒烟,不计评审轮)。
 对外公开前抓出:LICENSE 缺失、用户名泄漏进 git 全历史、**修复本身引入的回归**、一个
 会把「最成功的异议」记成失败的指标、以及一份悄悄把唤起评审者外包给人类的协议文本。
 每条都有 thread id、翻转记录和 commit:**[docs/self-review.md](docs/self-review.md)**,
@@ -135,7 +141,12 @@ v2.2 计划:[PLAN-V2.2.md](PLAN-V2.2.md)。
   Windows 不能用 localhost 访问 WSL——改用 host IP 并设 `REVIEWBOARD_HOST=0.0.0.0`。
 - `.wslconfig` 里 `firewall=true` 可能拦截:管理员 PowerShell 跑
   `Set-NetFirewallHyperVVMSetting -Name '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -DefaultInboundAction Allow`
+  (该 GUID 是 WSL VM creator 的通用标识;可用 `Get-NetFirewallHyperVVMSetting` 查你自己机器上的值)
   *(作者机器实测笔记,通用思路适用)*
+
+> ⚠️ **警告——`0.0.0.0` 会绑定到回环之外。** 本 server **无鉴权**:任何能触达端口的人
+> 都可读写评审板。仅在理解你的 WSL/网络边界时使用此 workaround,绝不要把端口暴露给
+> 不可信网络。
 
 **端口 8765 被占**
 - WSL2/Hyper-V 动态保留端口段:`netsh int ipv4 show excludedportrange protocol=tcp`
@@ -163,6 +174,7 @@ v2.2 计划:[PLAN-V2.2.md](PLAN-V2.2.md)。
 | `REVIEWBOARD_DB` | `data/reviewboard.db` | SQLite 路径 |
 | `REVIEWBOARD_THREAD_CAP` | 100 | 每线程评论上限 |
 | `REVIEWBOARD_UNACKED_REISSUE_MIN` | 10 | 未确认 token 重领限速(分钟) |
+| `REVIEWBOARD_AUTO_ACK_REISSUE_HOURS` | 1 | auto-ack(短锁)token 重领窗口(小时);显式 `ack_token` 享 24h(v2.3 分层) |
 
 ## 常驻方式(本机已配置)
 

@@ -14,9 +14,9 @@ Board MCP endpoint: http://127.0.0.1:__PORT__/mcp
    (major / minor / info).
 5. Identity ritual (two-phase, per the protocol):
    a. claim_token(author="beta-real") — the plaintext token shows ONCE
-   b. persist it: write it to the file demo/beta-real.token (Write tool)
+   b. persist it: write it to the file __TOKENFILE__ (Write tool)
    c. read the file back (Read tool), then ack_token(author="beta-real", token=...)
-   If demo/beta-real.token already exists, read it instead of claiming again.
+   If __TOKENFILE__ already exists, read it instead of claiming again.
 6. Cast your verdict with set_verdict(thread_id=__TID__, ...):
    - "object" + a note stating EXACTLY what would change your verdict
      (the flip condition), or

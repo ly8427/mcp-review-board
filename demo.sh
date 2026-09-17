@@ -20,8 +20,17 @@ if [ -z "$PY" ]; then
 fi
 
 if ! "$PY" -c "import fastmcp" 2>/dev/null; then
-  echo "· fastmcp missing — installing (same as run.sh)…"
-  "$PY" -m pip install --user -r requirements.txt
+  echo "· fastmcp missing — installing from PyPI (see requirements.txt)…"
+  # plain install first (venvs REJECT --user); then --user (legacy system
+  # pythons); PEP-668 systems need pipx — say so instead of failing silently.
+  if ! "$PY" -m pip install -r requirements.txt 2>/dev/null; then
+    if ! "$PY" -m pip install --user -r requirements.txt 2>/dev/null; then
+      echo "!! automatic install failed (externally-managed environment?)."
+      echo "   try: pipx install git+https://github.com/ly8427/mcp-review-board"
+      echo "   or : $PY -m pip install --break-system-packages -r requirements.txt"
+      exit 1
+    fi
+  fi
 fi
 
 cmd="${1:-replay}"
