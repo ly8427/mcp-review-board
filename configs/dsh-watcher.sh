@@ -52,9 +52,10 @@ echo "watching $BOARD for '$AUTHOR' every ${INTERVAL}s (probe = heartbeat, C1.1)
 # before the first liveness proof; the INTERVAL stays the steady-state
 # cadence (dsh-1 cost decision). Stale threshold = 2 x INTERVAL (40 min):
 # if '$AUTHOR' shows no probe-driven last_seen for >40 min, treat this
-# watcher as DEAD and alert — cross-checking the other watcher's last_seen
-# is only a supplementary layer (common-cause death zeroes both); the human
-# inspection line is the primary anchor.
+# watcher as DEAD and alert. Peer cross-checking is NOT implemented (no
+# such code exists — thread #15 #123-③/#124); the primary staleness
+# anchor is the human inspection line (board participants view, 40-min
+# upper bound).
 cycle() {
   touch "$LOCK" 2>/dev/null                        # keep lock fresh (v2.3)
   resp=$(probe) || { echo "$(date +%T) probe failed (network)"; return 0; }
