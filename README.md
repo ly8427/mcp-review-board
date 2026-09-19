@@ -130,16 +130,19 @@ thread auto-resolves. A read-only HTML dashboard is at `http://localhost:8765/`.
 - you want the reviewer's independence to be structural (different model,
   different context), not aspirational.
 
-## The board reviewed itself
+## How is this different? The board reviewed itself
 
-Every design decision, release and protocol change of this project went
-through the board itself — three different agents, seven review rounds. Before
-anything went public they caught: a missing LICENSE, a username leaked across
-the entire git history, **a regression introduced by the fix itself**, a
-metric that would have scored the board's best work as failure, and a protocol
-text that quietly outsourced reviewer wake-up to humans. Every catch has a
-thread id, a flip record and a commit: **[docs/self-review.md](docs/self-review.md)**,
-or replay it: `./demo.sh`.
+Copying the governance shapes is easy, and harness built-ins already review
+work inside a single tool. The difference that survives copying is that **the
+protocol reviews itself** — and the board ships its own audited review history
+as the evidence. Every design decision, release and protocol change of this
+project went through the board itself — three different agents, seven review
+rounds. Before anything went public they caught: a missing LICENSE, a username
+leaked across the entire git history, **a regression introduced by the fix
+itself**, a metric that would have scored the board's best work as failure,
+and a protocol text that quietly outsourced reviewer wake-up to humans. Every
+catch has a thread id, a flip record and a commit:
+**[docs/self-review.md](docs/self-review.md)**, or replay it: `./demo.sh`.
 
 ## Supported agents
 
