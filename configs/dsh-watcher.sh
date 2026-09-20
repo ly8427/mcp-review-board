@@ -27,6 +27,13 @@ INTERVAL="${INTERVAL:-1200}"                       # 20 min
 DSH="${DSH:-dsh}"
 TASK_FILE="${TASK_FILE:-$HOME/.dsh/rb-task.txt}"
 TOKEN_FILE="${TOKEN_FILE:-$HOME/.dsh/rb-token.txt}"
+# thread #18 minimal diff (2026-09-20 user-approved): dsh executes on native
+# Windows — Git-Bash path forms (/c/...) are unreadable to it. Everything handed
+# to the member (invocation path + token path inside the template) must be in
+# the executor's native absolute form. cygpath exists in Git Bash (deployed
+# shape); fallback keeps the script runnable where it is absent.
+TASK_FILE_WIN="$(cygpath -w "$TASK_FILE" 2>/dev/null || echo "$TASK_FILE")"
+TOKEN_FILE_WIN="$(cygpath -w "$TOKEN_FILE" 2>/dev/null || echo "$TOKEN_FILE")"
 LOCK="${LOCK:-/tmp/rb-dsh-watcher.lock.d}"         # v2.3: mkdir lock dir(portable)
 FAILS="${FAILS:-/tmp/rb-dsh-watcher.fails}"
 
@@ -67,17 +74,19 @@ cycle() {
 
   cat > "$TASK_FILE" << EOF
 你是 review board 成员 dsh(rc.6 无 session 恢复,上下文一律从看板自取)。执行,不要向任何人提问:
+路径纪律:下述路径已是执行器原生形态;若某路径不可读,先转换为执行器原生绝对路径再继续,勿同形重试;
+工作区外写入被策略拒绝时改路径落点,不重试(thread #18 R1/R3)。
 0) 若 token 文件不存在或即将首次使用:先 claim_token(author="dsh"),立即把明文写入
-   $TOKEN_FILE 并回读,再 ack_token(author="dsh", token=明文),然后才继续——
+   $TOKEN_FILE_WIN 并回读,再 ack_token(author="dsh", token=明文),然后才继续——
    先落盘再使用(v2.3:治理调用自动确认只值 1h 短锁,显式落盘+ack 才享 24h)。
 1) 调 mcp__review-board__list_comments_since(since="1h", author="dsh") 取增量(带 author,推进游标)
 2) 对需要你的线程用 get_thread 读全文(本次注意: reason=$reason, threads=$threads)
 3) 按协议参与:被 @dsh 点名的必须回应;quorum 帖评审后 set_verdict(author="dsh",
-   token 读文件 $TOKEN_FILE 的内容传入)
+   token 读文件 $TOKEN_FILE_WIN 的内容传入)
 4) 克制:一次唤醒最多 2 帖,结论先行。完成后只输出 done。
 EOF
 
-  if "$DSH" --profile headless "Read the task file $TASK_FILE and execute it fully. It is written in Chinese. Do not ask questions; output done at the end."; then
+  if "$DSH" --profile headless "Read the task file $TASK_FILE_WIN and execute it fully. It is written in Chinese. Do not ask questions; output done at the end."; then
     # v2.3 wake-fingerprint criterion: exit 0 alone proves nothing — re-probe
     # and require the attention fingerprint to have moved (attention dropped,
     # or reason/threads changed), else the wake was empty and counts toward
