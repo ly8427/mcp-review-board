@@ -47,12 +47,18 @@ Windows 文件关联,可能静默退出且退出码为 0**——请用上述 she
 ## 快速开始
 
 **1. 起 server**(Python ≥3.10——Windows 请装 python.org 版或用 WSL,微软商店的
-`python` 别名不可用;首次启动若缺 `fastmcp` 会自动从 PyPI 安装):
+`python` 别名不可用)。两条安装路线:`pipx` 最省(无需 clone);`clone` 适合要改
+代码或跑离线 demo 的场景。
 
 ```bash
 pipx install git+https://github.com/ly8427/mcp-review-board
-review-board                 # → http://127.0.0.1:8765
+review-board                 # → http://127.0.0.1:<port>(默认 8765;用 REVIEWBOARD_PORT 覆写)
 ```
+
+成功的样子:server 先打印自己的横幅行——`MCP Review Board → http://127.0.0.1:<port>/`
+——随后是 uvicorn/FastMCP 日志。FastMCP 的大字 ASCII banner 是**噪音,不是报错**。
+再开一个终端验证:`curl -s -o /dev/null -w '%{http_code}' http://localhost:<port>/`
+应答 `200`(curl 横幅里显示的那个端口)。依赖绝不自动安装:缺什么就大声失败并给出一行修复。
 
 数据落点:经 pipx 安装时,append-only 审计库放在用户自有目录(Linux
 `~/.local/state/mcp-review-board/`,Windows `%LOCALAPPDATA%\mcp-review-board\`),
@@ -64,22 +70,35 @@ review-board                 # → http://127.0.0.1:8765
 ```bash
 git clone https://github.com/ly8427/mcp-review-board
 cd mcp-review-board
-python3 -m venv .venv    # PEP-668 系统(Ubuntu ≥23.04、Debian 12…)推荐;
-                         # run.sh/demo.sh 会自动探测 .venv
+python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
+#       ^ 与 Demo 前置同一行;PEP-668 系统(Ubuntu ≥23.04、Debian 12…)必须用
+#         venv——run.sh/demo.sh 会自动探测它
 ./run.sh
 ```
 
-**2. 把两个 agent 指过来**——任何支持 Streamable HTTP 的 MCP 客户端:
+**2. 先接一个 agent**——第二个更好但非必需:一个客户端就足以确认板子活着。
+任何支持 Streamable HTTP 的 MCP 客户端:
 
 ```bash
 # Claude Code:
 claude mcp add --transport http --scope project review-board http://localhost:8765/mcp
 ```
 
+Claude Code 会对新加的 server 设**两道批准**(这是客户端行为,不是板的 bug):
+add 之后 `claude mcp list` 显示 `⏸ Pending approval`——交互式跑一次 `claude`
+批准即可;headless 的 `claude -p` 还需 `--allowedTools "mcp__review-board"`
+预授权工具(可用的完整拼法见 `demo/real.sh`、`configs/claude-watcher.sh`)。
+
+用这唯一接上的 agent 验证:`list_threads` 有返回——哪怕是空列表——即板子
+活着。等真要评审时再接第二个 agent。
+
 ZCode / Claude Code / Trae CN / DSH 的现成配置模板在 [`configs/`](configs/)(含各客户端
 的静默丢弃陷阱);三步成员仪式见 [`configs/onboarding.md`](configs/onboarding.md)。
 
-**3. 评审一件事**——任一 agent 调:
+**3. 评审一件事**——任一 agent 调。术语一句话:*thread* 是一个评审主题;
+*quorum* 是其判定门控的成员名单;*verdict* 是 `pass` 或 `object`,而 `object`
+必须写明*翻转条件*(flip condition)——什么证据会让你改判。1 分钟的
+`./demo.sh mock` 端到端演示全部。
 
 ```
 create_thread(title="评审: webhook 重试补丁", quorum=["agent-a", "agent-b"])

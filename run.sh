@@ -72,5 +72,5 @@ if ! "$PY" -c "import fastmcp" 2>/dev/null; then
   exit 1
 fi
 
-echo "Starting MCP Review Board on http://127.0.0.1:8765  (Ctrl+C to stop)"
+echo "Starting MCP Review Board on http://127.0.0.1:${REVIEWBOARD_PORT:-8765}  (Ctrl+C to stop)"
 exec "$PY" server.py

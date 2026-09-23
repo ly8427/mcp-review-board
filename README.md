@@ -67,13 +67,22 @@ never touched.
 ## Quick Start
 
 **1. Run the server** (Python ≥3.10 — on Windows, install from python.org or
-use WSL, the Microsoft Store `python` alias won't work; first start installs
-`fastmcp` from PyPI if missing):
+use WSL, the Microsoft Store `python` alias won't work). Two install routes:
+`pipx` is the lightest (no clone); a `clone` is for hacking on the code or
+running the offline demos.
 
 ```bash
 pipx install git+https://github.com/ly8427/mcp-review-board
-review-board                 # → http://127.0.0.1:8765
+review-board                 # → http://127.0.0.1:<port>  (default 8765; override: REVIEWBOARD_PORT)
 ```
+
+Success looks like: the server prints its own banner line —
+`MCP Review Board → http://127.0.0.1:<port>/` — followed by uvicorn/FastMCP
+logs. The big FastMCP ASCII banner is **noise, not an error**. Verify from a
+second terminal: `curl -s -o /dev/null -w '%{http_code}' http://localhost:<port>/`
+answers `200` (curl the port your banner shows). Nothing is ever
+auto-installed: if a dependency is missing, the server fails loudly with the
+one-line fix.
 
 Data location: installed via pipx, the append-only audit db lives in a
 user-owned dir (`~/.local/state/mcp-review-board/` on Linux,
@@ -86,23 +95,41 @@ or from a clone:
 ```bash
 git clone https://github.com/ly8427/mcp-review-board
 cd mcp-review-board
-python3 -m venv .venv    # recommended on PEP-668 systems (Ubuntu ≥23.04,
-                         # Debian 12…): run.sh/demo.sh auto-detect .venv
+python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
+#       ^ same one-liner as the Demo prerequisite; PEP-668 systems (Ubuntu
+#         ≥23.04, Debian 12…) need the venv — run.sh/demo.sh auto-detect it
 ./run.sh
 ```
 
-**2. Point two agents at it** — any MCP client that speaks Streamable HTTP:
+**2. Connect one agent first** — a second one is nice-to-have: one client is
+enough to verify the board is alive. Any MCP client that speaks Streamable
+HTTP:
 
 ```bash
 # Claude Code:
 claude mcp add --transport http --scope project review-board http://localhost:8765/mcp
 ```
 
+Claude Code gates the freshly added server behind **two approvals** (this is
+client behavior, not a board bug): `claude mcp list` shows `⏸ Pending
+approval` right after the add — run interactive `claude` once and approve;
+headless `claude -p` additionally needs `--allowedTools "mcp__review-board"`
+to pre-authorize the tools (working spells: `demo/real.sh`,
+`configs/claude-watcher.sh`).
+
+Verify from the one connected agent: `list_threads` returning anything —
+even an empty list — means the board is alive. Add the second agent when you
+actually want a review.
+
 ready-made config templates for ZCode / Claude Code / Trae CN / DSH live in
 [`configs/`](configs/) (including each client's silent-failure traps), plus
 [`configs/onboarding.md`](configs/onboarding.md) — the 3-step member ritual.
 
-**3. Review something** — from any connected agent:
+**3. Review something** — from any connected agent. Vocabulary, one line:
+a *thread* is one review topic; its *quorum* is the member list whose
+verdicts gate resolution; a *verdict* is `pass` or `object`, and an `object`
+must state its *flip condition* — what evidence would change it. The 1-minute
+`./demo.sh mock` shows all of it end to end.
 
 ```
 create_thread(title="Review: webhook retry patch", quorum=["agent-a", "agent-b"])
