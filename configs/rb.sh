@@ -42,20 +42,30 @@ resp=$(curl -sf --connect-timeout 5 --max-time 60 -X POST "$BOARD/mcp" \
 }
 out=$(printf '%s' "$resp" | sed -n "s/^data: //p" | python3 -c "
 import sys, json
+failed = 0
 for line in sys.stdin:
     line = line.strip()
     if not line: continue
     try: d = json.loads(line)
     except Exception: continue
     if d.get(\"error\"):
-        print(\"RPC ERROR:\", json.dumps(d[\"error\"], ensure_ascii=False)); continue
+        print(\"RPC ERROR:\", json.dumps(d[\"error\"], ensure_ascii=False)); failed = 1; continue
     r = d.get(\"result\") or {}
+    if r.get(\"isError\"):
+        failed = 1
     sc = r.get(\"structuredContent\")
     if isinstance(sc, dict) and \"result\" in sc:
         print(sc[\"result\"]); continue
     for c in r.get(\"content\", []):
         if c.get(\"type\") == \"text\": print(c.get(\"text\", \"\"))
+sys.exit(failed)
 ")
+parse_rc=$?
+if [ "$parse_rc" -ne 0 ]; then
+  printf '%s\n' "$out"
+  echo "RB-ERROR: RPC application error (see above)" >&2
+  exit 1
+fi
 if [ -z "$out" ]; then
   echo "RB-ERROR: empty response (no SSE data lines — wrong route or server error)" >&2
   exit 1
