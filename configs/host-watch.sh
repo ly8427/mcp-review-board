@@ -21,6 +21,12 @@
 #
 # Configure the wake_* functions below for your members, then:
 #   bash configs/host-watch.sh            # one round
+#
+# TASK-TEXT BUDGET (field-proven, thread #24): keep the injected task text
+# SHORT — point at thread ids and let members fetch content themselves via
+# get_thread. A long inline task text (a full review post) pushed a
+# flash-tier member past the 15-min timeout with ZERO output and the round
+# was lost; the same member finished in 5 minutes with a condensed task.
 set -u
 BOARD="${BOARD:-http://localhost:8765}"
 WATCH_THREADS="${WATCH_THREADS:-}"                      # e.g. "21,22"; empty = no self-stop
