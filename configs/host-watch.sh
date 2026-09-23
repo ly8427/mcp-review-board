@@ -110,12 +110,27 @@ wake_opencode() { # opencode: no MCP configured -> rb.sh channel; --auto approve
   wsl -e bash -c 'cd ~ && timeout 900 ~/.opencode/bin/opencode run --auto "$(cat /mnt/c/path/to/rb-watch/task-opencode-live.txt)"'
 }
 
-wake_pi() {       # pi: No MCP by design -> rb.sh; node>=22 + DEEPSEEK_API_KEY + explicit --model
+wake_pi() {       # pi: No MCP by design -> rb.sh; node>=22 + DEEPSEEK_API_KEY + explicit --model.
+                  # pi incident fix (thread #24): --mode json streams events in
+                  # real time; the watchdog kills the session when the stream
+                  # stalls (180s no writes = model call hung) — fail fast
+                  # instead of burning the full outer timeout with zero output.
   local reason="$1" threads="$2"
   { cat "$WATCH_DIR/task-template-pi.txt"
     echo; echo "(本次唤醒探针注入: reason=$reason, threads=$threads)"
   } > "$WATCH_DIR/task-pi-live.txt"
-  wsl -e bash -c 'export PATH=$HOME/opt/node22/bin:$PATH; export DEEPSEEK_API_KEY=$(sed -n "s/^DEEPSEEK_API_KEY: //p" /mnt/c/path/to/credentials.yml); cd ~ && timeout 900 ~/.npm-global/bin/pi -p --no-session --model deepseek/deepseek-flash "$(cat /mnt/c/path/to/rb-watch/task-pi-live.txt)"'
+  wsl -e bash -c '
+    export PATH=$HOME/opt/node22/bin:$PATH
+    export DEEPSEEK_API_KEY=$(sed -n "s/^DEEPSEEK_API_KEY: //p" /mnt/c/path/to/credentials.yml)
+    EV=/tmp/rb-pi-events.log; : > "$EV"
+    cd ~ && timeout 900 ~/.npm-global/bin/pi -p --no-session --mode json --model deepseek/deepseek-flash "$(cat /mnt/c/path/to/rb-watch/task-pi-live.txt)" > "$EV" 2>&1 &
+    PID=$!
+    while kill -0 $PID 2>/dev/null; do
+      sleep 30
+      now=$(date +%s); last=$(stat -c %Y "$EV" 2>/dev/null || echo "$now")
+      if [ $((now - last)) -gt 180 ]; then kill $PID 2>/dev/null; wait $PID 2>/dev/null; exit 124; fi
+    done
+    wait $PID; exit $?'
 }
 
 # --- the round ----------------------------------------------------------------
