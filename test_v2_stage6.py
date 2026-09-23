@@ -263,12 +263,12 @@ def part_a_semantics():
 
         # part C (reuse this live server): protocol gate + board raw components
         proto = tool("get_protocol", {})
-        assert "v2.3" in proto.splitlines()[0] and "版本闸" in proto, proto[:120]
+        assert "v2.4" in proto.splitlines()[0] and "版本闸" in proto, proto[:120]
         page = urllib.request.urlopen(f"http://localhost:{PORT}/", timeout=10).read().decode()
         assert "画像:数据不足" in page           # c (4 firsts) → insufficient branch
         assert "首判19" in page                   # b → raw components, no composite
         assert "2.2-r3" in page                   # metric version travels with the brief
-        assert "协议 protocol v2.3" in page
+        assert "协议 protocol v2.4" in page
     finally:
         proc.send_signal(signal.SIGTERM); proc.wait(timeout=10)
     print("✅ part A+C: adversarial sequence matrix — episode-local five-way "

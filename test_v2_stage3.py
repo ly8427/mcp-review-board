@@ -177,16 +177,16 @@ def main():
             assert "(billed" not in out, f"rev2 first verdict free: {out}"
         assert status(tid) == "resolved"
 
-        # set_quorum: frozen on resolved; floor; unregistered add
+        # set_quorum: frozen on resolved; floor; unseen add joins as invitee (v2.4)
         assert "open-thread-only" in tool("set_quorum", {
             "thread_id": tid, "author": "a", "token": tok["a"], "remove": ["c"]})
         out = tool("create_thread", {"title": "q2", "author": "a",
                                      "quorum": ["a", "b"]})
         tid2 = int(out.split("#")[1].split(":")[0])
-        assert "not registered" in tool("set_quorum", {
+        assert "Quorum updated" in tool("set_quorum", {
             "thread_id": tid2, "author": "a", "token": tok["a"], "add": ["zz"]})
         assert "< 2" in tool("set_quorum", {
-            "thread_id": tid2, "author": "a", "token": tok["a"], "remove": ["b"]})
+            "thread_id": tid2, "author": "a", "token": tok["a"], "remove": ["zz", "b"]})
         assert "Quorum updated" in tool("set_quorum", {
             "thread_id": tid2, "author": "a", "token": tok["a"], "add": ["c"]})
 

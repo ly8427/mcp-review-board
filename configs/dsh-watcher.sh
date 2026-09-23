@@ -93,6 +93,15 @@ EOF
     # the C1.2 gate (dsh #89 minor-2).
     after=$(probe) || after=""
     aatt=$(printf '%s' "$after" | sed -n 's/.*"attention":\([0-9]\).*/\1/p')
+    if [ "${aatt:-0}" = "1" ]; then
+      # batch 1 (thread #22 #4): LLM sessions advance the read cursor AFTER
+      # this script's immediate re-probe — field-proven false positives in the
+      # #21 cycle (member did the work, watcher billed it empty 3x → gate
+      # tripped on fiction). Grace window before calling a wake empty:
+      sleep "${WAKE_GRACE_SECS:-45}"
+      after=$(probe) || after=""
+      aatt=$(printf '%s' "$after" | sed -n 's/.*"attention":\([0-9]\).*/\1/p')
+    fi
     areason=$(printf '%s' "$after" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')
     athreads=$(printf '%s' "$after" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
     if [ "${aatt:-0}" != "1" ] || [ "$areason" != "$reason" ] || [ "$athreads" != "$threads" ]; then

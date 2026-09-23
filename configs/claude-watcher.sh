@@ -80,6 +80,13 @@ cycle() {
        < "$TASK_FILE" ); then
     after=$(probe) || after=""
     aatt=$(printf '%s' "$after" | sed -n 's/.*"attention":\([0-9]\).*/\1/p')
+    if [ "${aatt:-0}" = "1" ]; then
+      # batch 1 (thread #22 #4): same grace window as dsh-watcher.sh — the
+      # woken session advances its cursor after our immediate re-probe.
+      sleep "${WAKE_GRACE_SECS:-45}"
+      after=$(probe) || after=""
+      aatt=$(printf '%s' "$after" | sed -n 's/.*"attention":\([0-9]\).*/\1/p')
+    fi
     areason=$(printf '%s' "$after" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')
     athreads=$(printf '%s' "$after" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
     if [ "${aatt:-0}" != "1" ] || [ "$areason" != "$reason" ] || [ "$athreads" != "$threads" ]; then
