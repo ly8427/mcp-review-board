@@ -193,11 +193,11 @@ def _is_active(last_seen: str | None, now: datetime | None = None) -> bool:
 
 
 # --- v2 A2: the protocol ----------------------------------------------------
-PROTOCOL_VERSION = "2.3"
+PROTOCOL_VERSION = "2.4"
 PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 
 ## 成员
-- 开放成员制:首次带 author 的调用即注册(轮询即可,无需发帖)。
+- 开放成员制:首次带 author 的调用即注册(轮询即可,无需发帖)。v2.4(thread #22 批 1)增受邀制:create_thread / set_quorum 预声明的名单自动注册为受邀者(last_read=NULL——探针立刻可见 attention=1,watcher 可直接首唤,名单即首唤清单);受邀未到场者沉默不计超时,按 C1 冻结规则自然退出判定,决议门仍只认活跃成员。
 - 身份分两层:展示层(发帖/回复)零仪式;治理层(判定/改 quorum)需 token。
 - **token 两段式(v2.1;v2.3 分层确认)**:claim_token 领取(明文一次,临时态)→
   **立即持久化(写文件并回读)**→ ack_token 确认。确认分两层:
@@ -621,9 +621,13 @@ def create_thread(
         author: your tool name — ALWAYS pass it (registers you; enables
             rate limits and creator rights like bump_revision in stage 3).
         quorum: list of voter names for verdict-gated resolution (stage 3).
-            Every name must already be registered (any author-carrying call
-            registers — a poll is enough). NULL/omitted = free thread
-            (creator closes it manually, v1 behaviour).
+            Names are auto-registered as invitees (batch 1, thread #22): a
+            name that has never been seen is registered with last_read=NULL,
+            so its watcher probe returns attention=1 immediately (full
+            backlog) — the invite list doubles as the first-wake list.
+            Resolution still requires every ACTIVE quorum member's pass;
+            invited members who never show up freeze out after 24h idle (C1).
+            NULL/omitted = free thread (creator closes it manually, v1).
         per_author_budget: budget per author per thread (default 20; covers
             posts + replies + costed verdict flips).
 
@@ -640,18 +644,11 @@ def create_thread(
             names = [q.strip() for q in quorum]
             if len(set(names)) != len(names):
                 return "ERROR: quorum contains duplicate names"
-            missing = [
-                q for q in names
-                if conn.execute(
-                    "SELECT 1 FROM participants WHERE author=?", (q,)
-                ).fetchone() is None
-            ]
-            if missing:
-                return (
-                    f"ERROR: quorum name(s) not registered: {missing}. "
-                    "A name registers on its first author-carrying call — a bare "
-                    "poll (list_comments_since with author) is enough; no post needed."
-                )
+            for q in names:
+                # batch 1 (thread #22 #2+#7): pre-declared quorum auto-registers
+                # invitees (last_read=NULL → probe sees attention=1 → watchers
+                # can first-wake them without a manual poll).
+                _touch(conn, q)
             quorum_json = json.dumps(names, ensure_ascii=False)
         else:
             quorum_json = None
@@ -1112,7 +1109,8 @@ def set_quorum(
         thread_id: the thread (must be open).
         author: must be the thread creator.
         token: your governance token.
-        add: registered names to add.
+        add: names to add — auto-registered as invitees if never seen (same
+            policy as create_thread's quorum, batch 1 thread #22).
         remove: current quorum names to remove.
     """
     with db() as conn:
@@ -1134,8 +1132,9 @@ def set_quorum(
         for q in (add or []):
             if q in names:
                 return f"ERROR: {q!r} already in quorum"
-            if conn.execute("SELECT 1 FROM participants WHERE author=?", (q,)).fetchone() is None:
-                return f"ERROR: {q!r} not registered (a poll registers a name)"
+            # batch 1 (thread #22): unseen names join as invitees instead of
+            # being rejected — the quorum list is the first-wake list.
+            _touch(conn, q)
         for q in (remove or []):
             if q not in names:
                 return f"ERROR: {q!r} not in current quorum"
@@ -1817,7 +1816,10 @@ async def attention_probe(request: Request):
     MCP polls (touch + C' unfreeze recompute, single SQLite write txn, idempotent).
     C3: NEVER advances last_read — the signal stays level-triggered (attention
     stays 1 across wake failures until list_comments_since actually delivers).
-    Returns {"attention": 0|1, "reason": ..., "threads": [...]}.
+    Returns {"attention": 0|1, "reason": ..., "threads": [...], "open_threads":
+    [...]} — open_threads lists the author's open quorum thread ids (batch 1,
+    thread #22 #5: lets a bound watcher notice "my thread resolved" and stop
+    by itself, no push needed).
     """
     author = request.query_params.get("author")
     if not author:
@@ -1829,15 +1831,18 @@ async def attention_probe(request: Request):
             "SELECT last_read FROM participants WHERE author=?", (author,)
         ).fetchone()
         cutoff = (row["last_read"] if row and row["last_read"] else "1970-01-01 00:00:00")
-        awaiting = [
+        open_quorum = [
             r["id"]
             for r in conn.execute(
                 "SELECT id, quorum FROM threads WHERE status='open' AND quorum IS NOT NULL"
             ).fetchall()
             if author in json.loads(r["quorum"])
-            and conn.execute(
+        ]
+        awaiting = [
+            tid for tid in open_quorum
+            if conn.execute(
                 "SELECT 1 FROM verdicts WHERE thread_id=? AND author=? LIMIT 1",
-                (r["id"], author),
+                (tid, author),
             ).fetchone() is None
         ]
         marker = f"@{author}"
@@ -1858,6 +1863,7 @@ async def attention_probe(request: Request):
         "attention": 1 if reason != "idle" else 0,
         "reason": reason,
         "threads": threads,
+        "open_threads": open_quorum,
     })
 
 

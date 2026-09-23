@@ -81,14 +81,15 @@ def main():
         # 0. register 'other' via a bare poll (registration needs no post)
         tool("list_comments_since", {"since": "now", "author": "other"})
 
-        # 1. chicken-egg: creator in own quorum is fine; only unregistered rejected
+        # 1. invited list (v2.4 batch 1): unregistered names auto-register as
+        #    invitees instead of being rejected — and the invitee's first poll
+        #    shows the awaiting verdict
         out = tool("create_thread", {"title": "t1", "author": "me",
                                      "quorum": ["me", "ghost"]})
-        assert "ghost" in out and "not registered" in out, f"expect ghost rejection: {out}"
-        out = tool("create_thread", {"title": "t1", "author": "me",
-                                     "quorum": ["me", "other"]})
-        assert out.startswith("Created thread #"), f"creator+registered quorum must pass: {out}"
+        assert out.startswith("Created thread #"), f"invitee auto-registration must pass: {out}"
         tid = int(out.split("#")[1].split(":")[0])
+        out = tool("list_comments_since", {"since": "now", "author": "ghost"})
+        assert "needs_attention" in out and str(tid) in out, f"invitee sees awaiting verdict: {out[:200]}"
 
         # 2. header shows quorum + budget
         out = tool("get_thread", {"thread_id": tid})
