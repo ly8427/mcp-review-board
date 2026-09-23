@@ -140,7 +140,7 @@ SUSPEND_AFTER_HOURS = 24
 
 
 # --- v2 A1: participant registry / heartbeat --------------------------------
-mcp = FastMCP("ReviewBoard")
+mcp = FastMCP("ReviewBoard", version="2.4.0")  # align serverInfo with pyproject (was: fastmcp lib version)
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
