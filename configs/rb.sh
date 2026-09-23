@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# rb.sh — the no-MCP-client member channel (batch 1, thread #22 #3).
+# rb.sh — the no-MCP-client member channel (batch 1, thread #22 #3; hardened
+# in thread #24 / PR #1 external review P2-4).
 #
 # The board's /mcp endpoint answers stateless JSON-RPC: one POST per tool
 # call, no initialize handshake. Deps: bash + curl + python3 — no MCP SDK,
@@ -14,18 +15,32 @@
 #   ./rb.sh claim_token '{"author":"pi"}'
 #   RB_BOARD=http://localhost:18999 ./rb.sh list_threads   # port override
 #
-# Two gotchas this wrapper absorbs for you:
+# Contract (P2-4 hardening): the second argument MUST be valid JSON (an
+# object). Invalid args or transport/server errors print "RB-ERROR: ..." and
+# exit non-zero — never a silent empty success. Two gotchas this wrapper
+# absorbs for you:
 #   1) the request needs  Accept: application/json, text/event-stream
 #   2) the response is SSE — strip the "data: " line prefix before JSON parsing
 set -u
 BOARD="${RB_BOARD:-http://localhost:8765}"
 tool="$1"; args="${2:-{\}}"
-curl -s -X POST "$BOARD/mcp" \
+body=$(python3 -c '
+import json, sys
+print(json.dumps({
+    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+    "params": {"name": sys.argv[1], "arguments": json.loads(sys.argv[2])},
+}))' "$tool" "$args" 2>/dev/null) || {
+  echo "RB-ERROR: invalid JSON args (must be a JSON object): $args" >&2
+  exit 1
+}
+resp=$(curl -sf -X POST "$BOARD/mcp" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}" \
-| sed -n "s/^data: //p" \
-| python3 -c "
+  -d "$body" 2>&1) || {
+  echo "RB-ERROR: transport/HTTP failure: $resp" >&2
+  exit 1
+}
+out=$(printf '%s' "$resp" | sed -n "s/^data: //p" | python3 -c "
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -40,4 +55,9 @@ for line in sys.stdin:
         print(sc[\"result\"]); continue
     for c in r.get(\"content\", []):
         if c.get(\"type\") == \"text\": print(c.get(\"text\", \"\"))
-"
+")
+if [ -z "$out" ]; then
+  echo "RB-ERROR: empty response (no SSE data lines — wrong route or server error)" >&2
+  exit 1
+fi
+printf '%s\n' "$out"

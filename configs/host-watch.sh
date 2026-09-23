@@ -28,47 +28,14 @@ WAKE_GRACE_SECS="${WAKE_GRACE_SECS:-45}"
 WATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 RB_REPO="$(cd "$WATCH_DIR/.." && pwd)"
 
-probe() { curl -sf "$BOARD/attention?author=$1"; }
-jatt()     { printf '%s' "$1" | sed -n 's/.*"attention":\([0-9]\).*/\1/p'; }
-jreason()  { printf '%s' "$1" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p'; }
-jthreads() { printf '%s' "$1" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p'; }
-jopen()    { printf '%s' "$1" | sed -n 's/.*"open_threads":\[\([^]]*\)\].*/\1/p'; }
+# probe/parse/judge helpers live in host-watch-lib.sh (shared with the test
+# matrix — thread #24 P2-6/P3). P1-1 semantics and the delivery-gate known
+# gap are documented there.
+. "$WATCH_DIR/host-watch-lib.sh"
 
-# self-stop pre-check (v2.4 open_threads field; #238/#239/#240/#246 review fix):
-#   - PROBE_AUTHORS must list YOUR members (same names as the wake_* calls
-#     below). Probing a name this board has never seen REGISTERS it (v2.4
-#     _touch) and pollutes your participant list — never leave the shipped
-#     example names in on an adopted board. Self-stop stays DISABLED until
-#     both PROBE_AUTHORS and WATCH_THREADS are set.
-#   - accumulate the open_threads UNION across ALL probes (the field is
-#     author-scoped — one member's list misses threads others belong to)
-#   - probe usability = "response carries the open_threads FIELD" (an empty
-#     list is a valid all-closed answer; a missing field = old server/failure,
-#     stay conservative and continue)
-#   - exit 3 only when the field was seen AND no bound id is in the union
-PROBE_AUTHORS="${PROBE_AUTHORS:-}"
-if [ -n "$WATCH_THREADS" ] && [ -z "$PROBE_AUTHORS" ]; then
-  echo "note: self-stop disabled — set PROBE_AUTHORS to your member names (see header)."
-fi
-if [ -n "$WATCH_THREADS" ] && [ -n "$PROBE_AUTHORS" ]; then
-  field_seen=0 open_union=""
-  for a in $PROBE_AUTHORS; do
-    r=$(probe "$a") || continue
-    case "$r" in *'"open_threads"'*) field_seen=1 ;; esac
-    u=$(jopen "$r")
-    [ -n "$u" ] && open_union="${open_union:+$open_union,}$u"
-  done
-  if [ "$field_seen" = "1" ]; then
-    any_open=0
-    for t in ${WATCH_THREADS//,/ }; do
-      case ",$open_union," in *",$t,"*) any_open=1; break ;; esac
-    done
-    if [ "$any_open" = "0" ]; then
-      echo "$(date +%T) bound threads [$WATCH_THREADS] all closed (open union=[$open_union]) — host-watch done, drop the cron."
-      exit 3
-    fi
-  fi
-fi
+# self-stop pre-check: exit 3 when every bound thread is closed (v2.4 field;
+# PROBE_AUTHORS required — see lib header).
+self_stop_check
 
 # wake <name> <probe-author> <wakefn>: probe -> conditional wake -> gate
 wake() {
@@ -89,8 +56,8 @@ wake() {
     sleep "$WAKE_GRACE_SECS"
     after=$(probe "$pauthor") || after=""
   fi
-  if [ "$rc" -eq 0 ] && { [ "$(jatt "$after")" != "1" ] || [ "$(jreason "$after")" != "$reason" ] || [ "$(jthreads "$after")" != "$threads" ]; }; then
-    echo 0 > "$fails"; echo "$(date +%T) $name: wake ok (attention moved)"
+  if judge_wake "$rc" "1" "$reason" "$threads" "$(jatt "$after")" "$(jreason "$after")" "$(jthreads "$after")"; then
+    echo 0 > "$fails"; echo "$(date +%T) $name: delivered (attention consumed — delivery, not task-completion)"
   else
     local n; n=$(( $(cat "$fails" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$fails"
     echo "$(date +%T) $name: wake FAILED (rc=$rc, or attention unchanged after ${WAKE_GRACE_SECS}s grace) ($n/3)"
@@ -140,6 +107,15 @@ wake_pi() {       # pi: No MCP by design -> rb.sh; node>=22 + DEEPSEEK_API_KEY +
 
 # --- the round ----------------------------------------------------------------
 echo "=== $(date '+%F %T') host-watch round (board=$BOARD) ==="
+# P2-5 (thread #24): adoption self-check — the shipped wake_* examples carry
+# maintainer-local placeholder paths; fail loudly instead of half-working.
+if grep -q "/mnt/c/path/to/" "$WATCH_DIR/host-watch.sh" 2>/dev/null && [ ! -f /tmp/rb-host-watch-configured ]; then
+  echo "!! this is the unmodified adoption template — the wake_* functions below still"
+  echo "   contain placeholder paths (/mnt/c/path/to/...). Configure them for your"
+  echo "   members (see the EDIT THESE section), set PROBE_AUTHORS, then touch"
+  echo "   /tmp/rb-host-watch-configured to silence this check. Refusing to half-run."
+  exit 1
+fi
 wake claude    claude    wake_claude
 wake dsh       dsh       wake_dsh
 wake opencode  opencode  wake_opencode
