@@ -47,6 +47,13 @@ self_stop_check
 wake() {
   local name="$1" pauthor="$2" wakefn="$3"
   local fails="/tmp/rb-host-watch-$name.fails" lock="/tmp/rb-host-watch-$name.lock.d"
+  # fail-count TTL (pi incident, thread #24): a transient upstream stall
+  # (observed: 15min zero-output wake, same load finished in 3min later)
+  # can burn 3 rounds and permanently stop a member. Counts older than 1h
+  # expire, so blips self-heal on the next round.
+  if [ -f "$fails" ] && [ -n "$(find "$fails" -mmin +60 2>/dev/null)" ]; then
+    rm -f "$fails"
+  fi
   local gate; gate=$(cat "$fails" 2>/dev/null || echo 0)
   if [ "${gate:-0}" -ge 3 ]; then echo "$(date +%T) $name: gate tripped (3 consecutive fails), skipping"; return 0; fi
   mkdir "$lock" 2>/dev/null || { echo "$(date +%T) $name: wake in flight, skip"; return 0; }

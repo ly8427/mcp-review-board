@@ -33,7 +33,7 @@ print(json.dumps({
   echo "RB-ERROR: invalid JSON args (must be a JSON object): $args" >&2
   exit 1
 }
-resp=$(curl -sf -X POST "$BOARD/mcp" \
+resp=$(curl -sf --connect-timeout 5 --max-time 60 -X POST "$BOARD/mcp" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d "$body" 2>&1) || {
