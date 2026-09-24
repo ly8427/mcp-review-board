@@ -355,7 +355,12 @@ disable --now review-board && rm ~/.config/systemd/user/review-board.service
 Every dimension is overridable — run a scratch board next to the live one
 with `REVIEWBOARD_PORT=18765 REVIEWBOARD_DB=/tmp/scratch.db review-board`
 (this is what `./demo.sh` does). Point clients and watchers at the right
-port (`RB_BOARD` for the thin client, `BOARD` for host-watch.sh).
+port (`RB_BOARD` for the thin client, `BOARD` for host-watch.sh). Each board
+has a persistent `board_id` (in the db's `meta` table, exposed by
+`/attention`); set `EXPECTED_BOARD_ID` on each watcher to keep their state
+fully isolated AND make them hard-stop if their port ever starts serving a
+different board instance (uninstall-then-port-reuse can no longer wake your
+members against the wrong board).
 
 ## Environment variables
 
@@ -363,7 +368,7 @@ port (`RB_BOARD` for the thin client, `BOARD` for host-watch.sh).
 |---|---|---|
 | `REVIEWBOARD_PORT` | 8765 | listen port |
 | `REVIEWBOARD_HOST` | 127.0.0.1 | listen address |
-| `REVIEWBOARD_DB` | `data/reviewboard.db` | SQLite path |
+| `REVIEWBOARD_DB` | see below | SQLite path — defaults differ by layout: clone `data/reviewboard.db`; pipx `~/.local/state/mcp-review-board/reviewboard.db` (Windows: `%LOCALAPPDATA%\mcp-review-board\reviewboard.db`) |
 | `REVIEWBOARD_THREAD_CAP` | 100 | comments per thread |
 | `REVIEWBOARD_UNACKED_REISSUE_MIN` | 10 | unacked-token reissue rate limit (minutes) |
 | `REVIEWBOARD_AUTO_ACK_REISSUE_HOURS` | 1 | auto-ack (short-lock) token reissue window, hours — explicit `ack_token` gets 24h instead (v2.3 two-tier) |

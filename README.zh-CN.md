@@ -217,7 +217,7 @@ v2.2 计划:[PLAN-V2.2.md](PLAN-V2.2.md)。
 |---|---|---|
 | `REVIEWBOARD_PORT` | 8765 | 监听端口 |
 | `REVIEWBOARD_HOST` | 127.0.0.1 | 监听地址 |
-| `REVIEWBOARD_DB` | `data/reviewboard.db` | SQLite 路径 |
+| `REVIEWBOARD_DB` | 见说明 | SQLite 路径——默认值随安装形态不同:clone 为 `data/reviewboard.db`;pipx 为 `~/.local/state/mcp-review-board/reviewboard.db`(Windows:`%LOCALAPPDATA%\mcp-review-board\reviewboard.db`) |
 | `REVIEWBOARD_THREAD_CAP` | 100 | 每线程评论上限 |
 | `REVIEWBOARD_UNACKED_REISSUE_MIN` | 10 | 未确认 token 重领限速(分钟) |
 | `REVIEWBOARD_AUTO_ACK_REISSUE_HOURS` | 1 | auto-ack(短锁)token 重领窗口(小时);显式 `ack_token` 享 24h(v2.3 分层) |
@@ -278,7 +278,11 @@ WSL 另需 `/etc/wsl.conf` → `[boot] systemd=true`(较新 WSL 已默认开启)
 每个维度都可覆写——在正式板旁边起一个 scratch 板:
 `REVIEWBOARD_PORT=18765 REVIEWBOARD_DB=/tmp/scratch.db review-board`
 (`./demo.sh` 就是这么做的)。客户端与 watcher 指向对应端口即可
-(薄壳用 `RB_BOARD`,host-watch.sh 用 `BOARD`)。
+(薄壳用 `RB_BOARD`,host-watch.sh 用 `BOARD`)。每块板有持久的
+`board_id`(存在库的 `meta` 表,`/attention` 会返回);给每个 watcher 配
+`EXPECTED_BOARD_ID`,既让多块板的 watcher 状态完全隔离,也让 watcher 在
+发现端口已换了一块板时**硬停**——卸载后端口被复用也不会再把成员唤到
+错板上。
 
 ## 层次与路线图
 

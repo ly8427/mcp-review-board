@@ -22,6 +22,7 @@ import json
 import os
 import secrets
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from html import escape
@@ -53,6 +54,13 @@ def _default_data_dir() -> Path:
 
 DATA_DIR = _default_data_dir() if _INSTALLED_LAYOUT else BASE_DIR / "data"
 DB_PATH = Path(os.environ.get("REVIEWBOARD_DB", str(DATA_DIR / "reviewboard.db")))
+
+# Batch D (thread #26/#27): storage-shape version, deliberately SEPARATE from
+# PROTOCOL_VERSION (governance semantics). Legacy databases (no meta table)
+# are identified by column probing and stamped; a db NEWER than the server is
+# refused loudly. The migration chain grows here.
+SCHEMA_VERSION = 5
+BOARD_INSTANCE_ID: str | None = None  # set by init_db; exposed via /attention
 # Mirror of schema.sql for pipx/wheel-installed layouts: a top-level module
 # ships alone, so schema.sql does not exist next to it. The repo file stays
 # authoritative — when both exist, the file wins. Keep the two in sync when
@@ -111,6 +119,13 @@ CREATE TABLE IF NOT EXISTS verdict_events (
     costed     INTEGER NOT NULL DEFAULT 0,
     note       TEXT,
     created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+-- Batch D (thread #27): instance metadata — mirror of the schema.sql tail.
+-- Keep the two in sync; guarded by test_schema_migration.py (both paths must
+-- create an identical table set).
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
 );
 """
 
@@ -317,40 +332,82 @@ def _connect_ro() -> sqlite3.Connection:
     return conn
 
 
+def _legacy_shape_fixups(conn: sqlite3.Connection) -> None:
+    """Identify & complete pre-meta databases (batch D: probing is now an
+    IDENTIFIER feeding the schema_version stamp, not the migration itself)."""
+    # v2-era fixups for pre-v2 DBs (SQLite has no ADD COLUMN IF NOT EXISTS)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(threads)")}
+    for col, ddl in (
+        ("author", "TEXT"),
+        ("quorum", "TEXT"),
+        ("per_author_budget", "INTEGER NOT NULL DEFAULT 20"),
+        ("revision", "INTEGER NOT NULL DEFAULT 1"),
+    ):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE threads ADD COLUMN {col} {ddl}")
+
+
+def _v21_token_backfill(conn: sqlite3.Connection) -> None:
+    # v2.1 migration: legacy tokens predate the two-phase lifecycle; their
+    # holders proved possession (governance use / audited hub recovery),
+    # so backfill token_acked=True rather than letting them fall into the
+    # free-reissue path and get silently replaced. Idempotent — runs on
+    # EVERY start (a db written by an older server can carry unbackfilled
+    # legacy tokens regardless of the meta stamp; stage5 pins this).
+    for author, meta_raw in conn.execute(
+        "SELECT author, meta FROM participants"
+    ).fetchall():
+        try:
+            meta = json.loads(meta_raw or "{}")
+        except (ValueError, TypeError):
+            meta = {}
+        if meta.get("token_hash") and "token_acked" not in meta:
+            meta["token_acked"] = True
+            meta["token_acked_at"] = _now_iso()
+            conn.execute(
+                "UPDATE participants SET meta=? WHERE author=?",
+                (json.dumps(meta, ensure_ascii=False), author),
+            )
+
+
 def init_db() -> None:
     # lazily (not at import): read-only site-packages must not crash import,
     # and env-overridden REVIEWBOARD_DB paths get their parent created too
+    global BOARD_INSTANCE_ID
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _connect() as conn:
         conn.executescript(_load_schema())
-        # v2 migrations for pre-v2 DBs (SQLite has no ADD COLUMN IF NOT EXISTS)
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(threads)")}
-        for col, ddl in (
-            ("author", "TEXT"),
-            ("quorum", "TEXT"),
-            ("per_author_budget", "INTEGER NOT NULL DEFAULT 20"),
-            ("revision", "INTEGER NOT NULL DEFAULT 1"),
-        ):
-            if col not in cols:
-                conn.execute(f"ALTER TABLE threads ADD COLUMN {col} {ddl}")
-        # v2.1 migration: legacy tokens predate the two-phase lifecycle; their
-        # holders proved possession (governance use / audited hub recovery),
-        # so backfill token_acked=True rather than letting them fall into the
-        # free-reissue path and get silently replaced.
-        for author, meta_raw in conn.execute(
-            "SELECT author, meta FROM participants"
-        ).fetchall():
-            try:
-                meta = json.loads(meta_raw or "{}")
-            except (ValueError, TypeError):
-                meta = {}
-            if meta.get("token_hash") and "token_acked" not in meta:
-                meta["token_acked"] = True
-                meta["token_acked_at"] = _now_iso()
-                conn.execute(
-                    "UPDATE participants SET meta=? WHERE author=?",
-                    (json.dumps(meta, ensure_ascii=False), author),
+        conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+        row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        if row is None:
+            # legacy pre-meta database: identify & complete its shape, then stamp
+            _legacy_shape_fixups(conn)
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
+        else:
+            v = int(row[0])
+            if v > SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"refusing to start: database schema v{v} is NEWER than this "
+                    f"server (supports v{SCHEMA_VERSION}). Upgrade mcp-review-board, "
+                    "or point REVIEWBOARD_DB at a fresh path — this database is "
+                    "left untouched."
                 )
+            # v < SCHEMA_VERSION: the forward migration chain goes here
+            # (none needed yet — every shipped shape is completable by the
+            # legacy identifier above).
+        _v21_token_backfill(conn)  # idempotent, every start (stage5)
+        bid = conn.execute(
+            "SELECT value FROM meta WHERE key='board_instance_id'"
+        ).fetchone()
+        if bid is None:
+            bid = (uuid.uuid4().hex,)
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES('board_instance_id', ?)", bid
+            )
+        BOARD_INSTANCE_ID = bid[0]
 
 
 @contextmanager
@@ -1864,6 +1921,9 @@ async def attention_probe(request: Request):
         "reason": reason,
         "threads": threads,
         "open_threads": open_quorum,
+        "board_id": BOARD_INSTANCE_ID,  # stable instance identity (thread #27):
+        # a watcher pinned to EXPECTED_BOARD_ID can detect that this port now
+        # serves a DIFFERENT board and refuse to wake members against it.
     })
 
 

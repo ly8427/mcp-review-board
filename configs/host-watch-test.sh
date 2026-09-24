@@ -58,6 +58,47 @@ expect_eq "G attention-moved-no-action (delivery by design)" \
   "$(judge 0 1 awaiting_verdict 23 0 idle "")" "delivered"
 
 echo
+echo "== probe_ok: validity gate + board identity (thread #27 must-fix 1+2) =="
+EXPECT_SAVED="${EXPECTED_BOARD_ID:-}"
+p_ok() { ( probe_ok x >/dev/null 2>&1 ); echo "rc=$?"; }
+probe() { return 1; }
+expect_eq "probe_ok transport failure"     "$(p_ok)" "rc=1"
+probe() { printf '%s' "$PO"; }
+PO='not-json'
+expect_eq "probe_ok invalid JSON (J)"      "$(p_ok)" "rc=1"
+PO='{"reason":"x"}'
+expect_eq "probe_ok missing attention"     "$(p_ok)" "rc=1"
+PO='{"attention":1,"board_id":"bbb"}'      # no EXPECTED set → no identity gate
+expect_eq "probe_ok mismatch no-EXPECTED"  "$(p_ok)" "rc=0"
+EXPECTED_BOARD_ID="aaa"
+PO='{"attention":1,"board_id":"bbb"}'
+expect_eq "probe_ok mismatch → hard stop"  "$(p_ok)" "rc=4"
+PO='{"attention":1,"board_id":"aaa"}'
+expect_eq "probe_ok match → proceed"       "$(p_ok)" "rc=0"
+PO='{"attention":1}'                       # pre-2.5 server: no field, never hard-stop
+expect_eq "probe_ok old-server no field"   "$(p_ok)" "rc=0"
+EXPECTED_BOARD_ID="$EXPECT_SAVED"
+
+echo
+echo "== wake_outcome + apply_billing: H/I/J — probe failure NEVER moves the gate =="
+wo() { wake_outcome "$@"; }
+expect_eq "H post-probe network failure"  "$(wo 0 1 '{}' new_comments 24)" "unverified"
+expect_eq "I grace re-probe failure"      "$(wo 0 1 '{}' new_comments 24)" "unverified"
+expect_eq "J invalid JSON body"           "$(wo 0 1 garbage new_comments 24)" "unverified"
+expect_eq "A valid delivered path"        "$(wo 0 0 '{"attention":0,"reason":"idle","threads":[]}' new_comments 24)" "delivered"
+expect_eq "E valid failed path"           "$(wo 0 0 '{"attention":1,"reason":"new_comments","threads":[24]}' new_comments 24)" "failed"
+TF=$(mktemp); echo 2 > "$TF"
+apply_billing unverified "$TF"
+expect_eq "billing unverified keeps 2"    "$(cat "$TF")" "2"
+apply_billing unverified "$TF"; apply_billing unverified "$TF"
+expect_eq "billing 3x unverified still 2" "$(cat "$TF")" "2"
+apply_billing delivered "$TF"
+expect_eq "billing delivered resets"      "$(cat "$TF")" "0"
+apply_billing failed "$TF"; apply_billing failed "$TF"
+expect_eq "billing failed increments"     "$(cat "$TF")" "2"
+rm -f "$TF"
+
+echo
 echo "== self_stop_check: bound-thread scenarios =="
 OUT_C=""; OUT_OTHER=""
 probe() { case "$1" in claude) printf '%s' "$OUT_C";; *) printf '%s' "$OUT_OTHER";; esac; }

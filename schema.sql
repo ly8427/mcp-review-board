@@ -79,3 +79,12 @@ CREATE TABLE IF NOT EXISTS verdict_events (
     note       TEXT,
     created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Batch D (thread #27): instance metadata. schema_version stamps the shape
+-- (legacy no-meta databases are identified and stamped by _legacy_shape_fixups
+-- in server.py); board_instance_id is a stable UUID identity so a watcher can
+-- refuse a port that now serves a DIFFERENT board instance.
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);

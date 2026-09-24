@@ -35,6 +35,54 @@ fi
 
 probe() { curl -sf "$BOARD/attention?author=$1"; }
 
+# probe_ok <author> — the ONE probe entry point (thread #27 must-fix 1+2).
+#   rc 0 + valid JSON on stdout = a trustworthy response.
+#   rc 1 = NEUTRAL: transport failure or invalid/non-JSON body — zero
+#         information about delivery; callers must neither bill nor gate.
+#   exit 4 = BOARD IDENTITY MISMATCH (hard stop): only when EXPECTED_BOARD_ID
+#         is set AND the response is valid AND carries a board_id that differs.
+#         Probe failures and pre-2.5 servers (no field) NEVER hard-stop.
+probe_ok() {
+  local r bid
+  r=$(probe "$1") || return 1
+  [ "$(jhasfield "$r" attention)" = "1" ] || return 1
+  if [ -n "${EXPECTED_BOARD_ID:-}" ]; then
+    bid=$(jget board_id "$r")
+    if [ -n "$bid" ] && [ "$bid" != "$EXPECTED_BOARD_ID" ]; then
+      echo "BOARD IDENTITY MISMATCH: expected $EXPECTED_BOARD_ID, this port serves $bid." >&2
+      echo "Refusing to wake members against a different board instance." >&2
+      echo "Remove or repoint this watcher (configs/uninstall-watch.sh lists entry points)." >&2
+      exit 4
+    fi
+  fi
+  printf '%s\n' "$r"
+}
+
+# wake_outcome <agent_rc> <post_probe_rc> <post_json> <pre_reason> <pre_threads>
+#   → delivered | failed | unverified (thread #27 must-fix 1):
+#   probe failure is NEUTRAL — never billed, never touches the gate counter;
+#   only a VALID probe with an unchanged fingerprint is an informative FAILED.
+wake_outcome() {
+  local arc="$1" prc="$2" aj="$3" pr="$4" pt="$5"
+  if [ "$prc" != "0" ]; then echo unverified; return; fi
+  if judge_wake "$arc" "1" "$pr" "$pt" "$(jatt "$aj")" "$(jreason "$aj")" "$(jthreads "$aj")"; then
+    echo delivered
+  else
+    echo failed
+  fi
+}
+
+# apply_billing <outcome> <fails_file> — the ONLY writer of gate state.
+#   delivered → reset; failed → increment; unverified → NO change (asserted
+#   by the H/I/J matrix: probe failures never move the gate counter).
+apply_billing() {
+  case "$1" in
+    delivered) echo 0 > "$2" ;;
+    failed)    echo $(( $(cat "$2" 2>/dev/null || echo 0) + 1 )) > "$2" ;;
+    unverified) : ;;
+  esac
+}
+
 # jget <field> <json> — real JSON parse: empty output for absent fields;
 # lists joined with commas. Backend: python if available, else node.
 jget() {
@@ -105,7 +153,7 @@ self_stop_check() {
   fi
   local field_seen=0 open_union="" r u t any_open=0
   for a in $PROBE_AUTHORS; do
-    r=$(probe "$a") || continue
+    r=$(probe_ok "$a") || continue   # identity gate + neutral-on-failure (#27)
     [ "$(jhasfield "$r")" = "1" ] && field_seen=1
     u=$(jopen "$r")
     [ -n "$u" ] && open_union="${open_union:+$open_union,}$u"
