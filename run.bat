@@ -1,6 +1,7 @@
 @echo off
-REM Start the MCP Review Board server (Windows - for later migration from WSL).
-REM Requires Python 3.11+ on Windows (not currently installed; see README).
+REM Start the MCP Review Board server on native Windows (cold-start tested
+REM 2026-09-24, incl. GBK code page). Needs Python 3.10+ from python.org in
+REM PATH (the Microsoft Store "python" alias is a stub) - see README.md.
 setlocal
 cd /d "%~dp0"
 

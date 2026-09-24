@@ -39,22 +39,27 @@ probe() { curl -sf "$BOARD/attention?author=$1"; }
 #   rc 0 + valid JSON on stdout = a trustworthy response.
 #   rc 1 = NEUTRAL: transport failure or invalid/non-JSON body — zero
 #         information about delivery; callers must neither bill nor gate.
-#   rc 4 = BOARD IDENTITY MISMATCH (hard stop): only when EXPECTED_BOARD_ID
-#         is set AND the response is valid AND carries a board_id that differs.
-#         Probe failures and pre-2.5 servers (no field) NEVER hard-stop.
-#   NOTE: probe_ok RETURNS 4 instead of exiting (win-test finding #11: an
-#   exit inside a $(...) substitution dies in the subshell and the script
-#   ends with 0). Callers MUST propagate: [ "$rc" = 4 ] && exit 4.
+#   rc 4 = BOARD IDENTITY HARD STOP (GPT round-3 C1: fail-closed once the
+#         watcher opts into identity). When EXPECTED_BOARD_ID is SET, a
+#         response with a missing OR mismatched board_id returns 4 — an
+#         unidentifiable board on this port may be the wrong instance
+#         (uninstall + port reuse by a pre-2.5 server). Backward
+#         compatibility (no board_id field) applies ONLY when
+#         EXPECTED_BOARD_ID is unset.
+#   NOTE: probe_ok RETURNS 4 instead of exiting (win-test #11: an exit
+#   inside a $(...) substitution dies in the subshell). Callers MUST
+#   propagate: [ "$rc" = 4 ] && exit 4.
 probe_ok() {
   local r bid
   r=$(probe "$1") || return 1
   [ "$(jhasfield "$r" attention)" = "1" ] || return 1
   if [ -n "${EXPECTED_BOARD_ID:-}" ]; then
     bid=$(jget board_id "$r")
-    if [ -n "$bid" ] && [ "$bid" != "$EXPECTED_BOARD_ID" ]; then
-      echo "BOARD IDENTITY MISMATCH: expected $EXPECTED_BOARD_ID, this port serves $bid." >&2
-      echo "Refusing to wake members against a different board instance — remove or" >&2
-      echo "repoint this watcher (configs/uninstall-watch.sh lists entry points)." >&2
+    if [ -z "$bid" ] || [ "$bid" != "$EXPECTED_BOARD_ID" ]; then
+      echo "BOARD IDENTITY ${bid:+MISMATCH}${bid:-UNVERIFIABLE}: expected $EXPECTED_BOARD_ID," >&2
+      echo "this port ${bid:+serves $bid}${bid:-carries a server with no board_id (pre-2.5?)}." >&2
+      echo "Refusing to wake members against an unverified board — remove or repoint" >&2
+      echo "this watcher, or unset EXPECTED_BOARD_ID to run without identity pinning." >&2
       return 4
     fi
   fi

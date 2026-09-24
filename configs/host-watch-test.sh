@@ -75,8 +75,11 @@ PO='{"attention":1,"board_id":"bbb"}'
 expect_eq "probe_ok mismatch → hard stop"  "$(p_ok)" "rc=4"
 PO='{"attention":1,"board_id":"aaa"}'
 expect_eq "probe_ok match → proceed"       "$(p_ok)" "rc=0"
-PO='{"attention":1}'                       # pre-2.5 server: no field, never hard-stop
-expect_eq "probe_ok old-server no field"   "$(p_ok)" "rc=0"
+PO='{"attention":1}'                       # pre-2.5 server: no field.
+expect_eq "probe_ok no-field+EXPECTED → fail-closed (GPT C1)" "$(p_ok)" "rc=4"
+EXPECTED_BOARD_ID=""
+PO='{"attention":1}'
+expect_eq "probe_ok no-field, no pin → compat" "$(p_ok)" "rc=0"
 EXPECTED_BOARD_ID="$EXPECT_SAVED"
 
 echo

@@ -61,6 +61,9 @@ DB_PATH = Path(os.environ.get("REVIEWBOARD_DB", str(DATA_DIR / "reviewboard.db")
 # refused loudly. The migration chain grows here.
 SCHEMA_VERSION = 5
 BOARD_INSTANCE_ID: str | None = None  # set by init_db; exposed via /attention
+# Forward migrations keyed by the version they upgrade FROM (GPT round-3 C2):
+# _MIGRATIONS[4] upgrades a v4 db to v5. Empty today — see init_db.
+_MIGRATIONS: dict[int, callable] = {}
 # Mirror of schema.sql for pipx/wheel-installed layouts: a top-level module
 # ships alone, so schema.sql does not exist next to it. The repo file stays
 # authoritative — when both exist, the file wins. Keep the two in sync when
@@ -395,9 +398,20 @@ def init_db() -> None:
                     "or point REVIEWBOARD_DB at a fresh path — this database is "
                     "left untouched."
                 )
-            # v < SCHEMA_VERSION: the forward migration chain goes here
-            # (none needed yet — every shipped shape is completable by the
-            # legacy identifier above).
+            # Forward migration chain (GPT round-3 C2): apply each step from
+            # the db's version up to the server's, then stamp. The chain is
+            # EMPTY today (every shipped shape is completable by the legacy
+            # identifier above), but the contract is explicit and tested: an
+            # existing meta-version database NEVER falls through unstamped.
+            # To add one: _MIGRATIONS[old] = lambda conn: conn.execute(...)
+            for step in range(v, SCHEMA_VERSION):
+                fn = _MIGRATIONS.get(step)
+                if fn is not None:
+                    fn(conn)
+            conn.execute(
+                "UPDATE meta SET value=? WHERE key='schema_version'",
+                (str(SCHEMA_VERSION),),
+            )
         _v21_token_backfill(conn)  # idempotent, every start (stage5)
         bid = conn.execute(
             "SELECT value FROM meta WHERE key='board_instance_id'"

@@ -102,9 +102,28 @@ def main() -> None:
         server.BOARD_INSTANCE_ID = None
         try:
             server.init_db()
-            check("d1 newer db refuses", False)
+            check("d1 newer db refuses (loud)", False)
         except RuntimeError as e:
             check("d1 newer db refuses (loud)", "NEWER" in str(e) and "refusing" in str(e))
+
+        # d2/d3) existing meta with an OLDER version → forward-migration path
+        # (GPT round-3 C2): the (empty) chain runs and the version is stamped
+        # UP to current — an older-meta db never falls through unstamped.
+        db35 = td / "oldermeta.db"
+        _use_db(db35)
+        server.init_db()
+        c = sqlite3.connect(db35)
+        c.execute("INSERT INTO threads(title, author) VALUES ('from-v4', 'old')")
+        c.execute("UPDATE meta SET value='4' WHERE key='schema_version'")
+        c.commit(); c.close()
+        server.BOARD_INSTANCE_ID = None
+        server.init_db()
+        c = sqlite3.connect(db35)
+        rows = c.execute("SELECT count(*) FROM threads WHERE title='from-v4'").fetchone()[0]
+        c.close()
+        check("d2 older-meta stamped up to current",
+              _meta(db35).get("schema_version") == str(server.SCHEMA_VERSION))
+        check("d3 older-meta data preserved", rows == 1)
 
         # e) HTTP: stable board_id across restarts
         db4 = td / "http.db"
