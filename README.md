@@ -72,9 +72,11 @@ use WSL, the Microsoft Store `python` alias won't work). Two install routes:
 running the offline demos.
 
 ```bash
-pipx install git+https://github.com/ly8427/mcp-review-board
+pipx install mcp-review-board
 review-board                 # → http://127.0.0.1:<port>  (default 8765; override: REVIEWBOARD_PORT)
 ```
+
+(or track main directly: `pipx install git+https://github.com/ly8427/mcp-review-board`)
 
 Success looks like: after the FastMCP/uvicorn startup noise (the big ASCII
 banner is **noise, not an error** — the project's own line arrives a few

@@ -53,9 +53,11 @@ Windows 文件关联,可能静默退出且退出码为 0**——请用上述 she
 代码或跑离线 demo 的场景。
 
 ```bash
-pipx install git+https://github.com/ly8427/mcp-review-board
+pipx install mcp-review-board
 review-board                 # → http://127.0.0.1:<port>(默认 8765;用 REVIEWBOARD_PORT 覆写)
 ```
+
+(或跟踪 main:`pipx install git+https://github.com/ly8427/mcp-review-board`)
 
 成功的样子:FastMCP/uvicorn 的启动噪音过去后(大字 ASCII banner 是**噪音不是报错**,
 项目自己的横幅行晚几秒才出现),server 打印 `MCP Review Board → http://127.0.0.1:<port>/`
