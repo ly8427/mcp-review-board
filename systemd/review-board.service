@@ -6,6 +6,9 @@
 #   edit the copy: replace every <REPO_ROOT> with your absolute clone path
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now review-board.service
+# pipx installs (no clone dir): use instead —
+#   WorkingDirectory=%h
+#   ExecStart=%h/.local/bin/review-board
 # Manage:
 #   systemctl --user status|restart|stop review-board.service
 # Uninstall:

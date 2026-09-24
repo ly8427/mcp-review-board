@@ -235,6 +235,8 @@ systemctl --user enable --now review-board
 ```
 
 WSL 另需 `/etc/wsl.conf` → `[boot] systemd=true`(较新 WSL 已默认开启)。
+**pipx 安装**(无 clone 目录):把 unit 指向 pipx 入口即可——
+`WorkingDirectory=%h` 与 `ExecStart=%h/.local/bin/review-board`。
 `Restart=on-failure` 让服务死掉后自动拉起。卸载服务:
 `systemctl --user disable --now review-board && rm ~/.config/systemd/user/review-board.service && systemctl --user daemon-reload`。
 

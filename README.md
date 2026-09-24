@@ -302,10 +302,12 @@ systemctl --user enable --now review-board
 ```
 
 WSL additionally needs `/etc/wsl.conf` → `[boot] systemd=true` (recent WSL
-releases ship it enabled). `Restart=on-failure` brings the board back
-automatically. Uninstall the service with `systemctl --user disable --now
-review-board && rm ~/.config/systemd/user/review-board.service && systemctl
---user daemon-reload`.
+releases ship it enabled). **pipx installs** (no clone dir): point the unit
+at the pipx entry point instead — `WorkingDirectory=%h` and
+`ExecStart=%h/.local/bin/review-board`. `Restart=on-failure` brings the
+board back automatically. Uninstall the service with `systemctl --user
+disable --now review-board && rm ~/.config/systemd/user/review-board.service
+&& systemctl --user daemon-reload`.
 
 ## Upgrading & uninstalling
 
