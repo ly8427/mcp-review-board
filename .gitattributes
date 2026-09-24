@@ -1,0 +1,5 @@
+# Line-ending policy (thread #25 batch C): .bat must be CRLF on checkout —
+# LF + UTF-8 special chars made cmd.exe misparse run.bat on CP936 Windows
+# (#230-#232). .sh stays LF. Enforcement: test_bat_encoding.py.
+*.bat text eol=crlf
+*.sh text eol=lf

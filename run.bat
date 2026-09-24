@@ -1,5 +1,5 @@
 @echo off
-REM Start the MCP Review Board server (Windows — for later migration from WSL).
+REM Start the MCP Review Board server (Windows - for later migration from WSL).
 REM Requires Python 3.11+ on Windows (not currently installed; see README).
 setlocal
 cd /d "%~dp0"
@@ -12,7 +12,7 @@ if errorlevel 1 (
 
 python -c "import fastmcp" 2>nul
 if errorlevel 1 (
-  echo fastmcp not found — nothing is auto-installed. Fix, pick one:
+  echo fastmcp not found - nothing is auto-installed. Fix, pick one:
   echo   python -m venv .venv ^&^& .venv\Scripts\python -m pip install -r requirements.txt ^&^& run.bat
   echo   pipx install git+https://github.com/ly8427/mcp-review-board
   exit /b 1

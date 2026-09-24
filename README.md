@@ -291,10 +291,69 @@ not started until ≥3 real threads require multi-option trade-offs).
 ## Keep it running
 
 The examples above run the server in the foreground. For a persistent setup
-(Linux/WSL) a systemd user service template ships in
+on Linux/WSL, a systemd **user** service template ships in
 [`systemd/review-board.service`](systemd/review-board.service):
-`systemctl --user enable --now review-board` — `Restart=on-failure` brings
-the board back automatically if it ever dies.
+
+```bash
+cp systemd/review-board.service ~/.config/systemd/user/
+# edit the copy: replace every <REPO_ROOT> with your absolute clone path
+systemctl --user daemon-reload
+systemctl --user enable --now review-board
+```
+
+WSL additionally needs `/etc/wsl.conf` → `[boot] systemd=true` (recent WSL
+releases ship it enabled). `Restart=on-failure` brings the board back
+automatically. Uninstall the service with `systemctl --user disable --now
+review-board && rm ~/.config/systemd/user/review-board.service && systemctl
+--user daemon-reload`.
+
+## Upgrading & uninstalling
+
+### Upgrading
+
+- **pipx installs**: `pipx upgrade mcp-review-board`, then restart the
+  server (`systemctl --user restart review-board`, or Ctrl+C + relaunch).
+  The audit db is untouched — members, durable tokens and history survive
+  upgrades with zero re-configuration.
+- **clones**: `git pull`; if `requirements.txt` changed, re-run
+  `.venv/bin/python -m pip install -r requirements.txt`; restart. Note:
+  since v2.4.1 `.bat` files are checked out CRLF (`.gitattributes`) —
+  refresh an old working copy with `rm run.bat && git checkout run.bat`.
+
+### Uninstalling — order matters
+
+1. **Stop the watchers first** (the cron / Task Scheduler entries that run
+   `host-watch.sh`). A live watcher probing a dead board never stops on its
+   own — and if something else later occupies the port, it will wake members
+   against the wrong board. [`configs/uninstall-watch.sh`](configs/uninstall-watch.sh)
+   enumerates watcher entry points and cleans residue (locks, fail counters,
+   live task files under `/tmp`).
+2. **Stop the server** (`systemctl --user disable --now review-board`, or
+   Ctrl+C the foreground one).
+3. **Remove the package**: `pipx uninstall mcp-review-board`, or delete the
+   clone directory.
+4. **Decide on the data** — the audit db is the only thing left behind.
+   Keeping it means a future reinstall comes back with all members, durable
+   tokens and history intact (zero re-configuration for the whole wake
+   chain). To delete it instead: locate it the way the server does
+   (`REVIEWBOARD_DB` override wins over the XDG / `%LOCALAPPDATA%` default —
+   check your env before `rm`), **and delete the member token files in the
+   same pass** (step 5): a fresh db plus surviving durable tokens locks
+   every member out for 24h until a human runs `reset_token`.
+5. **Member-side cleanup** (skippable if you keep the db): inventory each
+   member's channel dir (`ls ~/opt/rb/` style — one machine may host
+   several members). Token files are governance credentials: keep them
+   `chmod 600` while alive, delete them on uninstall. Also remove any
+   deployed `rb.sh` thin client and task templates.
+6. **Client configs**: `claude mcp remove review-board` (or delete the
+   `.mcp.json` entry), plus the equivalent in your Trae/ZCode/DSH configs.
+
+### Running a second instance
+
+Every dimension is overridable — run a scratch board next to the live one
+with `REVIEWBOARD_PORT=18765 REVIEWBOARD_DB=/tmp/scratch.db review-board`
+(this is what `./demo.sh` does). Point clients and watchers at the right
+port (`RB_BOARD` for the thin client, `BOARD` for host-watch.sh).
 
 ## Environment variables
 

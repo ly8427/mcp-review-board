@@ -28,6 +28,8 @@
 # flash-tier member past the 15-min timeout with ZERO output and the round
 # was lost; the same member finished in 5 minutes with a condensed task.
 set -u
+KIT_VERSION="2.4.1"   # deployment drift check (thread #25 batch B): compare
+                      # against the repo copy and WARN only — never gate on it
 BOARD="${BOARD:-http://localhost:8765}"
 WATCH_THREADS="${WATCH_THREADS:-}"                      # e.g. "21,22"; empty = no self-stop
 WAKE_GRACE_SECS="${WAKE_GRACE_SECS:-45}"
@@ -134,7 +136,15 @@ wake_pi() {       # pi: No MCP by design -> rb.sh; node>=22 + DEEPSEEK_API_KEY +
 }
 
 # --- the round ----------------------------------------------------------------
-echo "=== $(date '+%F %T') host-watch round (board=$BOARD) ==="
+echo "=== $(date '+%F %T') host-watch round (board=$BOARD, kit $KIT_VERSION) ==="
+# drift check (advisory only, #268-3: local edits are legitimate; never block):
+if [ -f "$RB_REPO/configs/host-watch.sh" ]; then
+  repo_kit=$(sed -n 's/^KIT_VERSION="//p' "$RB_REPO/configs/host-watch.sh" | head -1 | tr -d '"')
+  if [ -n "$repo_kit" ] && [ "$repo_kit" != "$KIT_VERSION" ]; then
+    echo "note: this deployed copy is kit $KIT_VERSION, repo ships $repo_kit —"
+    echo "      diff $0 $RB_REPO/configs/host-watch.sh and update at your convenience."
+  fi
+fi
 # P2-5 (thread #24): adoption self-check — the shipped wake_* examples carry
 # maintainer-local placeholder paths; fail loudly instead of half-working.
 if grep -q "/mnt/c/path/to/" "$WATCH_DIR/host-watch.sh" 2>/dev/null && [ ! -f /tmp/rb-host-watch-configured ]; then

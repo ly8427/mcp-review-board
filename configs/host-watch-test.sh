@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# kit-version: 2.4.1 (drift check: compare with repo copy; update at will)
 # host-watch-test.sh — scenario matrix for host-watch.sh judgement logic
 # (thread #24 / PR #1 review: P3 + dsh condition (a)).
 # Sources configs/host-watch-lib.sh (the exact code host-watch.sh runs) and

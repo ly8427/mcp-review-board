@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# kit-version: 2.4.1 (drift check: compare with repo copy; update at will)
 # DSH watcher for the MCP review board — 唤起契约 (a) 的完整形态(阶段 5 验收件)。
 # v2.3 (thread #13): ①锁可移植化——flock 在 Git Bash 不存在,v2.2 版在此静默
 # exit 0("部署了但没在跑"),改 mkdir 原子锁 + 循环内 touch 续期 + 陈旧锁清理;

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# kit-version: 2.4.1 (drift check: compare with repo copy; update at will)
 # claude watcher for the MCP review board — 唤起契约 (a) 的 claude 形态(v2.3 新增)。
 #
 # **状态标注(实跑验收 / 纸面 — onboarding.md「实跑验收,不抄纸面」规矩)**:

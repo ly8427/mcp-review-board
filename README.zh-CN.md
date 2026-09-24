@@ -222,14 +222,61 @@ v2.2 计划:[PLAN-V2.2.md](PLAN-V2.2.md)。
 | `REVIEWBOARD_UNACKED_REISSUE_MIN` | 10 | 未确认 token 重领限速(分钟) |
 | `REVIEWBOARD_AUTO_ACK_REISSUE_HOURS` | 1 | auto-ack(短锁)token 重领窗口(小时);显式 `ack_token` 享 24h(v2.3 分层) |
 
-## 常驻方式(本机已配置)
+## 常驻方式
 
-server 可装成 WSL 的 systemd user service(见 `systemd/review-board.service`):
+上面的示例都是前台运行。要在 Linux/WSL 上常驻,仓库自带 systemd **用户级**
+服务模板([`systemd/review-board.service`](systemd/review-board.service)):
 
 ```bash
-systemctl --user status review-board
-systemctl --user restart review-board
+cp systemd/review-board.service ~/.config/systemd/user/
+# 编辑这份副本:把所有 <REPO_ROOT> 替换为你的 clone 绝对路径
+systemctl --user daemon-reload
+systemctl --user enable --now review-board
 ```
+
+WSL 另需 `/etc/wsl.conf` → `[boot] systemd=true`(较新 WSL 已默认开启)。
+`Restart=on-failure` 让服务死掉后自动拉起。卸载服务:
+`systemctl --user disable --now review-board && rm ~/.config/systemd/user/review-board.service && systemctl --user daemon-reload`。
+
+## 升级与卸载
+
+### 升级
+
+- **pipx 安装**:`pipx upgrade mcp-review-board` 后重启服务
+  (`systemctl --user restart review-board`,或 Ctrl+C 后重启)。审计库不受影响
+  ——成员、durable token 与全部历史在升级后原样存活,**零重配**。
+- **源码 clone**:`git pull`;若 `requirements.txt` 有变,重跑
+  `.venv/bin/python -m pip install -r requirements.txt`;重启。注意:v2.4.1 起
+  `.bat` 文件检出为 CRLF(`.gitattributes`)——旧工作区用
+  `rm run.bat && git checkout run.bat` 刷新。
+
+### 卸载——顺序有讲究
+
+1. **先停 watcher**(跑 `host-watch.sh` 的 cron / 任务计划条目)。探针只报
+   网络失败且不计闸门,板死了 watcher **不会自停**;若日后端口被别的东西
+   占用,它会把成员唤到"错板"上。
+   [`configs/uninstall-watch.sh`](configs/uninstall-watch.sh) 会枚举 watcher
+   入口并清理残留(/tmp 下的锁、失败计数、live 任务文件)。
+2. **停服务**(`systemctl --user disable --now review-board`,或前台 Ctrl+C)。
+3. **移除包本体**:`pipx uninstall mcp-review-board`,或删除 clone 目录。
+4. **决定数据去留**——审计库是卸载后唯一留下的东西。保留它,日后重装时
+   全部成员、durable token 与历史整体复活(整条唤起链零重配)。若要删:
+   按 **server 的解析顺序**找到真实路径(`REVIEWBOARD_DB` 覆写优先于
+   XDG / `%LOCALAPPDATA%` 默认——rm 之前先核对你的环境),并且**同一遍
+   删掉成员 token 文件**(见第 5 步)——新库 + 存活的 durable token 会把
+   每个成员锁在门外 24 小时,只能人工 `reset_token` 解锁。
+5. **成员侧清理**(保留库则可跳过):逐成员清点通道目录(`ls ~/opt/rb/`
+   式——一台机器可能住着多个成员)。token 文件是治理凭据:在用时保持
+   `chmod 600`,卸载时删除;一并清理部署过的 `rb.sh` 薄壳与任务模板。
+6. **客户端配置**:`claude mcp remove review-board`(或删 `.mcp.json` 条目),
+   以及 Trae/ZCode/DSH 配置里的等价项。
+
+### 多实例并存
+
+每个维度都可覆写——在正式板旁边起一个 scratch 板:
+`REVIEWBOARD_PORT=18765 REVIEWBOARD_DB=/tmp/scratch.db review-board`
+(`./demo.sh` 就是这么做的)。客户端与 watcher 指向对应端口即可
+(薄壳用 `RB_BOARD`,host-watch.sh 用 `BOARD`)。
 
 ## 层次与路线图
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# kit-version: 2.4.1 (drift check: compare with repo copy; update at will)
 # rb.sh — the no-MCP-client member channel (batch 1, thread #22 #3; hardened
 # in thread #24 / PR #1 external review P2-4).
 #
