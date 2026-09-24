@@ -125,6 +125,25 @@ def main() -> None:
               _meta(db35).get("schema_version") == str(server.SCHEMA_VERSION))
         check("d3 older-meta data preserved", rows == 1)
 
+        # d4) forgotten migration fails closed (GPT round-4): a declared
+        # SCHEMA_VERSION with a MISSING chain step refuses to start instead
+        # of stamping over an unmigrated shape.
+        db36 = td / "missingstep.db"
+        _use_db(db36)
+        server.init_db()
+        c = sqlite3.connect(db36)
+        c.execute("UPDATE meta SET value='4' WHERE key='schema_version'")
+        c.commit(); c.close()
+        server.BOARD_INSTANCE_ID = None
+        saved = dict(server._MIGRATIONS); server._MIGRATIONS.pop(4)
+        try:
+            server.init_db()
+            check("d4 missing migration fails closed", False)
+        except RuntimeError as e:
+            check("d4 missing migration fails closed", "missing migration 4 -> 5" in str(e))
+        finally:
+            server._MIGRATIONS.clear(); server._MIGRATIONS.update(saved)
+
         # e) HTTP: stable board_id across restarts
         db4 = td / "http.db"
         env = dict(os.environ, REVIEWBOARD_PORT="18877", REVIEWBOARD_DB=str(db4))

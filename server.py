@@ -61,9 +61,13 @@ DB_PATH = Path(os.environ.get("REVIEWBOARD_DB", str(DATA_DIR / "reviewboard.db")
 # refused loudly. The migration chain grows here.
 SCHEMA_VERSION = 5
 BOARD_INSTANCE_ID: str | None = None  # set by init_db; exposed via /attention
-# Forward migrations keyed by the version they upgrade FROM (GPT round-3 C2):
-# _MIGRATIONS[4] upgrades a v4 db to v5. Empty today — see init_db.
-_MIGRATIONS: dict[int, callable] = {}
+# Forward migrations keyed by the version they upgrade FROM (GPT round-3 C2
+# + round-4 P3): _MIGRATIONS[4] upgrades a v4 db to v5. EVERY step up to
+# SCHEMA_VERSION must be EXPLICITLY declared — value None means "no shape
+# change needed, just stamp" (that is the entire v4->5 step today); a step
+# MISSING from the dict is a forgotten migration and fails closed at startup
+# instead of silently stamping over an unmigrated shape.
+_MIGRATIONS: dict[int, callable | None] = {4: None}
 # Mirror of schema.sql for pipx/wheel-installed layouts: a top-level module
 # ships alone, so schema.sql does not exist next to it. The repo file stays
 # authoritative — when both exist, the file wins. Keep the two in sync when
@@ -405,7 +409,14 @@ def init_db() -> None:
             # existing meta-version database NEVER falls through unstamped.
             # To add one: _MIGRATIONS[old] = lambda conn: conn.execute(...)
             for step in range(v, SCHEMA_VERSION):
-                fn = _MIGRATIONS.get(step)
+                if step not in _MIGRATIONS:
+                    raise RuntimeError(
+                        f"missing migration {step} -> {step + 1}: this server "
+                        f"declares schema v{SCHEMA_VERSION} but has no migration "
+                        "step for it — refusing to stamp over an unmigrated db "
+                        "(add it to _MIGRATIONS, or None if no shape change)."
+                    )
+                fn = _MIGRATIONS[step]
                 if fn is not None:
                     fn(conn)
             conn.execute(
