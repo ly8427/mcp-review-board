@@ -22,6 +22,13 @@
 # Configure the wake_* functions below for your members, then:
 #   bash configs/host-watch.sh            # one round
 #
+# DEPLOYMENT COPY LIST (win-test finding #9 — copy ALL of these together or
+# the sourced/cated paths break): host-watch.sh, host-watch-lib.sh,
+# host-watch-test.sh, the task-template-*.txt files you use, plus
+# claude-polling-prompt.txt and claude-code.mcp.json (wake_claude reads them
+# from $RB_REPO/configs — if you deploy outside a clone, set RB_REPO to a
+# clone/checkout that has configs/).
+#
 # TASK-TEXT BUDGET (field-proven, thread #24): keep the injected task text
 # SHORT — point at thread ids and let members fetch content themselves via
 # get_thread. A long inline task text (a full review post) pushed a
@@ -68,8 +75,10 @@ wake() {
   local gate; gate=$(cat "$fails" 2>/dev/null || echo 0)
   if [ "${gate:-0}" -ge 3 ]; then echo "$(date +%T) $name: gate tripped (3 consecutive fails), skipping"; return 0; fi
   mkdir "$lock" 2>/dev/null || { echo "$(date +%T) $name: wake in flight, skip"; return 0; }
-  local resp att reason threads rc=0 after prc outcome
-  if ! resp=$(probe_ok "$pauthor"); then
+  local resp att reason threads rc=0 after prc outcome p
+  resp=$(probe_ok "$pauthor"); p=$?
+  [ "$p" = "4" ] && exit 4        # identity mismatch propagates (win-test #11)
+  if [ "$p" != "0" ]; then
     echo "$(date +%T) $name: probe unavailable (neutral — skip round, counters untouched)"
     rmdir "$lock" 2>/dev/null; return 0
   fi
@@ -78,10 +87,19 @@ wake() {
   reason=$(jreason "$resp"); threads=$(jthreads "$resp")
   echo "$(date +%T) $name: attention=1 ($reason, threads=$threads) — waking"
   "$wakefn" "$reason" "$threads" > "$STATE_DIR/$name.last.log" 2>&1 || rc=$?
-  prc=0; after=$(probe_ok "$pauthor") || { sleep 5; after=$(probe_ok "$pauthor") || prc=1; }
+  prc=0; after=$(probe_ok "$pauthor"); p=$?
+  [ "$p" = "4" ] && exit 4
+  if [ "$p" != "0" ]; then
+    sleep 5
+    after=$(probe_ok "$pauthor"); p=$?
+    [ "$p" = "4" ] && exit 4
+    [ "$p" != "0" ] && prc=1
+  fi
   if [ "$prc" = "0" ] && [ "$(jatt "$after")" = "1" ]; then
     sleep "$WAKE_GRACE_SECS"
-    prc=0; after=$(probe_ok "$pauthor") || prc=1
+    after=$(probe_ok "$pauthor"); p=$?
+    [ "$p" = "4" ] && exit 4
+    [ "$p" != "0" ] && prc=1
   fi
   outcome=$(wake_outcome "$rc" "$prc" "$after" "$reason" "$threads")
   case "$outcome" in
@@ -165,15 +183,23 @@ if [ -f "$RB_REPO/configs/host-watch.sh" ]; then
 fi
 # P2-5 (thread #24): adoption self-check — the shipped wake_* examples carry
 # maintainer-local placeholder paths; fail loudly instead of half-working.
-if grep -q "/mnt/c/path/to/" "$WATCH_DIR/host-watch.sh" 2>/dev/null && [ ! -f "$STATE_DIR/configured" ]; then
-  echo "!! this is the unmodified adoption template — the wake_* functions below still"
-  echo "   contain placeholder paths (/mnt/c/path/to/...). Configure them for your"
-  echo "   members (see the EDIT THESE section), set PROBE_AUTHORS, then touch"
-  echo "   $STATE_DIR/configured to silence this check. Refusing to half-run."
+if sed -n '/^wake_claude()/,/^# --- the round/p' "$0" 2>/dev/null | grep -q "/mnt/c/path/to/" \
+   && [ ! -f "$STATE_DIR/configured" ]; then
+  # scope the scan to the wake_* SECTION ONLY (win-test #10: grepping the whole
+  # file matched this very check's literal and rejected everything unconditionally).
+  echo "!! the wake_* functions below still contain placeholder paths (/mnt/c/path/to/...)."
+  echo "   Configure them for your members, set PROBE_AUTHORS, then"
+  echo "   touch $STATE_DIR/configured to silence this check. Refusing to half-run."
   exit 1
 fi
-wake claude    claude    wake_claude
-wake dsh       dsh       wake_dsh
-wake opencode  opencode  wake_opencode
-wake pi        pi        wake_pi
+for w in "claude claude wake_claude" "dsh dsh wake_dsh" "opencode opencode wake_opencode" "pi pi wake_pi"; do
+  set -- $w
+  if declare -F "$3" >/dev/null 2>&1; then
+    wake "$1" "$2" "$3"
+  else
+    # win-test #12: a dangling reference silently passes while everyone is
+    # idle and only explodes on the first attention=1 — warn loudly instead.
+    echo "$(date +%T) warning: $3 is not defined in this deployment — skipping $1."
+  fi
+done
 echo "=== round done ==="

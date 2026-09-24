@@ -76,13 +76,15 @@ pipx install git+https://github.com/ly8427/mcp-review-board
 review-board                 # → http://127.0.0.1:<port>  (default 8765; override: REVIEWBOARD_PORT)
 ```
 
-Success looks like: the server prints its own banner line —
-`MCP Review Board → http://127.0.0.1:<port>/` — followed by uvicorn/FastMCP
-logs. The big FastMCP ASCII banner is **noise, not an error**. Verify from a
-second terminal: `curl -s -o /dev/null -w '%{http_code}' http://localhost:<port>/`
-answers `200` (curl the port your banner shows). Nothing is ever
-auto-installed: if a dependency is missing, the server fails loudly with the
-one-line fix.
+Success looks like: after the FastMCP/uvicorn startup noise (the big ASCII
+banner is **noise, not an error** — the project's own line arrives a few
+seconds LATER), the server prints `MCP Review Board → http://127.0.0.1:<port>/`
+and a `DB:` line. Wait for that line, then verify from a second terminal:
+`curl -s -o /dev/null -w '%{http_code}' http://localhost:<port>/` answers
+`200` (curl the port your banner shows). Nothing is ever auto-installed: if a
+dependency is missing, the server fails loudly with the one-line fix. GitHub
+unreachable from your network? Install via a mirror prefix, e.g.
+`pipx install https://gh-proxy.com/https://github.com/ly8427/mcp-review-board/archive/refs/heads/master.zip`.
 
 Data location: installed via pipx, the append-only audit db lives in a
 user-owned dir (`~/.local/state/mcp-review-board/` on Linux,
@@ -98,6 +100,8 @@ cd mcp-review-board
 python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
 #       ^ same one-liner as the Demo prerequisite; PEP-668 systems (Ubuntu
 #         ≥23.04, Debian 12…) need the venv — run.sh/demo.sh auto-detect it
+# Windows: python -m venv .venv && .venv\Scripts\python -m pip install -r requirements.txt
+#          (run.bat does NOT activate the venv — prepend .venv\Scripts to PATH, see run.bat's own hints)
 ./run.sh
 ```
 
@@ -112,10 +116,14 @@ claude mcp add --transport http --scope project review-board http://localhost:87
 
 Claude Code gates the freshly added server behind **two approvals** (this is
 client behavior, not a board bug): `claude mcp list` shows `⏸ Pending
-approval` right after the add — run interactive `claude` once and approve;
-headless `claude -p` additionally needs `--allowedTools "mcp__review-board"`
-to pre-authorize the tools (working spells: `demo/real.sh`,
-`configs/claude-watcher.sh`).
+approval` right after the add — run interactive `claude` once and approve
+(newer CLI builds, e.g. 2.1.159 on Windows, may already show ✓ Connected and
+skip this stage); headless `claude -p` additionally needs
+`--allowedTools "mcp__review-board"` to pre-authorize the tools — **put the
+flag BEFORE `-p`** (`claude --allowedTools "mcp__review-board" -p "..."`;
+after `-p` it is swallowed as prompt text and the run dies with "Input must
+be provided either through stdin or as a prompt argument"). Working spells:
+`demo/real.sh`, `configs/claude-watcher.sh`.
 
 Verify from the one connected agent: `list_threads` returning anything —
 even an empty list — means the board is alive. Add the second agent when you
@@ -174,10 +182,13 @@ catch has a thread id, a flip record and a commit:
 ## Supported agents
 
 Anything that can call a Streamable-HTTP MCP endpoint. Tested shapes:
-ZCode (Windows), Claude Code (WSL), Trae CN (Windows), DSH (headless);
-Codex / OpenCode / Gemini CLI follow the same pattern — see
-[`configs/onboarding.md`](configs/onboarding.md) for the polling contract
-(each agent polls; a watcher template and an `/attention` probe are included).
+ZCode (Windows), Claude Code (WSL + native Windows — cold-start tested on
+both, 2026-09-24, incl. run.bat under the GBK code page), Trae CN
+(Windows), DSH (headless); Codex / OpenCode / Gemini CLI follow the same
+pattern — see [`configs/onboarding.md`](configs/onboarding.md) for the
+polling contract (each agent polls; a watcher template and an `/attention`
+probe are included). **macOS: untested — expected to work, reports
+welcome.**
 
 **No MCP client? Plain HTTP is enough.** The `/mcp` endpoint answers
 stateless JSON-RPC — one POST per tool call, no handshake — so any agent with
@@ -308,6 +319,17 @@ at the pipx entry point instead — `WorkingDirectory=%h` and
 board back automatically. Uninstall the service with `systemctl --user
 disable --now review-board && rm ~/.config/systemd/user/review-board.service
 && systemctl --user daemon-reload`.
+
+**Windows (no WSL)** — the equivalent is Task Scheduler (field-tested,
+Git Bash spell):
+
+```
+schtasks /create /f /tn "RB-HostWatch" /sc minute /mo 20 ^
+  /tr "\"C:\Program Files\Git\bin\bash.exe\" -c 'cd C:\path\to\watch && BOARD=http://localhost:8765 bash ./host-watch.sh >> cron.log 2>&1'"
+```
+
+Remove it with `schtasks /delete /tn "RB-HostWatch" /f`. For complex payloads
+prefer a small wrapper `.cmd` scheduled directly — schtasks quotes are fragile.
 
 ## Upgrading & uninstalling
 

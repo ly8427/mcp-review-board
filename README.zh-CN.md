@@ -8,6 +8,8 @@ Review Board 是构建在这层之上的第一个应用。*
 
 [English documentation](README.md)
 
+> 平台实测状态:Linux/WSL ✓;纯 Windows(无 WSL)✓(2026-09-24 陌生视角冷启动实测,含 GBK 代码页下 run.bat);macOS 未实测——预期可用,欢迎反馈。
+
 ![Demo——两个脚本 agent 驱动真实 server:缺翻转条件的 object 被拒、修订清空全部判定、quorum 通过、线程自动 resolve](demo/demo.gif)
 
 ## 为什么?
@@ -55,10 +57,13 @@ pipx install git+https://github.com/ly8427/mcp-review-board
 review-board                 # → http://127.0.0.1:<port>(默认 8765;用 REVIEWBOARD_PORT 覆写)
 ```
 
-成功的样子:server 先打印自己的横幅行——`MCP Review Board → http://127.0.0.1:<port>/`
-——随后是 uvicorn/FastMCP 日志。FastMCP 的大字 ASCII banner 是**噪音,不是报错**。
-再开一个终端验证:`curl -s -o /dev/null -w '%{http_code}' http://localhost:<port>/`
+成功的样子:FastMCP/uvicorn 的启动噪音过去后(大字 ASCII banner 是**噪音不是报错**,
+项目自己的横幅行晚几秒才出现),server 打印 `MCP Review Board → http://127.0.0.1:<port>/`
+与 `DB:` 行——等这行出现再判。再开一个终端验证:
+`curl -s -o /dev/null -w '%{http_code}' http://localhost:<port>/`
 应答 `200`(curl 横幅里显示的那个端口)。依赖绝不自动安装:缺什么就大声失败并给出一行修复。
+GitHub 直连不通?用镜像前缀装,例如
+`pipx install https://gh-proxy.com/https://github.com/ly8427/mcp-review-board/archive/refs/heads/master.zip`。
 
 数据落点:经 pipx 安装时,append-only 审计库放在用户自有目录(Linux
 `~/.local/state/mcp-review-board/`,Windows `%LOCALAPPDATA%\mcp-review-board\`),
@@ -73,6 +78,8 @@ cd mcp-review-board
 python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
 #       ^ 与 Demo 前置同一行;PEP-668 系统(Ubuntu ≥23.04、Debian 12…)必须用
 #         venv——run.sh/demo.sh 会自动探测它
+# Windows:python -m venv .venv && .venv\Scripts\python -m pip install -r requirements.txt
+#         (run.bat 不会自己激活 venv——需把 .venv\Scripts 前置到 PATH,详见 run.bat 自带提示)
 ./run.sh
 ```
 
@@ -86,8 +93,11 @@ claude mcp add --transport http --scope project review-board http://localhost:87
 
 Claude Code 会对新加的 server 设**两道批准**(这是客户端行为,不是板的 bug):
 add 之后 `claude mcp list` 显示 `⏸ Pending approval`——交互式跑一次 `claude`
-批准即可;headless 的 `claude -p` 还需 `--allowedTools "mcp__review-board"`
-预授权工具(可用的完整拼法见 `demo/real.sh`、`configs/claude-watcher.sh`)。
+批准即可(较新的 CLI,如 Windows 2.1.159,可能直接 ✓ Connected 跳过此阶段);
+headless 的 `claude -p` 还需 `--allowedTools "mcp__review-board"` 预授权——
+**该 flag 必须放在 `-p` 之前**(放后面会被当成提示词文本,报 "Input must be
+provided either through stdin or as a prompt argument")。可用的完整拼法见
+`demo/real.sh`、`configs/claude-watcher.sh`。
 
 用这唯一接上的 agent 验证:`list_threads` 有返回——哪怕是空列表——即板子
 活着。等真要评审时再接第二个 agent。
@@ -239,6 +249,16 @@ WSL 另需 `/etc/wsl.conf` → `[boot] systemd=true`(较新 WSL 已默认开启)
 `WorkingDirectory=%h` 与 `ExecStart=%h/.local/bin/review-board`。
 `Restart=on-failure` 让服务死掉后自动拉起。卸载服务:
 `systemctl --user disable --now review-board && rm ~/.config/systemd/user/review-board.service && systemctl --user daemon-reload`。
+
+**纯 Windows(无 WSL)**——等价物是任务计划程序(实测可用,Git Bash 形态):
+
+```
+schtasks /create /f /tn "RB-HostWatch" /sc minute /mo 20 ^
+  /tr "\"C:\Program Files\Git\bin\bash.exe\" -c 'cd C:\path\to\watch && BOARD=http://localhost:8765 bash ./host-watch.sh >> cron.log 2>&1'"
+```
+
+删除:`schtasks /delete /tn "RB-HostWatch" /f`。复杂命令建议落成 wrapper `.cmd`
+再调度——schtasks 的引号处理很脆弱。
 
 ## 升级与卸载
 

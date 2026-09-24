@@ -13,8 +13,13 @@ if errorlevel 1 (
 python -c "import fastmcp" 2>nul
 if errorlevel 1 (
   echo fastmcp not found - nothing is auto-installed. Fix, pick one:
-  echo   python -m venv .venv ^&^& .venv\Scripts\python -m pip install -r requirements.txt ^&^& run.bat
-  echo   pipx install git+https://github.com/ly8427/mcp-review-board
+  echo   [A] venv ^+ PATH: python -m venv .venv
+  echo        .venv\Scripts\python -m pip install -r requirements.txt
+  echo        set PATH=%CD%\.venv\Scripts;%PATH%
+  echo        then re-run run.bat ^(it does NOT activate the venv itself^)
+  echo   [B] pipx: pipx install git+https://github.com/ly8427/mcp-review-board
+  echo        then run the board directly with: review-board
+  echo        ^(run.bat is for venv installs only^)
   exit /b 1
 )
 

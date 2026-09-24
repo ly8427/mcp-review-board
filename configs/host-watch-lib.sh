@@ -39,9 +39,12 @@ probe() { curl -sf "$BOARD/attention?author=$1"; }
 #   rc 0 + valid JSON on stdout = a trustworthy response.
 #   rc 1 = NEUTRAL: transport failure or invalid/non-JSON body — zero
 #         information about delivery; callers must neither bill nor gate.
-#   exit 4 = BOARD IDENTITY MISMATCH (hard stop): only when EXPECTED_BOARD_ID
+#   rc 4 = BOARD IDENTITY MISMATCH (hard stop): only when EXPECTED_BOARD_ID
 #         is set AND the response is valid AND carries a board_id that differs.
 #         Probe failures and pre-2.5 servers (no field) NEVER hard-stop.
+#   NOTE: probe_ok RETURNS 4 instead of exiting (win-test finding #11: an
+#   exit inside a $(...) substitution dies in the subshell and the script
+#   ends with 0). Callers MUST propagate: [ "$rc" = 4 ] && exit 4.
 probe_ok() {
   local r bid
   r=$(probe "$1") || return 1
@@ -50,9 +53,9 @@ probe_ok() {
     bid=$(jget board_id "$r")
     if [ -n "$bid" ] && [ "$bid" != "$EXPECTED_BOARD_ID" ]; then
       echo "BOARD IDENTITY MISMATCH: expected $EXPECTED_BOARD_ID, this port serves $bid." >&2
-      echo "Refusing to wake members against a different board instance." >&2
-      echo "Remove or repoint this watcher (configs/uninstall-watch.sh lists entry points)." >&2
-      exit 4
+      echo "Refusing to wake members against a different board instance — remove or" >&2
+      echo "repoint this watcher (configs/uninstall-watch.sh lists entry points)." >&2
+      return 4
     fi
   fi
   printf '%s\n' "$r"
@@ -151,9 +154,11 @@ self_stop_check() {
     echo "note: self-stop disabled — set PROBE_AUTHORS to your member names."
     return 0
   fi
-  local field_seen=0 open_union="" r u t any_open=0
+  local field_seen=0 open_union="" r u t any_open=0 p
   for a in $PROBE_AUTHORS; do
-    r=$(probe_ok "$a") || continue   # identity gate + neutral-on-failure (#27)
+    r=$(probe_ok "$a"); p=$?          # identity gate on EVERY probe (#27)
+    [ "$p" = "4" ] && exit 4          # propagate the hard stop (win-test #11)
+    [ "$p" != "0" ] && continue       # neutral: no information, no gate
     [ "$(jhasfield "$r")" = "1" ] && field_seen=1
     u=$(jopen "$r")
     [ -n "$u" ] && open_union="${open_union:+$open_union,}$u"
