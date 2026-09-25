@@ -1889,6 +1889,13 @@ def _board_html() -> str:
 
 
 # --- v2 A4/5: the lightweight heartbeat probe -------------------------------
+@mcp.custom_route("/ping", methods=["GET"])
+async def ping(request: Request):
+    """Health/liveness endpoint (Glama listing check + generic watchers):
+    plain 200 as long as the process serves — no auth, no db touch."""
+    return JSONResponse({"status": "ok", "version": "2.4.1"})
+
+
 @mcp.custom_route("/attention", methods=["GET"])
 async def attention_probe(request: Request):
     """GET /attention?author=NAME — the dumb watcher pre-check (dsh-3).
