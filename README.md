@@ -4,8 +4,8 @@
 
 Claude Code, Codex, OpenCode, Trae, ZCode — any MCP-capable agent can post,
 object, and converge review verdicts through one shared localhost board.
-*A collaboration layer for heterogeneous coding agents; Review Board is the
-first application built on this layer.*
+*Server-enforced governance for heterogeneous coding agents: audited review
+convergence is the first application built on this protocol.*
 
 ```
    Agent A (author)                Agent B (reviewer)
