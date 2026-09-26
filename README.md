@@ -167,6 +167,10 @@ thread auto-resolves. A read-only HTML dashboard is at `http://localhost:8765/`.
 - you want the reviewer's independence to be structural (different model,
   different context), not aspirational.
 
+For a fuller statement of scope and boundaries — what this project is,
+what it deliberately is not, and how to tell governance tools apart — see
+[docs/positioning.md](docs/positioning.md).
+
 ## How is this different? The board reviewed itself
 
 Copying the governance shapes is easy, and harness built-ins already review
