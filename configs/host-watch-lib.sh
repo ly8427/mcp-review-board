@@ -6,11 +6,19 @@
 #
 # P1-1 semantics (thread #24, GPT review): judge_wake's success signal is
 # DELIVERY ("the member was woken and consumed the board's attention"), NOT
-# task completion. The failure gate is a delivery gate. Known gap
-# (field-proven, #257/#258): a member that polls THEN posts in the same wake
-# re-raises its own attention (its own comment is newer than its cursor) — a
-# fully-compliant round can be billed FAILED; 3 such rounds silently stop the
-# member. A governance-progress gate is specced for the next batch.
+# task completion. The failure gate is a delivery gate.
+#
+# v2 (thread #31 batch A, quorum 4/4 2026-09-27): delivered = attention
+# fingerprint moved OR last_read advanced. Closes the field-proven gap of
+# comment #257/#258 (thread #24): a member that polls THEN posts in the same
+# wake re-raises its own attention (own comment newer than its cursor) and was
+# billed FAILED — 3 such rounds silently blacklisted productive members
+# (2026-09-27: pi, opencode). last_read pre/post come from the /attention
+# response (server returns the effective cutoff; advanced only by
+# list_comments_since(author) — C3, single write point — never by the probe),
+# so a compliant poll-then-post round now shows last_read_post > last_read_pre
+# and bills delivered regardless of executor stdout shape. rc!=0 is ALWAYS
+# failed (crash/hang billing, witness #340 实错2); probe failure stays NEUTRAL.
 #
 # Executor-agnostic (thread #25 batch B): the watcher often runs under Git
 # Bash on Windows, where "python3" is typically the Microsoft Store stub and
@@ -67,12 +75,20 @@ probe_ok() {
 }
 
 # wake_outcome <agent_rc> <post_probe_rc> <post_json> <pre_reason> <pre_threads>
-#   → delivered | failed | unverified (thread #27 must-fix 1):
+#              [last_read_pre] [last_read_post]
+#   → delivered | failed | unverified (thread #27 must-fix 1; v2 thread #31):
 #   probe failure is NEUTRAL — never billed, never touches the gate counter;
-#   only a VALID probe with an unchanged fingerprint is an informative FAILED.
+#   rc!=0 is ALWAYS failed (crash/hang billing, witness #340 实错2);
+#   delivered = fingerprint moved OR last_read advanced (STRICT greater-than;
+#   both values are the /attention effective cutoff — 'YYYY-MM-DD HH:MM:SS'
+#   compares correctly as a string, never raw NULL). Empty last_read args
+#   (pre-2.5 server without the field) degrade to fingerprint-only, so old
+#   kit callers keep working unchanged.
 wake_outcome() {
-  local arc="$1" prc="$2" aj="$3" pr="$4" pt="$5"
+  local arc="$1" prc="$2" aj="$3" pr="$4" pt="$5" plr="${6:-}" qlr="${7:-}"
   if [ "$prc" != "0" ]; then echo unverified; return; fi
+  if [ "$arc" != "0" ]; then echo failed; return; fi
+  if [ -n "$plr" ] && [ -n "$qlr" ] && [[ "$qlr" > "$plr" ]]; then echo delivered; return; fi
   if judge_wake "$arc" "1" "$pr" "$pt" "$(jatt "$aj")" "$(jreason "$aj")" "$(jthreads "$aj")"; then
     echo delivered
   else

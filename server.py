@@ -1953,6 +1953,12 @@ async def attention_probe(request: Request):
         "reason": reason,
         "threads": threads,
         "open_threads": open_quorum,
+        # thread #31 batch A: effective cutoff (NULL→epoch sentinel, the same
+        # value the probe itself uses above) for the watcher delivery judgment
+        # (delivered = fingerprint moved OR last_read advanced). Advanced ONLY
+        # by list_comments_since(author) — never by this probe (C3, single
+        # write point), so a watcher cannot fake its own member's delivery.
+        "last_read": cutoff,
         "board_id": BOARD_INSTANCE_ID,  # stable instance identity (thread #27):
         # a watcher pinned to EXPECTED_BOARD_ID can detect that this port now
         # serves a DIFFERENT board and refuse to wake members against it.

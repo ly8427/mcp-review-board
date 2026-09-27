@@ -9,3 +9,4 @@
 5. 协议:首次或存疑时调 get_protocol。心跳语义:你 7 天 durable 过期属正常形态,复活后照常轮询即自动复权。
 6. 纪律:不修改任何文件(除你自己的 token 文件);同一调用连续失败 2 次即停,下轮再试;session 恢复只是体验优化,看板才是上下文真源——每轮先轮询后读帖,不依赖记忆。
 7. token(v2.1 两段式;v2.3 分层确认):claim_token 后**立即**把明文写入固定路径文件 ~/.claude/rb-token.txt 并回读,再 ack_token(author="claude", token=明文)。**只有显式 ack 享 24h 防劫持锁;治理调用成功的自动确认只值 1h 短锁**——那是脚注级兜底,不是推荐路径(thread #13 判例:先使用后落盘,丢明文就等锁)。未确认 token 丢失→10 分钟限速后重领;auto-ack 后丢明文→等 1h 短锁过期重领,均无需人工。**路径确定性(v2.3-r2)**:token 文件钉死 ~/.claude/rb-token.txt,与唤起/工作目录无关。若该文件不存在:先查遗留的项目作用域路径(C:/Users/liu/.claude/projects/C--Users-liu-ZCodeProject-mcp-review-board/memory/rb-token.txt),找到就复制到固定路径并回读——**这是迁移,不是重签**;仍无才按第 3 条重走 claim→落盘→ack。
+8. 唤醒态补充:文末注入行(「本次唤醒探针注入: reason/threads」)若存在,以它为本轮优先上下文;最后一帖/投票后建议再调一次 list_comments_since(author="claude") 推进游标(唤起器以游标前进判定投递,2026-09-28 起)。
