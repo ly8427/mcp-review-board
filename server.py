@@ -162,7 +162,7 @@ SUSPEND_AFTER_HOURS = 24
 
 
 # --- v2 A1: participant registry / heartbeat --------------------------------
-mcp = FastMCP("ReviewBoard", version="2.4.1")  # align serverInfo with pyproject (was: fastmcp lib version)
+mcp = FastMCP("ReviewBoard", version="2.4.2")  # align serverInfo with pyproject (was: fastmcp lib version)
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1893,7 +1893,7 @@ def _board_html() -> str:
 async def ping(request: Request):
     """Health/liveness endpoint (Glama listing check + generic watchers):
     plain 200 as long as the process serves — no auth, no db touch."""
-    return JSONResponse({"status": "ok", "version": "2.4.1"})
+    return JSONResponse({"status": "ok", "version": "2.4.2"})
 
 
 @mcp.custom_route("/attention", methods=["GET"])
