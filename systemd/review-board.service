@@ -1,8 +1,8 @@
-# systemd user service for the MCP Review Board server (kit-version: 2.4.1).
+# systemd user service for the MCP Review Board server (kit-version: 2.5.0).
 # Works on Linux and WSL (WSL needs /etc/wsl.conf [boot] systemd=true —
 # recent WSL releases ship it enabled).
 # Install:
-#   cp review-board.service ~/.config/systemd/user/
+#   cp review-board.service rb-notify@.service ~/.config/systemd/user/
 #   edit the copy: replace every <REPO_ROOT> with your absolute clone path
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now review-board.service
@@ -18,10 +18,14 @@
 #
 # The server then stays up for the whole session lifetime (survives terminal
 # closes; Restart=on-failure covers crashes).
+# v2.5 (thread #33 P0.5): OnFailure appends one line to ~/rb-failure.log via
+# rb-notify@.service — copy BOTH files, or systemd logs an unknown-unit note
+# on failure (harmless, but the notice line is the point).
 
 [Unit]
 Description=MCP Review Board server (shared review board for ZCode/Claude/Trae)
 After=network.target
+OnFailure=rb-notify@%n.service
 
 [Service]
 WorkingDirectory=<REPO_ROOT>

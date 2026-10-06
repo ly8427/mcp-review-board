@@ -1,0 +1,16 @@
+# rb-notify@.service — one-line failure logger for the review board user
+# unit (v2.5, thread #33 P0.5). Deliberately dependency-free: on failure it
+# appends a single line to ~/rb-failure.log, so a dead board leaves a trace
+# outside journald (where it otherwise only exists).
+# Install together with review-board.service (its [Unit] carries
+# OnFailure=rb-notify@%n.service):
+#   cp review-board.service rb-notify@.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+# Remove: rm the file, daemon-reload, and optionally delete ~/rb-failure.log.
+
+[Unit]
+Description=Log a review-board failure line (%i)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo "$(date -Is) %i failed (OnFailure notice)" >> %h/rb-failure.log'

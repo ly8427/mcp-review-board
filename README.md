@@ -326,6 +326,13 @@ board back automatically. Uninstall the service with `systemctl --user
 disable --now review-board && rm ~/.config/systemd/user/review-board.service
 && systemctl --user daemon-reload`.
 
+**Failure notices (v2.5)** — copy
+[`systemd/rb-notify@.service`](systemd/rb-notify@.service) alongside the
+unit and `daemon-reload`; the unit carries `OnFailure=rb-notify@%n.service`,
+which appends one line to `~/rb-failure.log` each time the board dies, so an
+outage leaves a trace outside journald. The `/attention` probe also exposes
+`uptime_secs` and an `errors` counter for lightweight liveness checks.
+
 **Windows (no WSL)** — the equivalent is Task Scheduler (field-tested,
 Git Bash spell):
 
