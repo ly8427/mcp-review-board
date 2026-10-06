@@ -111,13 +111,13 @@ def replay_thread(t, rule):
                 if h not in fired:
                     fired[h] = cid
                     if first_fire is None:
-                        first_fire = cid
+                        first_fire = (cid, h)
     for m, v2 in verdicts.items():
         if v2 == "object":
             if m in fired:
                 standing_fires += 1
     return {
-        "first_fire": first_fire,
+        "first_fire": first_fire,  # (comment_id, member) or None
         "fires": dict(fired),
         "transient_episodes": transient_episodes,
         "transient_fires": transient_fires,
@@ -161,7 +161,8 @@ def main() -> int:
     stats = {tid: replay_thread(t, rule) for tid, t in threads.items() if t["quorum"]}
     for tid, s in sorted(stats.items()):
         if s["fires"] or s["transient_episodes"]:
-            print(f"  thread {tid}: first_fire={s['first_fire']} fires={s['fires']} "
+            ff = f"{s['first_fire'][0]}({s['first_fire'][1]})" if s["first_fire"] else "None"
+            print(f"  thread {tid}: first_fire={ff} fires={s['fires']} "
                   f"transient_eps={s['transient_episodes']} "
                   f"transient_fires={s['transient_fires']} standing_fires={s['standing_fires']}")
 
@@ -172,12 +173,13 @@ def main() -> int:
 
     # --- acceptance 1: thread #30 fires exactly at #324, nothing earlier ---
     s30 = stats[30]
-    check("acceptance: thread #30 first trigger == comment 324", s30["first_fire"] == 324)
+    check("acceptance: thread #30 first trigger == comment 324",
+          s30["first_fire"] is not None and s30["first_fire"][0] == 324)
 
     # --- acceptance 2: noise budget outside the documented incident (#30 m6) ---
-    # m6 is the pseudonym of the incident holder; identify it as the member the
-    # #30 fire is attributed to, then exclude that one episode from noise.
-    incident_member = next(iter(s30["fires"]))
+    # The incident episode (thread #30's late flip) is the expected true
+    # positive; exclude exactly that one episode from the noise count.
+    incident_member = s30["first_fire"][1]
     noise_fires = sum(s["transient_fires"] for tid, s in stats.items() if tid != 30)
     noise_fires += s30["transient_fires"] - 1  # minus the incident episode itself
     transient_total = sum(s["transient_episodes"] for s in stats.values())

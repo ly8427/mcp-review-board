@@ -473,6 +473,51 @@ def _author_usage(conn: sqlite3.Connection, thread_id: int, author: str) -> int:
     return n + v
 
 
+# --- v2.5 (thread #33): verdict-staleness detection --------------------------
+# PINNED RULE (replay-reproducible, see test_replay_stale.py; pi #362 demanded
+# the timing definition be written down): a quorum member is STALE iff their
+# CURRENT standing verdict is 'object' AND >= STALE_MIN_FOLLOWUP of their OWN
+# comments landed strictly after the object landed (verdicts.updated_at of the
+# standing row; a re-verdict resets the window by moving it). OWN posts, not
+# others': others' posts already wake the holder via new_comments — the #30
+# blind spot was precisely the holder talking (text-pass) while the vote
+# stayed object. This rule fires first at #324 on the #30 replay.
+STALE_MIN_FOLLOWUP = 2
+
+
+def _stale_holders_pure(quorum, verdicts, verdict_updated, own_comments):
+    """Decision core shared by every read face (single implementation, dsh
+    #351) and by the replay tests — the faces and the tests cannot drift.
+    verdicts: {member: verdict}; verdict_updated: {member: landing ts of the
+    member's CURRENT standing verdict}; own_comments: {member: [ts, ...]}."""
+    holders = []
+    for m in quorum:
+        if verdicts.get(m) == "object":
+            landed = verdict_updated.get(m, "9999")
+            if sum(1 for ts in own_comments.get(m, []) if ts > landed) >= STALE_MIN_FOLLOWUP:
+                holders.append(m)
+    return holders
+
+
+def _stale_object_holders(conn: sqlite3.Connection, thread_id: int) -> list[str]:
+    t = conn.execute("SELECT quorum FROM threads WHERE id=?", (thread_id,)).fetchone()
+    if t is None or not t["quorum"]:
+        return []
+    names = json.loads(t["quorum"])
+    verdicts, updated, own = {}, {}, {}
+    for r in conn.execute(
+        "SELECT author, verdict, updated_at FROM verdicts WHERE thread_id=?",
+        (thread_id,),
+    ).fetchall():
+        verdicts[r["author"]] = r["verdict"]
+        updated[r["author"]] = r["updated_at"]
+    for r in conn.execute(
+        "SELECT author, created_at FROM comments WHERE thread_id=?", (thread_id,)
+    ).fetchall():
+        own.setdefault(r["author"], []).append(r["created_at"])
+    return _stale_holders_pure(names, verdicts, updated, own)
+
+
 # --- v2 A5 (3a)+v2.1: two-tier identity / tokens (two-phase lifecycle) -------
 REISSUE_AFTER_HOURS = 24        # EXPLICIT-acked tokens (durable possession)
 AUTO_ACK_REISSUE_HOURS = float(os.environ.get("REVIEWBOARD_AUTO_ACK_REISSUE_HOURS", "1"))
@@ -754,6 +799,23 @@ def create_thread(
     )
 
 
+def _stale_receipt_note(conn: sqlite3.Connection, thread_id: int) -> str:
+    """post/reply receipt addendum (thread #33 form c — free byproduct of the
+    same computation): surface a standing stale object at the source, to the
+    poster, in the same transaction as their comment."""
+    open_q = conn.execute(
+        "SELECT 1 FROM threads WHERE id=? AND status='open' AND quorum IS NOT NULL",
+        (thread_id,),
+    ).fetchone()
+    if not open_q:
+        return ""
+    holders = _stale_object_holders(conn, thread_id)
+    if not holders:
+        return ""
+    return (f" ⚠ verdict_stale: {holders} keep posting over a standing object —"
+            f" the thread cannot converge until they re-vote (set_verdict).")
+
+
 @mcp.tool
 def post_comment(
     thread_id: int,
@@ -813,11 +875,12 @@ def post_comment(
             (thread_id, author, body, file, line, severity),
         )
         cid = cur.lastrowid
+        stale_note = _stale_receipt_note(conn, thread_id)
     loc = ""
     if file:
         loc = f" at {file}" + (f":{line}" if line else "")
     sev = f" [{severity}]" if severity else ""
-    return f"Posted comment #{cid} in thread #{thread_id} by {author}{sev}{loc}."
+    return f"Posted comment #{cid} in thread #{thread_id} by {author}{sev}{loc}.{stale_note}"
 
 
 @mcp.tool
@@ -870,7 +933,8 @@ def reply_comment(comment_id: int, author: str, body: str) -> str:
             (row["thread_id"], comment_id, author, body),
         )
         cid = cur.lastrowid
-    return f"Posted reply #{cid} to comment #{comment_id} by {author}."
+        stale_note = _stale_receipt_note(conn, row["thread_id"])
+    return f"Posted reply #{cid} to comment #{comment_id} by {author}.{stale_note}"
 
 
 @mcp.tool
@@ -890,22 +954,33 @@ def list_threads(status: str | None = None) -> str:
     with db() as conn:
         if status == "all":
             rows = conn.execute(
-                """SELECT t.id, t.title, t.status, t.created_at,
+                """SELECT t.id, t.title, t.status, t.created_at, t.quorum,
                           (SELECT COUNT(*) FROM comments c WHERE c.thread_id = t.id) AS n
                    FROM threads t ORDER BY t.id DESC"""
             ).fetchall()
         else:
             rows = conn.execute(
-                """SELECT t.id, t.title, t.status, t.created_at,
+                """SELECT t.id, t.title, t.status, t.created_at, t.quorum,
                           (SELECT COUNT(*) FROM comments c WHERE c.thread_id = t.id) AS n
                    FROM threads t WHERE t.status=? ORDER BY t.id DESC""",
                 (status,),
             ).fetchall()
+        # thread #33 thread-level read face (dsh #351): the marker must be
+        # visible to readers NOT in the quorum (the host included) — an
+        # author-scoped signal alone would inherit #30's "nobody is woken
+        # to look at it" property.
+        stale_by_id: dict[int, list[str]] = {}
+        for r in rows:
+            if r["status"] == "open" and r["quorum"]:
+                holders = _stale_object_holders(conn, r["id"])
+                if holders:
+                    stale_by_id[r["id"]] = holders
     if not rows:
         return f"No threads with status '{status}'."
     lines = ["Threads:"]
     for r in rows:
-        lines.append(f"  #{r['id']} [{r['status']}] {r['title']}  ({r['n']} comments, {r['created_at']})")
+        flag = f"  ⚠ stale-object:{stale_by_id[r['id']]}" if r["id"] in stale_by_id else ""
+        lines.append(f"  #{r['id']} [{r['status']}] {r['title']}  ({r['n']} comments, {r['created_at']}){flag}")
     return "\n".join(lines)
 
 
@@ -932,6 +1007,11 @@ def get_thread(thread_id: int) -> str:
             "SELECT author, COUNT(*) AS c FROM comments WHERE thread_id=? GROUP BY author",
             (thread_id,),
         ).fetchall()
+        stale = (
+            _stale_object_holders(conn, thread_id)
+            if t["quorum"] and t["status"] == "open"
+            else []
+        )
     out = [
         f"Thread #{t['id']}: {t['title']}  [{t['status']}]",
         f"  created: {t['created_at']}   comments: {len(all_comments)}/{THREAD_CAP}",
@@ -942,7 +1022,8 @@ def get_thread(thread_id: int) -> str:
         except (ValueError, TypeError):
             names = []
         usage = " · ".join(f"{r['author']} {r['c']}/{t['per_author_budget']}" for r in usage_rows)
-        out.append(f"  quorum: {names}   revision: {t['revision']}   budget: {usage or '—'}")
+        stale_flag = f"   ⚠ stale-object: {stale}" if stale else ""
+        out.append(f"  quorum: {names}   revision: {t['revision']}   budget: {usage or '—'}{stale_flag}")
 
     by_parent: dict[int | None, list[sqlite3.Row]] = {}
     for c in all_comments:
@@ -1934,6 +2015,13 @@ async def attention_probe(request: Request):
                 (tid, author),
             ).fetchone() is None
         ]
+        # v2.5 (thread #33): the holder's OWN continued posting over a standing
+        # object wakes them to reconsider — priority BELOW awaiting_verdict
+        # (an uncast vote outranks a stale one), ABOVE mentions/new_comments.
+        stale_self = [
+            tid for tid in open_quorum
+            if author in _stale_object_holders(conn, tid)
+        ]
         marker = f"@{author}"
         undelivered = conn.execute(
             "SELECT thread_id, id, body FROM comments WHERE created_at > ? ORDER BY id",
@@ -1942,6 +2030,8 @@ async def attention_probe(request: Request):
         mention_threads = sorted({r["thread_id"] for r in undelivered if marker in (r["body"] or "")})
     if awaiting:
         reason, threads = "awaiting_verdict", awaiting
+    elif stale_self:
+        reason, threads = "verdict_stale", stale_self
     elif mention_threads:
         reason, threads = "mentioned", mention_threads
     elif undelivered:
