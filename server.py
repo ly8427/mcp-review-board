@@ -1003,10 +1003,25 @@ def get_thread(thread_id: int) -> str:
             """SELECT * FROM comments WHERE thread_id=? ORDER BY created_at ASC""",
             (thread_id,),
         ).fetchall()
-        usage_rows = conn.execute(
-            "SELECT author, COUNT(*) AS c FROM comments WHERE thread_id=? GROUP BY author",
-            (thread_id,),
-        ).fetchall()
+        # v2.5 (thread #33 ④-1, dsh): _author_usage is the ONLY usage
+        # computation (comments + costed flips) — no second GROUP BY face.
+        # The old comments-only display diverged from the real quota exactly
+        # when budget pressure mattered most. Falsifiable (dsh): the header
+        # must equal _author_usage for every author.
+        authors = {
+            r["author"] for r in conn.execute(
+                "SELECT DISTINCT author FROM comments WHERE thread_id=?", (thread_id,)
+            ).fetchall()
+        } | {
+            r["author"] for r in conn.execute(
+                "SELECT DISTINCT author FROM verdict_events"
+                " WHERE thread_id=? AND action='verdict' AND costed=1", (thread_id,)
+            ).fetchall()
+        }
+        usage = " · ".join(
+            f"{a} {_author_usage(conn, thread_id, a)}/{t['per_author_budget']}"
+            for a in sorted(authors)
+        )
         stale = (
             _stale_object_holders(conn, thread_id)
             if t["quorum"] and t["status"] == "open"
@@ -1021,7 +1036,6 @@ def get_thread(thread_id: int) -> str:
             names = json.loads(t["quorum"])
         except (ValueError, TypeError):
             names = []
-        usage = " · ".join(f"{r['author']} {r['c']}/{t['per_author_budget']}" for r in usage_rows)
         stale_flag = f"   ⚠ stale-object: {stale}" if stale else ""
         out.append(f"  quorum: {names}   revision: {t['revision']}   budget: {usage or '—'}{stale_flag}")
 
@@ -1151,8 +1165,11 @@ def set_verdict(
     Rules (DESIGN-V2 A5 + thread #8 conditions):
     - Only quorum members may vote here; others are rejected outright.
     - 'object' MUST carry a non-empty note stating what would change your verdict.
-    - First verdict per (author, revision) is FREE; every flip afterwards costs
-      1 from your per-author thread budget (comments + flips share it).
+    - First verdict per (author, revision) is FREE; object→pass flips toward
+      convergence are FREE too (v2.5, thread #33: the old hard gate locked a
+      budget-exhausted member out of exactly the action that fixes a stale
+      object); other flips cost 1 from your per-author thread budget
+      (comments + flips share it).
     - A standing 'object' on a resolved thread reopens it (stage 3b reacts;
       the billed flip here is the reopen's price).
 
@@ -1191,12 +1208,22 @@ def set_verdict(
             " AND revision=? AND action IN ('verdict','verdict_free') LIMIT 1",
             (thread_id, author, revision),
         ).fetchone() is None
-        costed = 0 if first_for_revision else 1
+        # v2.5 (thread #33 ④-3): object→pass flips toward convergence are FREE
+        # and never budget-gated — #30's fix action was a late flip, and the
+        # verdict_stale detector above would otherwise wake a member the gate
+        # then rejects (signal loop that cannot close).
+        convergence_flip = (
+            cur_row is not None and cur_row["verdict"] == "object" and verdict == "pass"
+        )
+        costed = 0 if (first_for_revision or convergence_flip) else 1
         if costed and _author_usage(conn, thread_id, author) >= t["per_author_budget"]:
             return (
                 f"ERROR: {author} reached the per-author budget "
-                f"({t['per_author_budget']}) in thread #{thread_id} — flips are billed. "
-                "Conclude via set_status (wontfix escalates to the human)."
+                f"({t['per_author_budget']}) in thread #{thread_id}. "
+                "An object→pass flip toward convergence is free and still allowed; "
+                "otherwise ask the creator to bump_revision (clears all verdicts, "
+                "re-votes are free) or escalate to the human (wontfix requires "
+                "human_override)."
             )
         conn.execute(
             "INSERT INTO verdicts(thread_id, author, verdict, note, updated_at)"
@@ -1209,9 +1236,9 @@ def set_verdict(
                thread_id=thread_id, from_v=from_v, to_v=verdict,
                revision=revision, costed=costed, note=note)
         recompute_thread(conn, thread_id)  # 3b state machine (no-op-safe)
+        tail = " (free)" if (first_for_revision or convergence_flip) else " (billed 1)"
         return (
-            f"Verdict recorded: {author} → {verdict}"
-            f"{'' if first_for_revision else ' (billed 1)'} on thread #{thread_id}"
+            f"Verdict recorded: {author} → {verdict}{tail} on thread #{thread_id}"
             f" rev {revision}."
         )
 
@@ -1221,8 +1248,10 @@ def bump_revision(thread_id: int, author: str, token: str | None = None) -> str:
     """Creator-only: bump the thread's revision, clearing ALL verdicts (G2).
 
     Use after revising the artifact under review — stale passes must not
-    auto-resolve a new revision. Costs 1 budget. Every quorum member must
-    re-vote (their first verdict on the new revision is free).
+    auto-resolve a new revision. Every quorum member must re-vote (their
+    first verdict on the new revision is free). v2.5 (thread #33 ④, pi):
+    budget-exempt — bump is the ONLY primitive that clears stale verdicts,
+    so the budget gate must never lock the creator out of it.
 
     Args:
         thread_id: the thread.
@@ -1239,14 +1268,12 @@ def bump_revision(thread_id: int, author: str, token: str | None = None) -> str:
             return f"ERROR: bump_revision is creator-only (creator: {t['author']!r})"
         if not _token_ok(conn, author, token):
             return "ERROR: missing/invalid governance token — claim_token first"
-        if _author_usage(conn, thread_id, author) >= t["per_author_budget"]:
-            return f"ERROR: {author} reached the per-author budget in thread #{thread_id}."
         new_rev = (t["revision"] or 1) + 1
         conn.execute("UPDATE threads SET revision=? WHERE id=?", (new_rev, thread_id))
         conn.execute("DELETE FROM verdicts WHERE thread_id=?", (thread_id,))
         _audit(conn, author, "bump_revision", thread_id=thread_id,
-               revision=new_rev, costed=1,
-               note="all verdicts cleared; re-vote required")
+               revision=new_rev, costed=0,
+               note="all verdicts cleared; re-vote required; budget-exempt (v2.5)")
         recompute_thread(conn, thread_id)
         return (
             f"Revision bumped to {new_rev} on thread #{thread_id}; all verdicts "
@@ -2022,6 +2049,16 @@ async def attention_probe(request: Request):
             tid for tid in open_quorum
             if author in _stale_object_holders(conn, tid)
         ]
+        # v2.5 (thread #33 ④-1): the real quota face — members were billed
+        # blind; the only visible number was comments-only (wrong face).
+        budget_face = {}
+        for tid in open_quorum:
+            cap = conn.execute(
+                "SELECT per_author_budget FROM threads WHERE id=?", (tid,)
+            ).fetchone()["per_author_budget"]
+            budget_face[str(tid)] = {
+                "used": _author_usage(conn, tid, author), "cap": cap,
+            }
         marker = f"@{author}"
         undelivered = conn.execute(
             "SELECT thread_id, id, body FROM comments WHERE created_at > ? ORDER BY id",
@@ -2043,6 +2080,7 @@ async def attention_probe(request: Request):
         "reason": reason,
         "threads": threads,
         "open_threads": open_quorum,
+        "budget": budget_face,
         # thread #31 batch A: effective cutoff (NULL→epoch sentinel, the same
         # value the probe itself uses above) for the watcher delivery judgment
         # (delivered = fingerprint moved OR last_read advanced). Advanced ONLY

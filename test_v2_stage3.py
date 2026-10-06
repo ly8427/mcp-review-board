@@ -152,10 +152,11 @@ def main():
         assert status(tid) == "open", "returning objector's verdict re-stands (C')"
         assert "auto_reopen" in json.dumps(out) or True  # audit lives in events
 
-        # billed flip + budget: c flips to pass (billed 1)
+        # v2.5 (thread #33): object→pass is a FREE convergence flip — the old
+        # "billed" expectation here was exactly the lock that stranded #30
         out = tool("set_verdict", {"thread_id": tid, "verdict": "pass",
                                    "author": "c", "token": tok["c"]})
-        assert "billed" in out, f"flip must bill: {out}"
+        assert "(free)" in out, f"convergence flip must be free: {out}"
         assert status(tid) == "resolved", "all pass -> auto-resolve again"
 
         # AUTO-REOPEN via new object (billed) on resolved
