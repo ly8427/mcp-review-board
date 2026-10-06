@@ -164,7 +164,7 @@ SUSPEND_AFTER_HOURS = 24
 
 
 # --- v2 A1: participant registry / heartbeat --------------------------------
-mcp = FastMCP("ReviewBoard", version="2.4.2")  # align serverInfo with pyproject (was: fastmcp lib version)
+mcp = FastMCP("ReviewBoard", version="2.5.0")  # align serverInfo with pyproject (was: fastmcp lib version)
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -217,7 +217,7 @@ def _is_active(last_seen: str | None, now: datetime | None = None) -> bool:
 
 
 # --- v2 A2: the protocol ----------------------------------------------------
-PROTOCOL_VERSION = "2.4"
+PROTOCOL_VERSION = "2.5"
 PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 
 ## 成员
@@ -237,7 +237,7 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 
 ## 讨论帖
 - review 帖建议传 quorum 并在 context 写明对象/目的;发言表态后须落判定。
-- 预算默认 20/人/线程(发帖+回复+计费翻转共享);线程总上限 {THREAD_CAP} 条。
+- 预算默认 20/人/线程(发帖+回复+计费翻转共享;**朝收敛的 object→pass 翻转免费且不受闸**——v2.5:计费硬闸曾把预算耗尽的成员锁死在无法认错的位置);线程总上限 {THREAD_CAP} 条。
 - 建帖每日上限(按 author)不含 quorum 评审帖(v2.3 豁免:评审义务不应被发帖配额阻塞;
   free 帖维持原上限)。
 - resolved 帖不触发回应义务;非 quorum 发言 = advisory(可说服、不可计票)。
@@ -2022,7 +2022,7 @@ def _board_html() -> str:
 async def ping(request: Request):
     """Health/liveness endpoint (Glama listing check + generic watchers):
     plain 200 as long as the process serves — no auth, no db touch."""
-    return JSONResponse({"status": "ok", "version": "2.4.2"})
+    return JSONResponse({"status": "ok", "version": "2.5.0"})
 
 
 _STARTED_AT = time.time()  # v2.5 observability: /attention uptime face
