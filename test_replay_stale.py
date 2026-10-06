@@ -23,13 +23,16 @@ Acceptance:
      true positive), at most 1/3 may fire. Episode = object landing -> flip
      (transient) or thread end (standing).
 
-Phase-0 mode: until server._stale_holders_pure exists, this suite runs the
-fixture sanity checks + prints analysis from a reference copy of the rule and
-SKIPS the acceptance assertions (fixtures-first discipline).
+Phase-0 mode (REPLAY_PHASE0=1, opt-in only): runs the fixture sanity checks +
+prints analysis from a reference copy of the rule and SKIPS the acceptance
+assertions. Without the switch, an unavailable server rule (import failure OR
+a renamed/missing _stale_holders_pure) is a HARD FAIL — a silent SKIP+exit 0
+here would gut this gate exactly when the rule drifted (#34 #365/#366/#367).
 """
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -148,14 +151,24 @@ def main() -> int:
     check("fixture: no CJK leakage (pseudonymized/structure-only)", not cjk)
 
     # --- pick the rule implementation ---
-    sys.path.insert(0, str(REPO))
-    try:
-        import server  # noqa: E402
-        rule = server._stale_holders_pure
-        src = "server._stale_holders_pure"
-    except (ImportError, AttributeError):
-        rule = ref_stale_holders
-        src = "reference copy (Phase 0)"
+    # Rule unavailability is a HARD FAIL, never a skip: the acceptance gate
+    # must fail loud when the rule drifted (renamed/moved) or deps are missing
+    # (#34 #365/#366/#367 — the old silent SKIP+exit 0 made "tests cannot
+    # drift" false exactly when it mattered). Reference mode survives ONLY
+    # behind the explicit REPLAY_PHASE0 switch.
+    if os.environ.get("REPLAY_PHASE0"):
+        rule, src = ref_stale_holders, "reference copy (Phase 0, REPLAY_PHASE0 opt-in)"
+    else:
+        sys.path.insert(0, str(REPO))
+        try:
+            import server  # noqa: E402
+            rule = server._stale_holders_pure
+            src = "server._stale_holders_pure"
+        except (ImportError, AttributeError) as e:
+            print(f"FAIL rule unavailable: {type(e).__name__}: {e} — "
+                  "acceptance must fail loud, not skip (REPLAY_PHASE0=1 for "
+                  "the informational Phase-0 mode)")
+            return 1
 
     # --- analysis over all threads ---
     stats = {tid: replay_thread(t, rule) for tid, t in threads.items() if t["quorum"]}
@@ -167,8 +180,8 @@ def main() -> int:
                   f"transient_fires={s['transient_fires']} standing_fires={s['standing_fires']}")
 
     if src.startswith("reference"):
-        print("SKIP acceptance (Phase 0: server._stale_holders_pure not implemented yet "
-              f"— rule used: {src}; analysis above is informational)")
+        print("SKIP acceptance (Phase 0 opt-in via REPLAY_PHASE0 — rule used: "
+              f"{src}; analysis above is informational)")
         return 0
 
     # --- acceptance 1: thread #30 fires exactly at #324, nothing earlier ---
