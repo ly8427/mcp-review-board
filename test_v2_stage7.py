@@ -188,7 +188,45 @@ def main():
         out = tool("bump_revision", {"thread_id": tid2, "author": "h", "token": tok["h"]})
         assert "Revision bumped to 2" in out, out
 
-        print("stage7 part1 (verdict_stale) + part2 (budget/convergence/bump): OK")
+        # ---- part 3 (Phase 1c): own-comment exclusion + mention boundary +
+        # observability fields
+        tool("list_comments_since", {"since": "now", "author": "e"})
+        out = tool("create_thread", {"title": "wake", "author": "h",
+                                     "quorum": ["e"], "per_author_budget": 6})
+        tid4 = int(out.split("#")[1].split(":")[0])
+        # my_verdicts face BEFORE voting: verdict None (distinguishable later)
+        p = probe("e")
+        assert p["my_verdicts"] == {str(tid4): {"verdict": None, "revision": 1}}, p
+        assert isinstance(p["uptime_secs"], int) and p["uptime_secs"] >= 0
+        assert p["errors"] == 0, p
+        # vote first so awaiting does not mask the wake-exclusion check below
+        tok["e"] = tool("claim_token", {"author": "e"}).split("\n")[1].strip()
+        tool("set_verdict", {"thread_id": tid4, "verdict": "object",
+                             "author": "e", "note": "w", "token": tok["e"]})
+        time.sleep(1.1)  # keep the verdict second apart (staleness rule is strict >)
+        # own comment after the cursor snapshot must NOT re-raise attention
+        # (>=1s apart so the only exclusion factor is authorship, not ties)
+        tool("post_comment", {"thread_id": tid4, "author": "e", "body": "mine only"})
+        p = probe("e")
+        assert p["attention"] == 0 and p["reason"] == "idle", \
+            f"own comment must not re-raise the member: {p}"
+        # others' comments in the same window still wake them
+        tool("post_comment", {"thread_id": tid4, "author": "h",
+                              "body": "no valid handle here: @emIL @e2"})
+        p = probe("e")
+        assert p["attention"] == 1 and p["reason"] == "new_comments", p
+        # mention boundary in the poll header: only a real @e counts
+        out = tool("post_comment", {"thread_id": tid4, "author": "h",
+                                    "body": "cc @e; not @e2 not @eee"})
+        cid_m = int(out.split("#")[1].split(" ")[0])
+        out = tool("list_comments_since", {"since": "now", "author": "e"})
+        mentions = json.loads(out.splitlines()[0].split("needs_attention: ", 1)[1])["mentions_me"]
+        assert mentions == [{"thread_id": tid4, "comment_id": cid_m}], mentions
+        p = probe("e")
+        assert p["my_verdicts"][str(tid4)] == {"verdict": "object", "revision": 1}, p
+
+        print("stage7 part1 (verdict_stale) + part2 (budget/convergence/bump)"
+              " + part3 (wake-exclusion/boundary/observability): OK")
     finally:
         proc.send_signal(signal.SIGTERM)
         proc.wait(timeout=10)

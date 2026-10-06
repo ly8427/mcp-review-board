@@ -20,8 +20,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -516,6 +518,23 @@ def _stale_object_holders(conn: sqlite3.Connection, thread_id: int) -> list[str]
     ).fetchall():
         own.setdefault(r["author"], []).append(r["created_at"])
     return _stale_holders_pure(names, verdicts, updated, own)
+
+
+# v2.5 (thread #33 B-1): the ONE @handle test — word-boundary match, so
+# "@ping" no longer hits member "pi". Shared by the MCP poll header and the
+# /attention probe; per-callsite substring tests were how the bug stayed
+# latent (dsh #351: one semantic, one implementation).
+_MENTION_RE: dict[str, "re.Pattern[str]"] = {}
+
+
+def _mentioned(body: str | None, author: str) -> bool:
+    if not body:
+        return False
+    pat = _MENTION_RE.get(author)
+    if pat is None:
+        pat = re.compile(rf"(?<![A-Za-z0-9_\-])@{re.escape(author)}(?![A-Za-z0-9_\-])")
+        _MENTION_RE[author] = pat
+    return pat.search(body) is not None
 
 
 # --- v2 A5 (3a)+v2.1: two-tier identity / tokens (two-phase lifecycle) -------
@@ -1451,8 +1470,11 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
     {new_comments, mentions_me[{thread_id,comment_id}], awaiting_my_verdict,
     open_threads} — idle polls can act on the header alone without reading
     threads (cost model §4). awaiting_my_verdict is a REAL list when `author`
-    is passed (open ∧ non-wontfix ∧ quorum ∧ no verdict yet on the current
-    revision ∧ active); the "not_implemented" sentinel appears ONLY when
+    is passed (open ∧ non-wontfix ∧ quorum ∧ no verdict row at all ∧ active —
+    bump_revision clears every row in the same transaction, so "no row" is
+    revision-equivalent by construction, pi #362 pinned this; /attention's
+    my_verdicts field disambiguates "bumped, re-vote" from "never voted");
+    the "not_implemented" sentinel appears ONLY when
     author is omitted (dsh #89 minor-5: the old text claimed the field was
     unimplemented — members following it would ignore their top-priority
     signal).
@@ -1491,11 +1513,10 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
             )
     mentions = []
     if author:
-        marker = f"@{author}"
         mentions = [
             {"thread_id": r["thread_id"], "comment_id": r["id"]}
             for r in rows
-            if marker in (r["body"] or "")
+            if _mentioned(r["body"], author)
         ]
     awaiting: list | str
     with _connect() as conn:
@@ -2004,6 +2025,10 @@ async def ping(request: Request):
     return JSONResponse({"status": "ok", "version": "2.4.2"})
 
 
+_STARTED_AT = time.time()  # v2.5 observability: /attention uptime face
+_PROBE_ERRORS = 0          # probe-path exception counter (best-effort; no heavy monitoring)
+
+
 @mcp.custom_route("/attention", methods=["GET"])
 async def attention_probe(request: Request):
     """GET /attention?author=NAME — the dumb watcher pre-check (dsh-3).
@@ -2013,84 +2038,116 @@ async def attention_probe(request: Request):
     MCP polls (touch + C' unfreeze recompute, single SQLite write txn, idempotent).
     C3: NEVER advances last_read — the signal stays level-triggered (attention
     stays 1 across wake failures until list_comments_since actually delivers).
-    Returns {"attention": 0|1, "reason": ..., "threads": [...], "open_threads":
-    [...]} — open_threads lists the author's open quorum thread ids (batch 1,
-    thread #22 #5: lets a bound watcher notice "my thread resolved" and stop
-    by itself, no push needed).
+
+    v2.5 (thread #33) response and semantics:
+    - "reason": "verdict_stale" — the prober's standing object has >=2 of
+      their OWN newer comments (priority: awaiting > stale > mention > new).
+    - "budget": {tid: {used, cap}} — the REAL quota face (comments + costed
+      flips), the same _author_usage the gates use.
+    - "my_verdicts": {tid: {verdict, revision}} — lets a member tell
+      "bumped, re-vote" from "never voted" (awaiting alone cannot).
+    - "uptime_secs" / "errors" — liveness faces for the watcher kit.
+    - The prober's OWN comments are excluded from the undelivered scan
+      (B-2, relocated server-side — the watcher payload never carried
+      comment authors, so watcher-side filtering was impossible): a
+      member's own post must not re-raise their attention; others'
+      comments still wake them. list_comments_since (the read face) still
+      returns own comments untouched, and last_read semantics are
+      unchanged (C3 single write point).
     """
     author = request.query_params.get("author")
     if not author:
         return JSONResponse({"error": "author query param required"}, status_code=400)
-    with db() as conn:
-        heartbeat_and_recompute(conn, author)
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT last_read FROM participants WHERE author=?", (author,)
-        ).fetchone()
-        cutoff = (row["last_read"] if row and row["last_read"] else "1970-01-01 00:00:00")
-        open_quorum = [
-            r["id"]
-            for r in conn.execute(
-                "SELECT id, quorum FROM threads WHERE status='open' AND quorum IS NOT NULL"
+    global _PROBE_ERRORS
+    try:
+        with db() as conn:
+            heartbeat_and_recompute(conn, author)
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT last_read FROM participants WHERE author=?", (author,)
+            ).fetchone()
+            cutoff = (row["last_read"] if row and row["last_read"] else "1970-01-01 00:00:00")
+            open_quorum = [
+                r["id"]
+                for r in conn.execute(
+                    "SELECT id, quorum FROM threads WHERE status='open' AND quorum IS NOT NULL"
+                ).fetchall()
+                if author in json.loads(r["quorum"])
+            ]
+            awaiting = [
+                tid for tid in open_quorum
+                if conn.execute(
+                    "SELECT 1 FROM verdicts WHERE thread_id=? AND author=? LIMIT 1",
+                    (tid, author),
+                ).fetchone() is None
+            ]
+            # v2.5 (thread #33): the holder's OWN continued posting over a standing
+            # object wakes them to reconsider — priority BELOW awaiting_verdict
+            # (an uncast vote outranks a stale one), ABOVE mentions/new_comments.
+            stale_self = [
+                tid for tid in open_quorum
+                if author in _stale_object_holders(conn, tid)
+            ]
+            # v2.5 (thread #33 ④-1): the real quota face — members were billed
+            # blind; the only visible number was comments-only (wrong face).
+            budget_face = {}
+            my_state = {}
+            for tid in open_quorum:
+                trow = conn.execute(
+                    "SELECT per_author_budget, revision FROM threads WHERE id=?", (tid,)
+                ).fetchone()
+                v = conn.execute(
+                    "SELECT verdict FROM verdicts WHERE thread_id=? AND author=?",
+                    (tid, author),
+                ).fetchone()
+                budget_face[str(tid)] = {
+                    "used": _author_usage(conn, tid, author),
+                    "cap": trow["per_author_budget"],
+                }
+                my_state[str(tid)] = {
+                    "verdict": v["verdict"] if v else None,
+                    "revision": trow["revision"],
+                }
+            undelivered = conn.execute(
+                "SELECT thread_id, id, body FROM comments"
+                " WHERE created_at > ? AND author != ? ORDER BY id",
+                (cutoff, author),
             ).fetchall()
-            if author in json.loads(r["quorum"])
-        ]
-        awaiting = [
-            tid for tid in open_quorum
-            if conn.execute(
-                "SELECT 1 FROM verdicts WHERE thread_id=? AND author=? LIMIT 1",
-                (tid, author),
-            ).fetchone() is None
-        ]
-        # v2.5 (thread #33): the holder's OWN continued posting over a standing
-        # object wakes them to reconsider — priority BELOW awaiting_verdict
-        # (an uncast vote outranks a stale one), ABOVE mentions/new_comments.
-        stale_self = [
-            tid for tid in open_quorum
-            if author in _stale_object_holders(conn, tid)
-        ]
-        # v2.5 (thread #33 ④-1): the real quota face — members were billed
-        # blind; the only visible number was comments-only (wrong face).
-        budget_face = {}
-        for tid in open_quorum:
-            cap = conn.execute(
-                "SELECT per_author_budget FROM threads WHERE id=?", (tid,)
-            ).fetchone()["per_author_budget"]
-            budget_face[str(tid)] = {
-                "used": _author_usage(conn, tid, author), "cap": cap,
-            }
-        marker = f"@{author}"
-        undelivered = conn.execute(
-            "SELECT thread_id, id, body FROM comments WHERE created_at > ? ORDER BY id",
-            (cutoff,),
-        ).fetchall()
-        mention_threads = sorted({r["thread_id"] for r in undelivered if marker in (r["body"] or "")})
-    if awaiting:
-        reason, threads = "awaiting_verdict", awaiting
-    elif stale_self:
-        reason, threads = "verdict_stale", stale_self
-    elif mention_threads:
-        reason, threads = "mentioned", mention_threads
-    elif undelivered:
-        reason, threads = "new_comments", sorted({r["thread_id"] for r in undelivered})
-    else:
-        reason, threads = "idle", []
-    return JSONResponse({
-        "attention": 1 if reason != "idle" else 0,
-        "reason": reason,
-        "threads": threads,
-        "open_threads": open_quorum,
-        "budget": budget_face,
-        # thread #31 batch A: effective cutoff (NULL→epoch sentinel, the same
-        # value the probe itself uses above) for the watcher delivery judgment
-        # (delivered = fingerprint moved OR last_read advanced). Advanced ONLY
-        # by list_comments_since(author) — never by this probe (C3, single
-        # write point), so a watcher cannot fake its own member's delivery.
-        "last_read": cutoff,
-        "board_id": BOARD_INSTANCE_ID,  # stable instance identity (thread #27):
-        # a watcher pinned to EXPECTED_BOARD_ID can detect that this port now
-        # serves a DIFFERENT board and refuse to wake members against it.
-    })
+            mention_threads = sorted(
+                {r["thread_id"] for r in undelivered if _mentioned(r["body"], author)}
+            )
+        if awaiting:
+            reason, threads = "awaiting_verdict", awaiting
+        elif stale_self:
+            reason, threads = "verdict_stale", stale_self
+        elif mention_threads:
+            reason, threads = "mentioned", mention_threads
+        elif undelivered:
+            reason, threads = "new_comments", sorted({r["thread_id"] for r in undelivered})
+        else:
+            reason, threads = "idle", []
+        return JSONResponse({
+            "attention": 1 if reason != "idle" else 0,
+            "reason": reason,
+            "threads": threads,
+            "open_threads": open_quorum,
+            "budget": budget_face,
+            "my_verdicts": my_state,
+            # thread #31 batch A: effective cutoff (NULL→epoch sentinel, the same
+            # value the probe itself uses above) for the watcher delivery judgment
+            # (delivered = fingerprint moved OR last_read advanced). Advanced ONLY
+            # by list_comments_since(author) — never by this probe (C3, single
+            # write point), so a watcher cannot fake its own member's delivery.
+            "last_read": cutoff,
+            "board_id": BOARD_INSTANCE_ID,  # stable instance identity (thread #27):
+            # a watcher pinned to EXPECTED_BOARD_ID can detect that this port now
+            # serves a DIFFERENT board and refuse to wake members against it.
+            "uptime_secs": int(time.time() - _STARTED_AT),
+            "errors": _PROBE_ERRORS,
+        })
+    except Exception:
+        _PROBE_ERRORS += 1
+        raise
 
 
 @mcp.custom_route("/", methods=["GET"])
