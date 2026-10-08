@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# kit-version: 2.4.1 (drift check: compare with repo copy; update at will)
+# kit-version: 2.5.0 (drift check: compare with repo copy; update at will)
 # host-watch-test.sh — scenario matrix for host-watch.sh judgement logic
 # (thread #24 / PR #1 review: P3 + dsh condition (a)).
 # Sources configs/host-watch-lib.sh (the exact code host-watch.sh runs) and
@@ -46,10 +46,12 @@ expect_eq "E token-failure (rc==0, frozen)" \
 # F1: SOMEONE ELSE's comment re-raised attention — fingerprint changed -> delivered
 expect_eq "F1 others-comment re-raise (moved)" \
   "$(judge 0 1 new_comments 24 1 new_comments 24,25)" "delivered"
-# F2: the member's OWN comment re-raised attention — fingerprint identical.
-# KNOWN GAP (documented, lib header + #257/#258): fully-compliant round billed
-# FAILED; 3 such rounds trip the delivery gate. Next batch: governance-progress gate.
-expect_eq "F2 own-comment re-raise (KNOWN GAP)" \
+# F2: identical fingerprint, cursor frozen -> FAILED. v2.5 (thread #33 B-2):
+# the member's-own-comment re-raise shape is prevented SERVER-side now
+# (/attention excludes the prober's own comments from the wake scan), so
+# this lib-level FAILED only bills genuinely frozen rounds; compliant
+# poll-then-post rounds deliver via rule 3 (LR-1 below).
+expect_eq "F2 frozen fingerprint, cursor frozen" \
   "$(judge 0 1 new_comments 24 1 new_comments 24)" "FAILED"
 # G: attention moved but no governance action — delivered BY DESIGN (P1-1:
 # watcher judges delivery, not task completion; awaiting_verdict keeps
@@ -90,6 +92,12 @@ expect_eq "I grace re-probe failure"      "$(wo 0 1 '{}' new_comments 24)" "unve
 expect_eq "J invalid JSON body"           "$(wo 0 1 garbage new_comments 24)" "unverified"
 expect_eq "A valid delivered path"        "$(wo 0 0 '{"attention":0,"reason":"idle","threads":[]}' new_comments 24)" "delivered"
 expect_eq "E valid failed path"           "$(wo 0 0 '{"attention":1,"reason":"new_comments","threads":[24]}' new_comments 24)" "failed"
+expect_eq "LR-1 cursor advanced (frozen fingerprint)" \
+  "$(wo 0 0 '{"attention":1,"reason":"new_comments","threads":[24]}' new_comments 24 '2026-10-02 10:00:00' '2026-10-02 10:05:03')" "delivered"
+expect_eq "LR-2 cursor frozen (F2 via wake_outcome)" \
+  "$(wo 0 0 '{"attention":1,"reason":"new_comments","threads":[24]}' new_comments 24 '2026-10-02 10:00:00' '2026-10-02 10:00:00')" "failed"
+expect_eq "LR-3 old server (no last_read field) -> fingerprint fallback" \
+  "$(wo 0 0 '{"attention":1,"reason":"new_comments","threads":[24]}' new_comments 24 '' '')" "failed"
 TF=$(mktemp); echo 2 > "$TF"
 apply_billing unverified "$TF"
 expect_eq "billing unverified keeps 2"    "$(cat "$TF")" "2"

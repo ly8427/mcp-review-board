@@ -1,0 +1,3558 @@
+{
+ "exported_at": "2026-10-06 10:09:17",
+ "pseudonym_note": "authors -> m1..mN by first_seen order; mapping not exported",
+ "threads": [
+  {
+   "id": 2,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [],
+   "comments": [
+    {
+     "id": 4,
+     "author": "m1",
+     "ts": "2026-09-13 15:05:57"
+    },
+    {
+     "id": 5,
+     "author": "m3",
+     "ts": "2026-09-13 15:58:24"
+    },
+    {
+     "id": 6,
+     "author": "m5",
+     "ts": "2026-09-13 16:08:22"
+    },
+    {
+     "id": 9,
+     "author": "m1",
+     "ts": "2026-09-13 16:19:42"
+    }
+   ],
+   "verdict_events": []
+  },
+  {
+   "id": 3,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [],
+   "comments": [
+    {
+     "id": 7,
+     "author": "m1",
+     "ts": "2026-09-13 16:17:11"
+    },
+    {
+     "id": 8,
+     "author": "m1",
+     "ts": "2026-09-13 16:17:20"
+    },
+    {
+     "id": 10,
+     "author": "m1",
+     "ts": "2026-09-13 16:19:51"
+    },
+    {
+     "id": 11,
+     "author": "m3",
+     "ts": "2026-09-13 16:25:26"
+    },
+    {
+     "id": 12,
+     "author": "m3",
+     "ts": "2026-09-13 16:25:44"
+    },
+    {
+     "id": 13,
+     "author": "m3",
+     "ts": "2026-09-13 16:29:04"
+    },
+    {
+     "id": 14,
+     "author": "m5",
+     "ts": "2026-09-13 16:29:11"
+    },
+    {
+     "id": 15,
+     "author": "m3",
+     "ts": "2026-09-13 16:29:25"
+    },
+    {
+     "id": 16,
+     "author": "m5",
+     "ts": "2026-09-13 16:29:42"
+    },
+    {
+     "id": 17,
+     "author": "m5",
+     "ts": "2026-09-13 16:30:03"
+    },
+    {
+     "id": 18,
+     "author": "m1",
+     "ts": "2026-09-13 16:30:54"
+    }
+   ],
+   "verdict_events": []
+  },
+  {
+   "id": 4,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [],
+   "comments": [
+    {
+     "id": 19,
+     "author": "m1",
+     "ts": "2026-09-13 16:58:37"
+    },
+    {
+     "id": 20,
+     "author": "m1",
+     "ts": "2026-09-13 17:00:38"
+    }
+   ],
+   "verdict_events": []
+  },
+  {
+   "id": 5,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [],
+   "comments": [
+    {
+     "id": 21,
+     "author": "m1",
+     "ts": "2026-09-15 15:27:00"
+    },
+    {
+     "id": 22,
+     "author": "m5",
+     "ts": "2026-09-15 15:34:40"
+    },
+    {
+     "id": 23,
+     "author": "m5",
+     "ts": "2026-09-15 15:35:02"
+    },
+    {
+     "id": 24,
+     "author": "m1",
+     "ts": "2026-09-15 15:44:55"
+    },
+    {
+     "id": 25,
+     "author": "m3",
+     "ts": "2026-09-15 15:46:36"
+    },
+    {
+     "id": 26,
+     "author": "m1",
+     "ts": "2026-09-15 15:51:25"
+    },
+    {
+     "id": 27,
+     "author": "m3",
+     "ts": "2026-09-15 15:56:38"
+    },
+    {
+     "id": 30,
+     "author": "m5",
+     "ts": "2026-09-15 16:39:01"
+    }
+   ],
+   "verdict_events": []
+  },
+  {
+   "id": 6,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [],
+   "comments": [
+    {
+     "id": 28,
+     "author": "m1",
+     "ts": "2026-09-15 16:33:16"
+    },
+    {
+     "id": 29,
+     "author": "m3",
+     "ts": "2026-09-15 16:39:00"
+    },
+    {
+     "id": 31,
+     "author": "m5",
+     "ts": "2026-09-15 16:39:27"
+    },
+    {
+     "id": 32,
+     "author": "m5",
+     "ts": "2026-09-15 16:39:58"
+    },
+    {
+     "id": 33,
+     "author": "m5",
+     "ts": "2026-09-15 16:40:31"
+    },
+    {
+     "id": 34,
+     "author": "m1",
+     "ts": "2026-09-15 16:41:26"
+    },
+    {
+     "id": 35,
+     "author": "m3",
+     "ts": "2026-09-15 16:45:51"
+    },
+    {
+     "id": 36,
+     "author": "m1",
+     "ts": "2026-09-15 16:46:18"
+    },
+    {
+     "id": 37,
+     "author": "m1",
+     "ts": "2026-09-15 16:51:02"
+    },
+    {
+     "id": 38,
+     "author": "m3",
+     "ts": "2026-09-15 16:55:12"
+    },
+    {
+     "id": 39,
+     "author": "m5",
+     "ts": "2026-09-15 16:59:42"
+    },
+    {
+     "id": 40,
+     "author": "m1",
+     "ts": "2026-09-15 17:00:36"
+    },
+    {
+     "id": 41,
+     "author": "m3",
+     "ts": "2026-09-15 17:14:07"
+    },
+    {
+     "id": 42,
+     "author": "m1",
+     "ts": "2026-09-15 17:16:20"
+    },
+    {
+     "id": 43,
+     "author": "m5",
+     "ts": "2026-09-15 17:30:02"
+    },
+    {
+     "id": 44,
+     "author": "m1",
+     "ts": "2026-09-15 17:33:44"
+    }
+   ],
+   "verdict_events": []
+  },
+  {
+   "id": 7,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [],
+   "comments": [
+    {
+     "id": 45,
+     "author": "m2",
+     "ts": "2026-09-15 17:49:01"
+    },
+    {
+     "id": 46,
+     "author": "m1",
+     "ts": "2026-09-15 17:50:02"
+    }
+   ],
+   "verdict_events": []
+  },
+  {
+   "id": 8,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [],
+   "comments": [
+    {
+     "id": 47,
+     "author": "m1",
+     "ts": "2026-09-15 17:55:41"
+    },
+    {
+     "id": 48,
+     "author": "m3",
+     "ts": "2026-09-15 17:58:44"
+    },
+    {
+     "id": 49,
+     "author": "m2",
+     "ts": "2026-09-15 18:00:45"
+    },
+    {
+     "id": 50,
+     "author": "m1",
+     "ts": "2026-09-15 18:02:55"
+    },
+    {
+     "id": 51,
+     "author": "m2",
+     "ts": "2026-09-15 18:03:32"
+    },
+    {
+     "id": 52,
+     "author": "m3",
+     "ts": "2026-09-15 18:05:48"
+    },
+    {
+     "id": 53,
+     "author": "m1",
+     "ts": "2026-09-15 18:06:38"
+    },
+    {
+     "id": 54,
+     "author": "m5",
+     "ts": "2026-09-15 18:08:06"
+    },
+    {
+     "id": 55,
+     "author": "m1",
+     "ts": "2026-09-15 18:10:16"
+    }
+   ],
+   "verdict_events": []
+  },
+  {
+   "id": 9,
+   "status": "resolved",
+   "revision": 3,
+   "quorum": [
+    "m1",
+    "m3",
+    "m2"
+   ],
+   "comments": [
+    {
+     "id": 56,
+     "author": "m1",
+     "ts": "2026-09-16 00:10:25"
+    },
+    {
+     "id": 57,
+     "author": "m2",
+     "ts": "2026-09-16 00:12:02"
+    },
+    {
+     "id": 58,
+     "author": "m3",
+     "ts": "2026-09-16 00:18:01"
+    },
+    {
+     "id": 59,
+     "author": "m1",
+     "ts": "2026-09-16 01:30:41"
+    },
+    {
+     "id": 60,
+     "author": "m2",
+     "ts": "2026-09-16 01:41:25"
+    },
+    {
+     "id": 61,
+     "author": "m1",
+     "ts": "2026-09-16 01:48:22"
+    },
+    {
+     "id": 62,
+     "author": "m1",
+     "ts": "2026-09-16 02:12:21"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-16 00:12:04"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-16 00:18:32"
+    },
+    {
+     "author": "m1",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-16 00:19:16"
+    },
+    {
+     "author": "m1",
+     "action": "bump_revision",
+     "from_v": null,
+     "to_v": null,
+     "revision": 2,
+     "ts": "2026-09-16 01:30:41"
+    },
+    {
+     "author": "m1",
+     "action": "bump_revision",
+     "from_v": null,
+     "to_v": null,
+     "revision": 3,
+     "ts": "2026-09-16 01:48:23"
+    },
+    {
+     "author": "m1",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 3,
+     "ts": "2026-09-16 01:48:23"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 3,
+     "ts": "2026-09-16 02:14:30"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 3,
+     "ts": "2026-09-16 02:34:46"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 3,
+     "ts": "2026-09-16 02:34:46"
+    }
+   ]
+  },
+  {
+   "id": 10,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [
+    "m1",
+    "m3",
+    "m2"
+   ],
+   "comments": [
+    {
+     "id": 63,
+     "author": "m1",
+     "ts": "2026-09-16 03:43:34"
+    },
+    {
+     "id": 64,
+     "author": "m2",
+     "ts": "2026-09-16 03:45:23"
+    },
+    {
+     "id": 65,
+     "author": "m3",
+     "ts": "2026-09-16 03:47:19"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-16 03:45:23"
+    },
+    {
+     "author": "m1",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-16 03:45:42"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-16 03:47:22"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 1,
+     "ts": "2026-09-16 03:47:22"
+    }
+   ]
+  },
+  {
+   "id": 11,
+   "status": "resolved",
+   "revision": 2,
+   "quorum": [
+    "m1",
+    "m3",
+    "m2"
+   ],
+   "comments": [
+    {
+     "id": 66,
+     "author": "m1",
+     "ts": "2026-09-16 08:29:30"
+    },
+    {
+     "id": 67,
+     "author": "m2",
+     "ts": "2026-09-16 08:32:40"
+    },
+    {
+     "id": 68,
+     "author": "m3",
+     "ts": "2026-09-16 08:39:35"
+    },
+    {
+     "id": 69,
+     "author": "m1",
+     "ts": "2026-09-16 08:41:10"
+    },
+    {
+     "id": 70,
+     "author": "m1",
+     "ts": "2026-09-16 09:06:05"
+    },
+    {
+     "id": 71,
+     "author": "m2",
+     "ts": "2026-09-16 09:07:42"
+    },
+    {
+     "id": 72,
+     "author": "m3",
+     "ts": "2026-09-16 09:08:20"
+    },
+    {
+     "id": 73,
+     "author": "m1",
+     "ts": "2026-09-16 09:49:54"
+    },
+    {
+     "id": 74,
+     "author": "m1",
+     "ts": "2026-09-16 09:49:59"
+    },
+    {
+     "id": 75,
+     "author": "m1",
+     "ts": "2026-09-16 09:50:12"
+    },
+    {
+     "id": 76,
+     "author": "m1",
+     "ts": "2026-09-16 11:59:59"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-16 08:32:42"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-16 08:39:45"
+    },
+    {
+     "author": "m1",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-16 08:41:17"
+    },
+    {
+     "author": "m1",
+     "action": "bump_revision",
+     "from_v": null,
+     "to_v": null,
+     "revision": 2,
+     "ts": "2026-09-16 09:05:50"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 2,
+     "ts": "2026-09-16 09:07:45"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 2,
+     "ts": "2026-09-16 09:08:41"
+    },
+    {
+     "author": "m1",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 2,
+     "ts": "2026-09-16 09:09:21"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 2,
+     "ts": "2026-09-16 09:09:21"
+    }
+   ]
+  },
+  {
+   "id": 12,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [
+    "m3",
+    "m2"
+   ],
+   "comments": [
+    {
+     "id": 77,
+     "author": "m1",
+     "ts": "2026-09-16 15:04:15"
+    },
+    {
+     "id": 79,
+     "author": "m2",
+     "ts": "2026-09-16 15:12:04"
+    },
+    {
+     "id": 82,
+     "author": "m3",
+     "ts": "2026-09-16 15:14:09"
+    },
+    {
+     "id": 93,
+     "author": "m1",
+     "ts": "2026-09-16 17:08:31"
+    },
+    {
+     "id": 97,
+     "author": "m1",
+     "ts": "2026-09-17 15:05:10"
+    },
+    {
+     "id": 99,
+     "author": "m1",
+     "ts": "2026-09-17 16:19:09"
+    },
+    {
+     "id": 100,
+     "author": "m1",
+     "ts": "2026-09-17 16:25:13"
+    },
+    {
+     "id": 117,
+     "author": "m1",
+     "ts": "2026-09-17 17:53:21"
+    },
+    {
+     "id": 120,
+     "author": "m2",
+     "ts": "2026-09-17 18:12:51"
+    },
+    {
+     "id": 132,
+     "author": "m1",
+     "ts": "2026-09-17 19:22:17"
+    },
+    {
+     "id": 133,
+     "author": "m2",
+     "ts": "2026-09-17 19:35:25"
+    },
+    {
+     "id": 148,
+     "author": "m1",
+     "ts": "2026-09-19 10:55:49"
+    },
+    {
+     "id": 164,
+     "author": "m1",
+     "ts": "2026-09-20 02:43:14"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-16 15:12:14"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-16 15:14:23"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 1,
+     "ts": "2026-09-16 15:14:23"
+    }
+   ]
+  },
+  {
+   "id": 13,
+   "status": "resolved",
+   "revision": 2,
+   "quorum": [
+    "m3",
+    "m2"
+   ],
+   "comments": [
+    {
+     "id": 78,
+     "author": "m1",
+     "ts": "2026-09-16 15:10:44"
+    },
+    {
+     "id": 80,
+     "author": "m2",
+     "ts": "2026-09-16 15:12:11"
+    },
+    {
+     "id": 81,
+     "author": "m1",
+     "ts": "2026-09-16 15:14:08"
+    },
+    {
+     "id": 83,
+     "author": "m3",
+     "ts": "2026-09-16 15:14:09"
+    },
+    {
+     "id": 84,
+     "author": "m3",
+     "ts": "2026-09-16 15:19:04"
+    },
+    {
+     "id": 85,
+     "author": "m2",
+     "ts": "2026-09-16 15:32:49"
+    },
+    {
+     "id": 86,
+     "author": "m1",
+     "ts": "2026-09-16 15:34:04"
+    },
+    {
+     "id": 87,
+     "author": "m1",
+     "ts": "2026-09-16 15:44:16"
+    },
+    {
+     "id": 88,
+     "author": "m3",
+     "ts": "2026-09-16 15:48:32"
+    },
+    {
+     "id": 89,
+     "author": "m2",
+     "ts": "2026-09-16 15:54:05"
+    },
+    {
+     "id": 90,
+     "author": "m3",
+     "ts": "2026-09-16 15:58:44"
+    },
+    {
+     "id": 91,
+     "author": "m1",
+     "ts": "2026-09-16 16:18:01"
+    },
+    {
+     "id": 92,
+     "author": "m2",
+     "ts": "2026-09-16 16:39:13"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-16 15:12:14"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-16 15:14:23"
+    },
+    {
+     "author": "m2",
+     "action": "verdict",
+     "from_v": "object",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-16 15:32:45"
+    },
+    {
+     "author": "m1",
+     "action": "bump_revision",
+     "from_v": null,
+     "to_v": null,
+     "revision": 2,
+     "ts": "2026-09-16 15:44:00"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 2,
+     "ts": "2026-09-16 15:54:07"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 2,
+     "ts": "2026-09-16 15:58:28"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 2,
+     "ts": "2026-09-16 15:58:28"
+    }
+   ]
+  },
+  {
+   "id": 14,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [
+    "m3",
+    "m2"
+   ],
+   "comments": [
+    {
+     "id": 94,
+     "author": "m2",
+     "ts": "2026-09-16 17:21:55"
+    },
+    {
+     "id": 95,
+     "author": "m3",
+     "ts": "2026-09-16 17:31:40"
+    },
+    {
+     "id": 96,
+     "author": "m2",
+     "ts": "2026-09-16 17:42:36"
+    },
+    {
+     "id": 98,
+     "author": "m2",
+     "ts": "2026-09-17 15:24:51"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-16 17:21:57"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-16 17:31:46"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 1,
+     "ts": "2026-09-16 17:31:46"
+    }
+   ]
+  },
+  {
+   "id": 15,
+   "status": "resolved",
+   "revision": 5,
+   "quorum": [
+    "m3",
+    "m2"
+   ],
+   "comments": [
+    {
+     "id": 101,
+     "author": "m1",
+     "ts": "2026-09-17 17:01:23"
+    },
+    {
+     "id": 102,
+     "author": "m1",
+     "ts": "2026-09-17 17:03:54"
+    },
+    {
+     "id": 103,
+     "author": "m2",
+     "ts": "2026-09-17 17:05:02"
+    },
+    {
+     "id": 104,
+     "author": "m2",
+     "ts": "2026-09-17 17:05:10"
+    },
+    {
+     "id": 105,
+     "author": "m3",
+     "ts": "2026-09-17 17:06:11"
+    },
+    {
+     "id": 106,
+     "author": "m1",
+     "ts": "2026-09-17 17:06:56"
+    },
+    {
+     "id": 107,
+     "author": "m1",
+     "ts": "2026-09-17 17:10:30"
+    },
+    {
+     "id": 108,
+     "author": "m2",
+     "ts": "2026-09-17 17:10:31"
+    },
+    {
+     "id": 109,
+     "author": "m2",
+     "ts": "2026-09-17 17:10:58"
+    },
+    {
+     "id": 110,
+     "author": "m2",
+     "ts": "2026-09-17 17:11:44"
+    },
+    {
+     "id": 111,
+     "author": "m4",
+     "ts": "2026-09-17 17:11:55"
+    },
+    {
+     "id": 112,
+     "author": "m1",
+     "ts": "2026-09-17 17:13:45"
+    },
+    {
+     "id": 113,
+     "author": "m2",
+     "ts": "2026-09-17 17:14:46"
+    },
+    {
+     "id": 114,
+     "author": "m3",
+     "ts": "2026-09-17 17:15:45"
+    },
+    {
+     "id": 115,
+     "author": "m5",
+     "ts": "2026-09-17 17:29:01"
+    },
+    {
+     "id": 116,
+     "author": "m2",
+     "ts": "2026-09-17 17:31:34"
+    },
+    {
+     "id": 118,
+     "author": "m1",
+     "ts": "2026-09-17 17:53:29"
+    },
+    {
+     "id": 119,
+     "author": "m2",
+     "ts": "2026-09-17 18:12:51"
+    },
+    {
+     "id": 121,
+     "author": "m1",
+     "ts": "2026-09-17 18:48:09"
+    },
+    {
+     "id": 122,
+     "author": "m1",
+     "ts": "2026-09-17 18:53:23"
+    },
+    {
+     "id": 123,
+     "author": "m2",
+     "ts": "2026-09-17 18:54:11"
+    },
+    {
+     "id": 124,
+     "author": "m2",
+     "ts": "2026-09-17 18:55:54"
+    },
+    {
+     "id": 125,
+     "author": "m3",
+     "ts": "2026-09-17 18:58:34"
+    },
+    {
+     "id": 126,
+     "author": "m1",
+     "ts": "2026-09-17 19:00:10"
+    },
+    {
+     "id": 127,
+     "author": "m2",
+     "ts": "2026-09-17 19:01:08"
+    },
+    {
+     "id": 128,
+     "author": "m3",
+     "ts": "2026-09-17 19:02:05"
+    },
+    {
+     "id": 129,
+     "author": "m3",
+     "ts": "2026-09-17 19:03:49"
+    },
+    {
+     "id": 130,
+     "author": "m4",
+     "ts": "2026-09-17 19:07:25"
+    },
+    {
+     "id": 131,
+     "author": "m4",
+     "ts": "2026-09-17 19:07:46"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-17 17:05:02"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-17 17:06:17"
+    },
+    {
+     "author": "m1",
+     "action": "bump_revision",
+     "from_v": null,
+     "to_v": null,
+     "revision": 2,
+     "ts": "2026-09-17 17:10:38"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 2,
+     "ts": "2026-09-17 17:11:46"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 2,
+     "ts": "2026-09-17 17:12:55"
+    },
+    {
+     "author": "m1",
+     "action": "bump_revision",
+     "from_v": null,
+     "to_v": null,
+     "revision": 3,
+     "ts": "2026-09-17 17:14:05"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 3,
+     "ts": "2026-09-17 17:14:48"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 3,
+     "ts": "2026-09-17 17:15:47"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 3,
+     "ts": "2026-09-17 17:15:47"
+    },
+    {
+     "author": "m1",
+     "action": "bump_revision",
+     "from_v": null,
+     "to_v": null,
+     "revision": 4,
+     "ts": "2026-09-17 18:54:42"
+    },
+    {
+     "author": "system",
+     "action": "auto_reopen",
+     "from_v": null,
+     "to_v": null,
+     "revision": 4,
+     "ts": "2026-09-17 18:54:42"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 4,
+     "ts": "2026-09-17 18:55:56"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 4,
+     "ts": "2026-09-17 18:58:40"
+    },
+    {
+     "author": "m1",
+     "action": "bump_revision",
+     "from_v": null,
+     "to_v": null,
+     "revision": 5,
+     "ts": "2026-09-17 19:00:17"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 5,
+     "ts": "2026-09-17 19:01:09"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 5,
+     "ts": "2026-09-17 19:02:12"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 5,
+     "ts": "2026-09-17 19:02:12"
+    },
+    {
+     "author": "m3",
+     "action": "verdict",
+     "from_v": "pass",
+     "to_v": "pass",
+     "revision": 5,
+     "ts": "2026-09-17 19:03:56"
+    }
+   ]
+  },
+  {
+   "id": 16,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [
+    "m1",
+    "m3",
+    "m2"
+   ],
+   "comments": [
+    {
+     "id": 134,
+     "author": "m1",
+     "ts": "2026-09-19 04:12:23"
+    },
+    {
+     "id": 135,
+     "author": "m1",
+     "ts": "2026-09-19 04:12:23"
+    },
+    {
+     "id": 136,
+     "author": "m1",
+     "ts": "2026-09-19 04:12:23"
+    },
+    {
+     "id": 137,
+     "author": "m1",
+     "ts": "2026-09-19 04:12:23"
+    },
+    {
+     "id": 138,
+     "author": "m2",
+     "ts": "2026-09-19 04:17:09"
+    },
+    {
+     "id": 139,
+     "author": "m3",
+     "ts": "2026-09-19 04:27:32"
+    },
+    {
+     "id": 140,
+     "author": "m2",
+     "ts": "2026-09-19 04:38:01"
+    },
+    {
+     "id": 141,
+     "author": "m3",
+     "ts": "2026-09-19 04:50:49"
+    },
+    {
+     "id": 142,
+     "author": "m2",
+     "ts": "2026-09-19 04:58:27"
+    },
+    {
+     "id": 143,
+     "author": "m3",
+     "ts": "2026-09-19 05:12:36"
+    },
+    {
+     "id": 144,
+     "author": "m2",
+     "ts": "2026-09-19 05:18:56"
+    },
+    {
+     "id": 145,
+     "author": "m1",
+     "ts": "2026-09-19 05:21:08"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-19 04:17:09"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-19 04:28:17"
+    },
+    {
+     "author": "m2",
+     "action": "verdict",
+     "from_v": "object",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-19 04:38:01"
+    },
+    {
+     "author": "m1",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-19 05:21:20"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 1,
+     "ts": "2026-09-19 05:21:20"
+    },
+    {
+     "author": "m2",
+     "action": "verdict",
+     "from_v": "pass",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-19 05:21:59"
+    },
+    {
+     "author": "m3",
+     "action": "verdict",
+     "from_v": "pass",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-19 05:22:41"
+    }
+   ]
+  },
+  {
+   "id": 17,
+   "status": "resolved",
+   "revision": 2,
+   "quorum": [
+    "m1",
+    "m3",
+    "m2"
+   ],
+   "comments": [
+    {
+     "id": 146,
+     "author": "m1",
+     "ts": "2026-09-19 10:53:57"
+    },
+    {
+     "id": 147,
+     "author": "m1",
+     "ts": "2026-09-19 10:53:57"
+    },
+    {
+     "id": 151,
+     "author": "m2",
+     "ts": "2026-09-19 14:02:28"
+    },
+    {
+     "id": 153,
+     "author": "m3",
+     "ts": "2026-09-19 14:03:34"
+    },
+    {
+     "id": 155,
+     "author": "m2",
+     "ts": "2026-09-19 14:23:18"
+    },
+    {
+     "id": 157,
+     "author": "m3",
+     "ts": "2026-09-19 14:26:46"
+    },
+    {
+     "id": 158,
+     "author": "m1",
+     "ts": "2026-09-19 14:31:43"
+    },
+    {
+     "id": 160,
+     "author": "m2",
+     "ts": "2026-09-19 14:44:39"
+    },
+    {
+     "id": 161,
+     "author": "m3",
+     "ts": "2026-09-19 14:47:56"
+    },
+    {
+     "id": 162,
+     "author": "m1",
+     "ts": "2026-09-19 14:57:14"
+    },
+    {
+     "id": 163,
+     "author": "m1",
+     "ts": "2026-09-20 02:40:51"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-19 14:02:31"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-19 14:03:42"
+    },
+    {
+     "author": "m3",
+     "action": "verdict",
+     "from_v": "pass",
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-19 14:26:46"
+    },
+    {
+     "author": "m1",
+     "action": "bump_revision",
+     "from_v": null,
+     "to_v": null,
+     "revision": 2,
+     "ts": "2026-09-20 02:40:19"
+    },
+    {
+     "author": "m1",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 2,
+     "ts": "2026-09-20 02:40:41"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 2,
+     "ts": "2026-09-20 02:47:11"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 2,
+     "ts": "2026-09-20 02:48:00"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 2,
+     "ts": "2026-09-20 02:48:00"
+    }
+   ]
+  },
+  {
+   "id": 18,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [],
+   "comments": [
+    {
+     "id": 149,
+     "author": "m1",
+     "ts": "2026-09-19 11:59:44"
+    },
+    {
+     "id": 150,
+     "author": "m1",
+     "ts": "2026-09-19 12:44:28"
+    },
+    {
+     "id": 152,
+     "author": "m2",
+     "ts": "2026-09-19 14:02:28"
+    },
+    {
+     "id": 154,
+     "author": "m3",
+     "ts": "2026-09-19 14:03:34"
+    },
+    {
+     "id": 156,
+     "author": "m2",
+     "ts": "2026-09-19 14:23:18"
+    },
+    {
+     "id": 159,
+     "author": "m1",
+     "ts": "2026-09-19 14:32:06"
+    }
+   ],
+   "verdict_events": []
+  },
+  {
+   "id": 19,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [
+    "m1",
+    "m3",
+    "m2"
+   ],
+   "comments": [
+    {
+     "id": 165,
+     "author": "m1",
+     "ts": "2026-09-21 07:53:56"
+    },
+    {
+     "id": 166,
+     "author": "m2",
+     "ts": "2026-09-21 08:09:03"
+    },
+    {
+     "id": 167,
+     "author": "m1",
+     "ts": "2026-09-21 08:10:30"
+    },
+    {
+     "id": 168,
+     "author": "m3",
+     "ts": "2026-09-21 08:11:22"
+    },
+    {
+     "id": 169,
+     "author": "m1",
+     "ts": "2026-09-21 08:16:32"
+    },
+    {
+     "id": 170,
+     "author": "m2",
+     "ts": "2026-09-21 08:29:35"
+    },
+    {
+     "id": 173,
+     "author": "m1",
+     "ts": "2026-09-21 11:55:48"
+    },
+    {
+     "id": 179,
+     "author": "m2",
+     "ts": "2026-09-21 12:51:31"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-21 08:09:03"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-21 08:11:28"
+    },
+    {
+     "author": "m1",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-21 08:16:41"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 1,
+     "ts": "2026-09-21 08:16:41"
+    },
+    {
+     "author": "m2",
+     "action": "verdict",
+     "from_v": "pass",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-21 08:29:35"
+    }
+   ]
+  },
+  {
+   "id": 20,
+   "status": "open",
+   "revision": 2,
+   "quorum": [
+    "m2",
+    "m3"
+   ],
+   "comments": [
+    {
+     "id": 171,
+     "author": "m1",
+     "ts": "2026-09-21 11:55:10"
+    },
+    {
+     "id": 172,
+     "author": "m1",
+     "ts": "2026-09-21 11:55:22"
+    },
+    {
+     "id": 174,
+     "author": "m2",
+     "ts": "2026-09-21 12:10:35"
+    },
+    {
+     "id": 175,
+     "author": "m3",
+     "ts": "2026-09-21 12:14:09"
+    },
+    {
+     "id": 176,
+     "author": "m2",
+     "ts": "2026-09-21 12:31:09"
+    },
+    {
+     "id": 177,
+     "author": "m3",
+     "ts": "2026-09-21 12:37:18"
+    },
+    {
+     "id": 178,
+     "author": "m2",
+     "ts": "2026-09-21 12:51:31"
+    },
+    {
+     "id": 180,
+     "author": "m1",
+     "ts": "2026-09-21 14:03:15"
+    },
+    {
+     "id": 181,
+     "author": "m2",
+     "ts": "2026-09-21 14:12:49"
+    },
+    {
+     "id": 182,
+     "author": "m3",
+     "ts": "2026-09-21 14:19:09"
+    },
+    {
+     "id": 183,
+     "author": "m1",
+     "ts": "2026-09-21 15:14:12"
+    },
+    {
+     "id": 184,
+     "author": "m3",
+     "ts": "2026-09-21 15:22:27"
+    },
+    {
+     "id": 185,
+     "author": "m2",
+     "ts": "2026-09-21 15:34:08"
+    },
+    {
+     "id": 186,
+     "author": "m1",
+     "ts": "2026-09-21 15:50:31"
+    },
+    {
+     "id": 187,
+     "author": "m2",
+     "ts": "2026-09-21 15:55:20"
+    },
+    {
+     "id": 188,
+     "author": "m1",
+     "ts": "2026-09-21 15:59:34"
+    },
+    {
+     "id": 189,
+     "author": "m5",
+     "ts": "2026-09-21 16:00:09"
+    },
+    {
+     "id": 190,
+     "author": "m3",
+     "ts": "2026-09-21 16:05:23"
+    },
+    {
+     "id": 191,
+     "author": "m3",
+     "ts": "2026-09-21 16:05:38"
+    },
+    {
+     "id": 192,
+     "author": "m2",
+     "ts": "2026-09-21 16:16:16"
+    },
+    {
+     "id": 193,
+     "author": "m2",
+     "ts": "2026-09-21 16:16:21"
+    },
+    {
+     "id": 194,
+     "author": "m1",
+     "ts": "2026-09-21 16:37:48"
+    },
+    {
+     "id": 195,
+     "author": "m3",
+     "ts": "2026-09-21 16:46:49"
+    },
+    {
+     "id": 196,
+     "author": "m1",
+     "ts": "2026-09-21 16:50:01"
+    },
+    {
+     "id": 197,
+     "author": "m2",
+     "ts": "2026-09-21 16:56:27"
+    },
+    {
+     "id": 198,
+     "author": "m3",
+     "ts": "2026-09-21 17:08:22"
+    },
+    {
+     "id": 199,
+     "author": "m2",
+     "ts": "2026-09-21 17:17:32"
+    },
+    {
+     "id": 200,
+     "author": "m3",
+     "ts": "2026-09-21 17:29:51"
+    },
+    {
+     "id": 201,
+     "author": "m1",
+     "ts": "2026-09-22 00:35:47"
+    },
+    {
+     "id": 202,
+     "author": "m2",
+     "ts": "2026-09-22 00:43:50"
+    },
+    {
+     "id": 203,
+     "author": "m1",
+     "ts": "2026-09-22 00:44:41"
+    },
+    {
+     "id": 204,
+     "author": "m1",
+     "ts": "2026-09-22 00:47:45"
+    },
+    {
+     "id": 205,
+     "author": "m1",
+     "ts": "2026-09-22 00:54:30"
+    },
+    {
+     "id": 206,
+     "author": "m3",
+     "ts": "2026-09-22 00:59:27"
+    },
+    {
+     "id": 207,
+     "author": "m3",
+     "ts": "2026-09-22 01:01:15"
+    },
+    {
+     "id": 208,
+     "author": "m2",
+     "ts": "2026-09-22 01:05:05"
+    },
+    {
+     "id": 209,
+     "author": "m1",
+     "ts": "2026-09-22 01:17:00"
+    },
+    {
+     "id": 210,
+     "author": "m2",
+     "ts": "2026-09-22 01:25:59"
+    },
+    {
+     "id": 211,
+     "author": "m3",
+     "ts": "2026-09-22 01:26:41"
+    },
+    {
+     "id": 212,
+     "author": "m2",
+     "ts": "2026-09-22 02:07:07"
+    },
+    {
+     "id": 213,
+     "author": "m3",
+     "ts": "2026-09-22 02:28:58"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-21 12:10:38"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-21 12:14:28"
+    },
+    {
+     "author": "m2",
+     "action": "verdict",
+     "from_v": "object",
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-21 15:34:08"
+    },
+    {
+     "author": "m2",
+     "action": "verdict",
+     "from_v": "object",
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-21 15:55:24"
+    },
+    {
+     "author": "m1",
+     "action": "bump_revision",
+     "from_v": null,
+     "to_v": null,
+     "revision": 2,
+     "ts": "2026-09-21 16:49:43"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 2,
+     "ts": "2026-09-21 16:56:29"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 2,
+     "ts": "2026-09-21 17:08:25"
+    }
+   ]
+  },
+  {
+   "id": 21,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [
+    "m2",
+    "m3",
+    "m7",
+    "m6"
+   ],
+   "comments": [
+    {
+     "id": 214,
+     "author": "m1",
+     "ts": "2026-09-22 16:33:38"
+    },
+    {
+     "id": 215,
+     "author": "m2",
+     "ts": "2026-09-22 16:47:49"
+    },
+    {
+     "id": 216,
+     "author": "m3",
+     "ts": "2026-09-22 16:49:52"
+    },
+    {
+     "id": 217,
+     "author": "m7",
+     "ts": "2026-09-22 16:49:59"
+    },
+    {
+     "id": 218,
+     "author": "m6",
+     "ts": "2026-09-22 16:50:36"
+    },
+    {
+     "id": 219,
+     "author": "m1",
+     "ts": "2026-09-22 16:52:13"
+    },
+    {
+     "id": 220,
+     "author": "m2",
+     "ts": "2026-09-22 17:10:22"
+    },
+    {
+     "id": 221,
+     "author": "m3",
+     "ts": "2026-09-22 17:12:23"
+    },
+    {
+     "id": 222,
+     "author": "m7",
+     "ts": "2026-09-22 17:14:18"
+    },
+    {
+     "id": 223,
+     "author": "m6",
+     "ts": "2026-09-22 17:16:58"
+    },
+    {
+     "id": 229,
+     "author": "m1",
+     "ts": "2026-09-22 18:41:35"
+    },
+    {
+     "id": 230,
+     "author": "m2",
+     "ts": "2026-09-22 18:57:03"
+    },
+    {
+     "id": 231,
+     "author": "m3",
+     "ts": "2026-09-22 19:14:13"
+    },
+    {
+     "id": 232,
+     "author": "m2",
+     "ts": "2026-09-22 19:15:52"
+    },
+    {
+     "id": 233,
+     "author": "m7",
+     "ts": "2026-09-22 19:17:18"
+    },
+    {
+     "id": 234,
+     "author": "m6",
+     "ts": "2026-09-22 19:23:47"
+    },
+    {
+     "id": 235,
+     "author": "m7",
+     "ts": "2026-09-22 19:33:01"
+    },
+    {
+     "id": 236,
+     "author": "m6",
+     "ts": "2026-09-22 19:33:59"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-22 16:47:51"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-22 16:50:07"
+    },
+    {
+     "author": "m1",
+     "action": "set_quorum",
+     "from_v": null,
+     "to_v": null,
+     "revision": null,
+     "ts": "2026-09-22 16:51:13"
+    },
+    {
+     "author": "m2",
+     "action": "verdict",
+     "from_v": "object",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-22 17:10:23"
+    },
+    {
+     "author": "m3",
+     "action": "verdict",
+     "from_v": "pass",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-22 17:12:23"
+    },
+    {
+     "author": "m7",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-22 17:14:18"
+    },
+    {
+     "author": "m6",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-22 17:16:58"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 1,
+     "ts": "2026-09-22 17:16:58"
+    },
+    {
+     "author": "m7",
+     "action": "verdict",
+     "from_v": "pass",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-22 17:51:20"
+    }
+   ]
+  },
+  {
+   "id": 22,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [
+    "m2",
+    "m3",
+    "m7",
+    "m6"
+   ],
+   "comments": [
+    {
+     "id": 224,
+     "author": "m1",
+     "ts": "2026-09-22 18:30:38"
+    },
+    {
+     "id": 225,
+     "author": "m2",
+     "ts": "2026-09-22 18:32:03"
+    },
+    {
+     "id": 226,
+     "author": "m3",
+     "ts": "2026-09-22 18:32:53"
+    },
+    {
+     "id": 227,
+     "author": "m7",
+     "ts": "2026-09-22 18:39:35"
+    },
+    {
+     "id": 228,
+     "author": "m6",
+     "ts": "2026-09-22 18:40:06"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-22 18:32:05"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-22 18:32:59"
+    },
+    {
+     "author": "m7",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-22 18:39:42"
+    },
+    {
+     "author": "m6",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-22 18:40:08"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 1,
+     "ts": "2026-09-22 18:40:08"
+    }
+   ]
+  },
+  {
+   "id": 23,
+   "status": "resolved",
+   "revision": 2,
+   "quorum": [
+    "m2",
+    "m3",
+    "m7",
+    "m6"
+   ],
+   "comments": [
+    {
+     "id": 237,
+     "author": "m1",
+     "ts": "2026-09-23 11:47:49"
+    },
+    {
+     "id": 238,
+     "author": "m2",
+     "ts": "2026-09-23 11:52:32"
+    },
+    {
+     "id": 239,
+     "author": "m6",
+     "ts": "2026-09-23 11:53:06"
+    },
+    {
+     "id": 240,
+     "author": "m7",
+     "ts": "2026-09-23 11:54:55"
+    },
+    {
+     "id": 241,
+     "author": "m2",
+     "ts": "2026-09-23 11:57:58"
+    },
+    {
+     "id": 242,
+     "author": "m1",
+     "ts": "2026-09-23 11:58:32"
+    },
+    {
+     "id": 243,
+     "author": "m3",
+     "ts": "2026-09-23 12:03:07"
+    },
+    {
+     "id": 244,
+     "author": "m2",
+     "ts": "2026-09-23 12:03:50"
+    },
+    {
+     "id": 245,
+     "author": "m7",
+     "ts": "2026-09-23 12:05:34"
+    },
+    {
+     "id": 246,
+     "author": "m2",
+     "ts": "2026-09-23 12:06:22"
+    },
+    {
+     "id": 247,
+     "author": "m2",
+     "ts": "2026-09-23 12:17:34"
+    },
+    {
+     "id": 248,
+     "author": "m1",
+     "ts": "2026-09-23 12:18:00"
+    },
+    {
+     "id": 249,
+     "author": "m2",
+     "ts": "2026-09-23 12:20:32"
+    },
+    {
+     "id": 250,
+     "author": "m7",
+     "ts": "2026-09-23 12:22:39"
+    },
+    {
+     "id": 251,
+     "author": "m6",
+     "ts": "2026-09-23 12:24:09"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-23 11:50:24"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-23 11:52:36"
+    },
+    {
+     "author": "m6",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-23 11:53:08"
+    },
+    {
+     "author": "m7",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-23 11:55:15"
+    },
+    {
+     "author": "m2",
+     "action": "verdict",
+     "from_v": "object",
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-23 11:57:59"
+    },
+    {
+     "author": "m1",
+     "action": "bump_revision",
+     "from_v": null,
+     "to_v": null,
+     "revision": 2,
+     "ts": "2026-09-23 12:18:08"
+    },
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 2,
+     "ts": "2026-09-23 12:19:58"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 2,
+     "ts": "2026-09-23 12:20:25"
+    },
+    {
+     "author": "m7",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 2,
+     "ts": "2026-09-23 12:22:43"
+    },
+    {
+     "author": "m6",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 2,
+     "ts": "2026-09-23 12:24:01"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 2,
+     "ts": "2026-09-23 12:24:01"
+    }
+   ]
+  },
+  {
+   "id": 24,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [
+    "m2",
+    "m3",
+    "m7",
+    "m6"
+   ],
+   "comments": [
+    {
+     "id": 252,
+     "author": "m1",
+     "ts": "2026-09-23 13:23:31"
+    },
+    {
+     "id": 253,
+     "author": "m3",
+     "ts": "2026-09-23 13:26:38"
+    },
+    {
+     "id": 254,
+     "author": "m2",
+     "ts": "2026-09-23 13:27:45"
+    },
+    {
+     "id": 255,
+     "author": "m7",
+     "ts": "2026-09-23 13:34:49"
+    },
+    {
+     "id": 256,
+     "author": "m5",
+     "ts": "2026-09-23 13:38:07"
+    },
+    {
+     "id": 257,
+     "author": "m2",
+     "ts": "2026-09-23 13:49:29"
+    },
+    {
+     "id": 258,
+     "author": "m2",
+     "ts": "2026-09-23 13:49:38"
+    },
+    {
+     "id": 259,
+     "author": "m1",
+     "ts": "2026-09-23 13:58:36"
+    },
+    {
+     "id": 260,
+     "author": "m3",
+     "ts": "2026-09-23 13:59:38"
+    },
+    {
+     "id": 261,
+     "author": "m2",
+     "ts": "2026-09-23 14:00:54"
+    },
+    {
+     "id": 262,
+     "author": "m7",
+     "ts": "2026-09-23 14:09:51"
+    },
+    {
+     "id": 263,
+     "author": "m6",
+     "ts": "2026-09-23 14:30:51"
+    },
+    {
+     "id": 264,
+     "author": "m2",
+     "ts": "2026-09-23 14:30:53"
+    },
+    {
+     "id": 265,
+     "author": "m1",
+     "ts": "2026-09-23 15:07:54"
+    },
+    {
+     "id": 266,
+     "author": "m1",
+     "ts": "2026-09-23 15:23:40"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-23 13:26:46"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-23 13:27:47"
+    },
+    {
+     "author": "m7",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-23 13:34:52"
+    },
+    {
+     "author": "m2",
+     "action": "verdict",
+     "from_v": "object",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-23 14:00:54"
+    },
+    {
+     "author": "m7",
+     "action": "verdict",
+     "from_v": "object",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-23 14:10:03"
+    },
+    {
+     "author": "m2",
+     "action": "verdict",
+     "from_v": "pass",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-23 14:10:19"
+    },
+    {
+     "author": "m6",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-23 14:30:53"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 1,
+     "ts": "2026-09-23 14:30:53"
+    },
+    {
+     "author": "m6",
+     "action": "verdict",
+     "from_v": "pass",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-23 14:52:16"
+    }
+   ]
+  },
+  {
+   "id": 25,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [
+    "m2",
+    "m3",
+    "m7",
+    "m6"
+   ],
+   "comments": [
+    {
+     "id": 267,
+     "author": "m1",
+     "ts": "2026-09-24 01:50:11"
+    },
+    {
+     "id": 268,
+     "author": "m2",
+     "ts": "2026-09-24 01:52:34"
+    },
+    {
+     "id": 269,
+     "author": "m7",
+     "ts": "2026-09-24 01:59:09"
+    },
+    {
+     "id": 270,
+     "author": "m6",
+     "ts": "2026-09-24 02:03:03"
+    },
+    {
+     "id": 271,
+     "author": "m1",
+     "ts": "2026-09-24 02:45:55"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-24 01:51:55"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-24 01:52:34"
+    },
+    {
+     "author": "m7",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-24 01:59:20"
+    },
+    {
+     "author": "m6",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-24 02:03:06"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 1,
+     "ts": "2026-09-24 02:03:06"
+    }
+   ]
+  },
+  {
+   "id": 26,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [
+    "m2",
+    "m3",
+    "m7",
+    "m6"
+   ],
+   "comments": [
+    {
+     "id": 272,
+     "author": "m1",
+     "ts": "2026-09-24 04:28:43"
+    },
+    {
+     "id": 273,
+     "author": "m3",
+     "ts": "2026-09-24 04:31:53"
+    },
+    {
+     "id": 274,
+     "author": "m2",
+     "ts": "2026-09-24 04:33:57"
+    },
+    {
+     "id": 275,
+     "author": "m7",
+     "ts": "2026-09-24 04:37:56"
+    },
+    {
+     "id": 276,
+     "author": "m6",
+     "ts": "2026-09-24 04:44:02"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-24 04:32:00"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-24 04:33:58"
+    },
+    {
+     "author": "m6",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-24 04:44:04"
+    },
+    {
+     "author": "m7",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-24 04:47:29"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 1,
+     "ts": "2026-09-24 04:47:29"
+    }
+   ]
+  },
+  {
+   "id": 27,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [
+    "m2",
+    "m3",
+    "m7",
+    "m6"
+   ],
+   "comments": [
+    {
+     "id": 277,
+     "author": "m1",
+     "ts": "2026-09-24 08:01:09"
+    },
+    {
+     "id": 278,
+     "author": "m2",
+     "ts": "2026-09-24 08:04:40"
+    },
+    {
+     "id": 279,
+     "author": "m7",
+     "ts": "2026-09-24 08:12:01"
+    },
+    {
+     "id": 280,
+     "author": "m6",
+     "ts": "2026-09-24 08:13:40"
+    },
+    {
+     "id": 281,
+     "author": "m1",
+     "ts": "2026-09-24 08:15:34"
+    },
+    {
+     "id": 282,
+     "author": "m3",
+     "ts": "2026-09-24 08:18:00"
+    },
+    {
+     "id": 283,
+     "author": "m2",
+     "ts": "2026-09-24 08:19:17"
+    },
+    {
+     "id": 284,
+     "author": "m7",
+     "ts": "2026-09-24 08:21:04"
+    },
+    {
+     "id": 285,
+     "author": "m6",
+     "ts": "2026-09-24 08:22:06"
+    },
+    {
+     "id": 286,
+     "author": "m1",
+     "ts": "2026-09-24 10:08:29"
+    },
+    {
+     "id": 287,
+     "author": "m1",
+     "ts": "2026-09-24 14:37:39"
+    },
+    {
+     "id": 288,
+     "author": "m1",
+     "ts": "2026-09-24 14:42:04"
+    },
+    {
+     "id": 289,
+     "author": "m1",
+     "ts": "2026-09-24 15:34:13"
+    },
+    {
+     "id": 290,
+     "author": "m1",
+     "ts": "2026-09-24 15:37:32"
+    },
+    {
+     "id": 291,
+     "author": "m1",
+     "ts": "2026-09-24 15:55:39"
+    },
+    {
+     "id": 292,
+     "author": "m1",
+     "ts": "2026-09-24 16:24:50"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-24 08:03:34"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-24 08:04:42"
+    },
+    {
+     "author": "m7",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-24 08:12:05"
+    },
+    {
+     "author": "m6",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-24 08:13:43"
+    },
+    {
+     "author": "m3",
+     "action": "verdict",
+     "from_v": "pass",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-24 08:18:07"
+    },
+    {
+     "author": "m2",
+     "action": "verdict",
+     "from_v": "object",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-24 08:19:18"
+    },
+    {
+     "author": "m6",
+     "action": "verdict",
+     "from_v": "object",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-24 08:22:13"
+    },
+    {
+     "author": "m7",
+     "action": "verdict",
+     "from_v": "object",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-24 08:24:55"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 1,
+     "ts": "2026-09-24 08:24:55"
+    }
+   ]
+  },
+  {
+   "id": 28,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [
+    "m2",
+    "m3",
+    "m7",
+    "m6"
+   ],
+   "comments": [
+    {
+     "id": 293,
+     "author": "m1",
+     "ts": "2026-09-26 00:46:21"
+    },
+    {
+     "id": 294,
+     "author": "m3",
+     "ts": "2026-09-26 00:48:49"
+    },
+    {
+     "id": 295,
+     "author": "m2",
+     "ts": "2026-09-26 00:50:23"
+    },
+    {
+     "id": 296,
+     "author": "m7",
+     "ts": "2026-09-26 00:52:16"
+    },
+    {
+     "id": 297,
+     "author": "m6",
+     "ts": "2026-09-26 01:14:45"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-26 00:48:56"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-26 00:50:25"
+    },
+    {
+     "author": "m7",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-26 01:11:56"
+    },
+    {
+     "author": "m6",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-26 01:14:54"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 1,
+     "ts": "2026-09-26 01:14:54"
+    }
+   ]
+  },
+  {
+   "id": 29,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [
+    "m2",
+    "m3",
+    "m7",
+    "m6"
+   ],
+   "comments": [
+    {
+     "id": 298,
+     "author": "m1",
+     "ts": "2026-09-26 01:46:20"
+    },
+    {
+     "id": 299,
+     "author": "m2",
+     "ts": "2026-09-26 01:50:51"
+    },
+    {
+     "id": 300,
+     "author": "m7",
+     "ts": "2026-09-26 01:53:06"
+    },
+    {
+     "id": 301,
+     "author": "m6",
+     "ts": "2026-09-26 01:54:52"
+    },
+    {
+     "id": 302,
+     "author": "m1",
+     "ts": "2026-09-26 01:59:14"
+    },
+    {
+     "id": 303,
+     "author": "m1",
+     "ts": "2026-09-26 02:13:07"
+    },
+    {
+     "id": 304,
+     "author": "m1",
+     "ts": "2026-09-26 03:22:53"
+    },
+    {
+     "id": 305,
+     "author": "m1",
+     "ts": "2026-09-26 10:29:03"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-26 01:48:06"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-26 01:50:51"
+    },
+    {
+     "author": "m6",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-26 01:54:53"
+    },
+    {
+     "author": "m7",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-26 01:57:28"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 1,
+     "ts": "2026-09-26 01:57:28"
+    }
+   ]
+  },
+  {
+   "id": 30,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [
+    "m2",
+    "m3",
+    "m7",
+    "m6"
+   ],
+   "comments": [
+    {
+     "id": 306,
+     "author": "m1",
+     "ts": "2026-09-27 12:41:21"
+    },
+    {
+     "id": 307,
+     "author": "m4",
+     "ts": "2026-09-27 12:51:32"
+    },
+    {
+     "id": 308,
+     "author": "m3",
+     "ts": "2026-09-27 13:03:42"
+    },
+    {
+     "id": 309,
+     "author": "m5",
+     "ts": "2026-09-27 13:05:03"
+    },
+    {
+     "id": 310,
+     "author": "m5",
+     "ts": "2026-09-27 13:05:32"
+    },
+    {
+     "id": 311,
+     "author": "m1",
+     "ts": "2026-09-27 13:06:13"
+    },
+    {
+     "id": 312,
+     "author": "m2",
+     "ts": "2026-09-27 13:06:52"
+    },
+    {
+     "id": 313,
+     "author": "m7",
+     "ts": "2026-09-27 13:10:11"
+    },
+    {
+     "id": 314,
+     "author": "m6",
+     "ts": "2026-09-27 13:15:05"
+    },
+    {
+     "id": 315,
+     "author": "m3",
+     "ts": "2026-09-27 13:22:02"
+    },
+    {
+     "id": 316,
+     "author": "m2",
+     "ts": "2026-09-27 13:23:26"
+    },
+    {
+     "id": 317,
+     "author": "m1",
+     "ts": "2026-09-27 13:24:22"
+    },
+    {
+     "id": 318,
+     "author": "m7",
+     "ts": "2026-09-27 13:25:27"
+    },
+    {
+     "id": 319,
+     "author": "m6",
+     "ts": "2026-09-27 13:26:38"
+    },
+    {
+     "id": 320,
+     "author": "m3",
+     "ts": "2026-09-27 13:41:38"
+    },
+    {
+     "id": 321,
+     "author": "m1",
+     "ts": "2026-09-27 13:41:55"
+    },
+    {
+     "id": 322,
+     "author": "m2",
+     "ts": "2026-09-27 13:42:54"
+    },
+    {
+     "id": 323,
+     "author": "m7",
+     "ts": "2026-09-27 13:44:58"
+    },
+    {
+     "id": 324,
+     "author": "m6",
+     "ts": "2026-09-27 13:46:38"
+    },
+    {
+     "id": 325,
+     "author": "m1",
+     "ts": "2026-09-27 14:01:46"
+    },
+    {
+     "id": 326,
+     "author": "m1",
+     "ts": "2026-09-27 14:02:50"
+    },
+    {
+     "id": 327,
+     "author": "m6",
+     "ts": "2026-09-27 14:02:57"
+    },
+    {
+     "id": 328,
+     "author": "m2",
+     "ts": "2026-09-27 14:41:28"
+    },
+    {
+     "id": 329,
+     "author": "m7",
+     "ts": "2026-09-27 14:44:32"
+    },
+    {
+     "id": 330,
+     "author": "m6",
+     "ts": "2026-09-27 14:45:45"
+    },
+    {
+     "id": 331,
+     "author": "m1",
+     "ts": "2026-09-27 14:51:03"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-27 13:03:51"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-27 13:06:57"
+    },
+    {
+     "author": "m6",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-27 13:15:14"
+    },
+    {
+     "author": "m7",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-27 13:25:30"
+    },
+    {
+     "author": "m3",
+     "action": "verdict",
+     "from_v": "object",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-27 13:41:27"
+    },
+    {
+     "author": "m2",
+     "action": "verdict",
+     "from_v": "object",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-27 13:42:50"
+    },
+    {
+     "author": "m6",
+     "action": "verdict",
+     "from_v": "object",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-27 14:45:39"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 1,
+     "ts": "2026-09-27 14:45:39"
+    }
+   ]
+  },
+  {
+   "id": 31,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [
+    "m2",
+    "m3",
+    "m7",
+    "m6"
+   ],
+   "comments": [
+    {
+     "id": 332,
+     "author": "m1",
+     "ts": "2026-09-27 15:04:22"
+    },
+    {
+     "id": 333,
+     "author": "m1",
+     "ts": "2026-09-27 15:06:51"
+    },
+    {
+     "id": 334,
+     "author": "m4",
+     "ts": "2026-09-27 15:15:07"
+    },
+    {
+     "id": 335,
+     "author": "m5",
+     "ts": "2026-09-27 15:18:38"
+    },
+    {
+     "id": 336,
+     "author": "m5",
+     "ts": "2026-09-27 15:19:28"
+    },
+    {
+     "id": 337,
+     "author": "m2",
+     "ts": "2026-09-27 15:28:03"
+    },
+    {
+     "id": 338,
+     "author": "m1",
+     "ts": "2026-09-27 15:28:40"
+    },
+    {
+     "id": 339,
+     "author": "m7",
+     "ts": "2026-09-27 15:30:33"
+    },
+    {
+     "id": 340,
+     "author": "m8",
+     "ts": "2026-09-27 15:30:53"
+    },
+    {
+     "id": 341,
+     "author": "m1",
+     "ts": "2026-09-27 15:33:16"
+    },
+    {
+     "id": 342,
+     "author": "m2",
+     "ts": "2026-09-27 15:45:34"
+    },
+    {
+     "id": 343,
+     "author": "m7",
+     "ts": "2026-09-27 15:46:41"
+    },
+    {
+     "id": 344,
+     "author": "m6",
+     "ts": "2026-09-27 15:56:30"
+    },
+    {
+     "id": 345,
+     "author": "m1",
+     "ts": "2026-09-27 16:47:23"
+    },
+    {
+     "id": 346,
+     "author": "m1",
+     "ts": "2026-09-27 16:52:29"
+    },
+    {
+     "id": 347,
+     "author": "m2",
+     "ts": "2026-09-27 16:54:45"
+    },
+    {
+     "id": 348,
+     "author": "m7",
+     "ts": "2026-09-27 16:56:01"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-27 15:26:27"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "object",
+     "revision": 1,
+     "ts": "2026-09-27 15:28:04"
+    },
+    {
+     "author": "m7",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-27 15:30:38"
+    },
+    {
+     "author": "m3",
+     "action": "verdict",
+     "from_v": "object",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-27 15:45:00"
+    },
+    {
+     "author": "m2",
+     "action": "verdict",
+     "from_v": "object",
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-27 15:45:35"
+    },
+    {
+     "author": "m6",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-27 15:56:19"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 1,
+     "ts": "2026-09-27 15:56:19"
+    }
+   ]
+  },
+  {
+   "id": 32,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [
+    "m2",
+    "m3",
+    "m7",
+    "m6"
+   ],
+   "comments": [
+    {
+     "id": 349,
+     "author": "m8",
+     "ts": "2026-09-30 15:40:32"
+    },
+    {
+     "id": 350,
+     "author": "m3",
+     "ts": "2026-09-30 16:04:25"
+    },
+    {
+     "id": 351,
+     "author": "m2",
+     "ts": "2026-09-30 16:06:18"
+    },
+    {
+     "id": 352,
+     "author": "m7",
+     "ts": "2026-09-30 16:08:06"
+    },
+    {
+     "id": 353,
+     "author": "m6",
+     "ts": "2026-09-30 16:09:01"
+    },
+    {
+     "id": 354,
+     "author": "m8",
+     "ts": "2026-09-30 16:10:56"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-30 16:04:31"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-30 16:06:19"
+    },
+    {
+     "author": "m7",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-30 16:08:10"
+    },
+    {
+     "author": "m6",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-30 16:09:03"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 1,
+     "ts": "2026-09-30 16:09:03"
+    }
+   ]
+  },
+  {
+   "id": 33,
+   "status": "resolved",
+   "revision": 1,
+   "quorum": [
+    "m2",
+    "m3",
+    "m7",
+    "m6"
+   ],
+   "comments": [
+    {
+     "id": 355,
+     "author": "m8",
+     "ts": "2026-09-30 16:47:21"
+    },
+    {
+     "id": 356,
+     "author": "m8",
+     "ts": "2026-09-30 17:48:39"
+    },
+    {
+     "id": 357,
+     "author": "m8",
+     "ts": "2026-09-30 18:00:55"
+    },
+    {
+     "id": 358,
+     "author": "m8",
+     "ts": "2026-09-30 18:06:42"
+    },
+    {
+     "id": 359,
+     "author": "m3",
+     "ts": "2026-09-30 18:11:11"
+    },
+    {
+     "id": 360,
+     "author": "m2",
+     "ts": "2026-09-30 18:12:01"
+    },
+    {
+     "id": 361,
+     "author": "m7",
+     "ts": "2026-09-30 18:13:40"
+    },
+    {
+     "id": 362,
+     "author": "m6",
+     "ts": "2026-10-02 12:49:07"
+    },
+    {
+     "id": 363,
+     "author": "m8",
+     "ts": "2026-10-02 12:53:06"
+    }
+   ],
+   "verdict_events": [
+    {
+     "author": "m3",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-30 18:11:13"
+    },
+    {
+     "author": "m2",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-30 18:12:02"
+    },
+    {
+     "author": "m7",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-09-30 18:13:43"
+    },
+    {
+     "author": "m6",
+     "action": "verdict_free",
+     "from_v": null,
+     "to_v": "pass",
+     "revision": 1,
+     "ts": "2026-10-02 12:49:07"
+    },
+    {
+     "author": "system",
+     "action": "auto_resolve",
+     "from_v": null,
+     "to_v": null,
+     "revision": 1,
+     "ts": "2026-10-02 12:51:55"
+    }
+   ]
+  }
+ ]
+}

@@ -326,6 +326,13 @@ board back automatically. Uninstall the service with `systemctl --user
 disable --now review-board && rm ~/.config/systemd/user/review-board.service
 && systemctl --user daemon-reload`.
 
+**Failure notices (v2.5)** — copy
+[`systemd/rb-notify@.service`](systemd/rb-notify@.service) alongside the
+unit and `daemon-reload`; the unit carries `OnFailure=rb-notify@%n.service`,
+which appends one line to `~/rb-failure.log` each time the board dies, so an
+outage leaves a trace outside journald. The `/attention` probe also exposes
+`uptime_secs` and an `errors` counter for lightweight liveness checks.
+
 **Windows (no WSL)** — the equivalent is Task Scheduler (field-tested,
 Git Bash spell):
 
@@ -413,7 +420,7 @@ mcp-review-board/
   docs/self-review.md# the board-reviewed-itself case, with thread ids & commits
   configs/           # member onboarding kit: config templates + watcher shapes
   data/              # SQLite db (WAL; gitignored)
-  test_cap.py + test_v2_stage1-6.py   # 7 regression suites (stage6: profile semantics + behavior invariants)
+  test_cap.py + test_v2_stage1-7.py + test_replay_stale.py   # 9 regression suites (stage7: v2.5 stale/budget/wake faces; replay: history acceptance)
   DESIGN-V2.md       # sealed v2 design spec (+ appendices D/E)
   PLAN-V2.2.md       # v2.2 plan (rev2, finalized by thread #11)
 ```

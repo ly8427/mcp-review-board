@@ -20,8 +20,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -162,7 +164,7 @@ SUSPEND_AFTER_HOURS = 24
 
 
 # --- v2 A1: participant registry / heartbeat --------------------------------
-mcp = FastMCP("ReviewBoard", version="2.4.2")  # align serverInfo with pyproject (was: fastmcp lib version)
+mcp = FastMCP("ReviewBoard", version="2.5.0")  # align serverInfo with pyproject (was: fastmcp lib version)
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -215,7 +217,7 @@ def _is_active(last_seen: str | None, now: datetime | None = None) -> bool:
 
 
 # --- v2 A2: the protocol ----------------------------------------------------
-PROTOCOL_VERSION = "2.4"
+PROTOCOL_VERSION = "2.5"
 PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 
 ## 成员
@@ -235,7 +237,7 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 
 ## 讨论帖
 - review 帖建议传 quorum 并在 context 写明对象/目的;发言表态后须落判定。
-- 预算默认 20/人/线程(发帖+回复+计费翻转共享);线程总上限 {THREAD_CAP} 条。
+- 预算默认 20/人/线程(发帖+回复+计费翻转共享;**朝收敛的 object→pass 翻转免费且不受闸**——v2.5:计费硬闸曾把预算耗尽的成员锁死在无法认错的位置);线程总上限 {THREAD_CAP} 条。
 - 建帖每日上限(按 author)不含 quorum 评审帖(v2.3 豁免:评审义务不应被发帖配额阻塞;
   free 帖维持原上限)。
 - resolved 帖不触发回应义务;非 quorum 发言 = advisory(可说服、不可计票)。
@@ -471,6 +473,68 @@ def _author_usage(conn: sqlite3.Connection, thread_id: int, author: str) -> int:
         (thread_id, author),
     ).fetchone()[0]
     return n + v
+
+
+# --- v2.5 (thread #33): verdict-staleness detection --------------------------
+# PINNED RULE (replay-reproducible, see test_replay_stale.py; pi #362 demanded
+# the timing definition be written down): a quorum member is STALE iff their
+# CURRENT standing verdict is 'object' AND >= STALE_MIN_FOLLOWUP of their OWN
+# comments landed strictly after the object landed (verdicts.updated_at of the
+# standing row; a re-verdict resets the window by moving it). OWN posts, not
+# others': others' posts already wake the holder via new_comments — the #30
+# blind spot was precisely the holder talking (text-pass) while the vote
+# stayed object. This rule fires first at #324 on the #30 replay.
+STALE_MIN_FOLLOWUP = 2
+
+
+def _stale_holders_pure(quorum, verdicts, verdict_updated, own_comments):
+    """Decision core shared by every read face (single implementation, dsh
+    #351) and by the replay tests — the faces and the tests cannot drift.
+    verdicts: {member: verdict}; verdict_updated: {member: landing ts of the
+    member's CURRENT standing verdict}; own_comments: {member: [ts, ...]}."""
+    holders = []
+    for m in quorum:
+        if verdicts.get(m) == "object":
+            landed = verdict_updated.get(m, "9999")
+            if sum(1 for ts in own_comments.get(m, []) if ts > landed) >= STALE_MIN_FOLLOWUP:
+                holders.append(m)
+    return holders
+
+
+def _stale_object_holders(conn: sqlite3.Connection, thread_id: int) -> list[str]:
+    t = conn.execute("SELECT quorum FROM threads WHERE id=?", (thread_id,)).fetchone()
+    if t is None or not t["quorum"]:
+        return []
+    names = json.loads(t["quorum"])
+    verdicts, updated, own = {}, {}, {}
+    for r in conn.execute(
+        "SELECT author, verdict, updated_at FROM verdicts WHERE thread_id=?",
+        (thread_id,),
+    ).fetchall():
+        verdicts[r["author"]] = r["verdict"]
+        updated[r["author"]] = r["updated_at"]
+    for r in conn.execute(
+        "SELECT author, created_at FROM comments WHERE thread_id=?", (thread_id,)
+    ).fetchall():
+        own.setdefault(r["author"], []).append(r["created_at"])
+    return _stale_holders_pure(names, verdicts, updated, own)
+
+
+# v2.5 (thread #33 B-1): the ONE @handle test — word-boundary match, so
+# "@ping" no longer hits member "pi". Shared by the MCP poll header and the
+# /attention probe; per-callsite substring tests were how the bug stayed
+# latent (dsh #351: one semantic, one implementation).
+_MENTION_RE: dict[str, "re.Pattern[str]"] = {}
+
+
+def _mentioned(body: str | None, author: str) -> bool:
+    if not body:
+        return False
+    pat = _MENTION_RE.get(author)
+    if pat is None:
+        pat = re.compile(rf"(?<![A-Za-z0-9_\-])@{re.escape(author)}(?![A-Za-z0-9_\-])")
+        _MENTION_RE[author] = pat
+    return pat.search(body) is not None
 
 
 # --- v2 A5 (3a)+v2.1: two-tier identity / tokens (two-phase lifecycle) -------
@@ -754,6 +818,23 @@ def create_thread(
     )
 
 
+def _stale_receipt_note(conn: sqlite3.Connection, thread_id: int) -> str:
+    """post/reply receipt addendum (thread #33 form c — free byproduct of the
+    same computation): surface a standing stale object at the source, to the
+    poster, in the same transaction as their comment."""
+    open_q = conn.execute(
+        "SELECT 1 FROM threads WHERE id=? AND status='open' AND quorum IS NOT NULL",
+        (thread_id,),
+    ).fetchone()
+    if not open_q:
+        return ""
+    holders = _stale_object_holders(conn, thread_id)
+    if not holders:
+        return ""
+    return (f" ⚠ verdict_stale: {holders} keep posting over a standing object —"
+            f" the thread cannot converge until they re-vote (set_verdict).")
+
+
 @mcp.tool
 def post_comment(
     thread_id: int,
@@ -813,11 +894,12 @@ def post_comment(
             (thread_id, author, body, file, line, severity),
         )
         cid = cur.lastrowid
+        stale_note = _stale_receipt_note(conn, thread_id)
     loc = ""
     if file:
         loc = f" at {file}" + (f":{line}" if line else "")
     sev = f" [{severity}]" if severity else ""
-    return f"Posted comment #{cid} in thread #{thread_id} by {author}{sev}{loc}."
+    return f"Posted comment #{cid} in thread #{thread_id} by {author}{sev}{loc}.{stale_note}"
 
 
 @mcp.tool
@@ -870,7 +952,8 @@ def reply_comment(comment_id: int, author: str, body: str) -> str:
             (row["thread_id"], comment_id, author, body),
         )
         cid = cur.lastrowid
-    return f"Posted reply #{cid} to comment #{comment_id} by {author}."
+        stale_note = _stale_receipt_note(conn, row["thread_id"])
+    return f"Posted reply #{cid} to comment #{comment_id} by {author}.{stale_note}"
 
 
 @mcp.tool
@@ -890,22 +973,33 @@ def list_threads(status: str | None = None) -> str:
     with db() as conn:
         if status == "all":
             rows = conn.execute(
-                """SELECT t.id, t.title, t.status, t.created_at,
+                """SELECT t.id, t.title, t.status, t.created_at, t.quorum,
                           (SELECT COUNT(*) FROM comments c WHERE c.thread_id = t.id) AS n
                    FROM threads t ORDER BY t.id DESC"""
             ).fetchall()
         else:
             rows = conn.execute(
-                """SELECT t.id, t.title, t.status, t.created_at,
+                """SELECT t.id, t.title, t.status, t.created_at, t.quorum,
                           (SELECT COUNT(*) FROM comments c WHERE c.thread_id = t.id) AS n
                    FROM threads t WHERE t.status=? ORDER BY t.id DESC""",
                 (status,),
             ).fetchall()
+        # thread #33 thread-level read face (dsh #351): the marker must be
+        # visible to readers NOT in the quorum (the host included) — an
+        # author-scoped signal alone would inherit #30's "nobody is woken
+        # to look at it" property.
+        stale_by_id: dict[int, list[str]] = {}
+        for r in rows:
+            if r["status"] == "open" and r["quorum"]:
+                holders = _stale_object_holders(conn, r["id"])
+                if holders:
+                    stale_by_id[r["id"]] = holders
     if not rows:
         return f"No threads with status '{status}'."
     lines = ["Threads:"]
     for r in rows:
-        lines.append(f"  #{r['id']} [{r['status']}] {r['title']}  ({r['n']} comments, {r['created_at']})")
+        flag = f"  ⚠ stale-object:{stale_by_id[r['id']]}" if r["id"] in stale_by_id else ""
+        lines.append(f"  #{r['id']} [{r['status']}] {r['title']}  ({r['n']} comments, {r['created_at']}){flag}")
     return "\n".join(lines)
 
 
@@ -928,10 +1022,30 @@ def get_thread(thread_id: int) -> str:
             """SELECT * FROM comments WHERE thread_id=? ORDER BY created_at ASC""",
             (thread_id,),
         ).fetchall()
-        usage_rows = conn.execute(
-            "SELECT author, COUNT(*) AS c FROM comments WHERE thread_id=? GROUP BY author",
-            (thread_id,),
-        ).fetchall()
+        # v2.5 (thread #33 ④-1, dsh): _author_usage is the ONLY usage
+        # computation (comments + costed flips) — no second GROUP BY face.
+        # The old comments-only display diverged from the real quota exactly
+        # when budget pressure mattered most. Falsifiable (dsh): the header
+        # must equal _author_usage for every author.
+        authors = {
+            r["author"] for r in conn.execute(
+                "SELECT DISTINCT author FROM comments WHERE thread_id=?", (thread_id,)
+            ).fetchall()
+        } | {
+            r["author"] for r in conn.execute(
+                "SELECT DISTINCT author FROM verdict_events"
+                " WHERE thread_id=? AND action='verdict' AND costed=1", (thread_id,)
+            ).fetchall()
+        }
+        usage = " · ".join(
+            f"{a} {_author_usage(conn, thread_id, a)}/{t['per_author_budget']}"
+            for a in sorted(authors)
+        )
+        stale = (
+            _stale_object_holders(conn, thread_id)
+            if t["quorum"] and t["status"] == "open"
+            else []
+        )
     out = [
         f"Thread #{t['id']}: {t['title']}  [{t['status']}]",
         f"  created: {t['created_at']}   comments: {len(all_comments)}/{THREAD_CAP}",
@@ -941,8 +1055,8 @@ def get_thread(thread_id: int) -> str:
             names = json.loads(t["quorum"])
         except (ValueError, TypeError):
             names = []
-        usage = " · ".join(f"{r['author']} {r['c']}/{t['per_author_budget']}" for r in usage_rows)
-        out.append(f"  quorum: {names}   revision: {t['revision']}   budget: {usage or '—'}")
+        stale_flag = f"   ⚠ stale-object: {stale}" if stale else ""
+        out.append(f"  quorum: {names}   revision: {t['revision']}   budget: {usage or '—'}{stale_flag}")
 
     by_parent: dict[int | None, list[sqlite3.Row]] = {}
     for c in all_comments:
@@ -1070,8 +1184,11 @@ def set_verdict(
     Rules (DESIGN-V2 A5 + thread #8 conditions):
     - Only quorum members may vote here; others are rejected outright.
     - 'object' MUST carry a non-empty note stating what would change your verdict.
-    - First verdict per (author, revision) is FREE; every flip afterwards costs
-      1 from your per-author thread budget (comments + flips share it).
+    - First verdict per (author, revision) is FREE; object→pass flips toward
+      convergence are FREE too (v2.5, thread #33: the old hard gate locked a
+      budget-exhausted member out of exactly the action that fixes a stale
+      object); other flips cost 1 from your per-author thread budget
+      (comments + flips share it).
     - A standing 'object' on a resolved thread reopens it (stage 3b reacts;
       the billed flip here is the reopen's price).
 
@@ -1110,12 +1227,22 @@ def set_verdict(
             " AND revision=? AND action IN ('verdict','verdict_free') LIMIT 1",
             (thread_id, author, revision),
         ).fetchone() is None
-        costed = 0 if first_for_revision else 1
+        # v2.5 (thread #33 ④-3): object→pass flips toward convergence are FREE
+        # and never budget-gated — #30's fix action was a late flip, and the
+        # verdict_stale detector above would otherwise wake a member the gate
+        # then rejects (signal loop that cannot close).
+        convergence_flip = (
+            cur_row is not None and cur_row["verdict"] == "object" and verdict == "pass"
+        )
+        costed = 0 if (first_for_revision or convergence_flip) else 1
         if costed and _author_usage(conn, thread_id, author) >= t["per_author_budget"]:
             return (
                 f"ERROR: {author} reached the per-author budget "
-                f"({t['per_author_budget']}) in thread #{thread_id} — flips are billed. "
-                "Conclude via set_status (wontfix escalates to the human)."
+                f"({t['per_author_budget']}) in thread #{thread_id}. "
+                "An object→pass flip toward convergence is free and still allowed; "
+                "otherwise ask the creator to bump_revision (clears all verdicts, "
+                "re-votes are free) or escalate to the human (wontfix requires "
+                "human_override)."
             )
         conn.execute(
             "INSERT INTO verdicts(thread_id, author, verdict, note, updated_at)"
@@ -1128,9 +1255,9 @@ def set_verdict(
                thread_id=thread_id, from_v=from_v, to_v=verdict,
                revision=revision, costed=costed, note=note)
         recompute_thread(conn, thread_id)  # 3b state machine (no-op-safe)
+        tail = " (free)" if (first_for_revision or convergence_flip) else " (billed 1)"
         return (
-            f"Verdict recorded: {author} → {verdict}"
-            f"{'' if first_for_revision else ' (billed 1)'} on thread #{thread_id}"
+            f"Verdict recorded: {author} → {verdict}{tail} on thread #{thread_id}"
             f" rev {revision}."
         )
 
@@ -1140,8 +1267,10 @@ def bump_revision(thread_id: int, author: str, token: str | None = None) -> str:
     """Creator-only: bump the thread's revision, clearing ALL verdicts (G2).
 
     Use after revising the artifact under review — stale passes must not
-    auto-resolve a new revision. Costs 1 budget. Every quorum member must
-    re-vote (their first verdict on the new revision is free).
+    auto-resolve a new revision. Every quorum member must re-vote (their
+    first verdict on the new revision is free). v2.5 (thread #33 ④, pi):
+    budget-exempt — bump is the ONLY primitive that clears stale verdicts,
+    so the budget gate must never lock the creator out of it.
 
     Args:
         thread_id: the thread.
@@ -1158,14 +1287,12 @@ def bump_revision(thread_id: int, author: str, token: str | None = None) -> str:
             return f"ERROR: bump_revision is creator-only (creator: {t['author']!r})"
         if not _token_ok(conn, author, token):
             return "ERROR: missing/invalid governance token — claim_token first"
-        if _author_usage(conn, thread_id, author) >= t["per_author_budget"]:
-            return f"ERROR: {author} reached the per-author budget in thread #{thread_id}."
         new_rev = (t["revision"] or 1) + 1
         conn.execute("UPDATE threads SET revision=? WHERE id=?", (new_rev, thread_id))
         conn.execute("DELETE FROM verdicts WHERE thread_id=?", (thread_id,))
         _audit(conn, author, "bump_revision", thread_id=thread_id,
-               revision=new_rev, costed=1,
-               note="all verdicts cleared; re-vote required")
+               revision=new_rev, costed=0,
+               note="all verdicts cleared; re-vote required; budget-exempt (v2.5)")
         recompute_thread(conn, thread_id)
         return (
             f"Revision bumped to {new_rev} on thread #{thread_id}; all verdicts "
@@ -1343,8 +1470,11 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
     {new_comments, mentions_me[{thread_id,comment_id}], awaiting_my_verdict,
     open_threads} — idle polls can act on the header alone without reading
     threads (cost model §4). awaiting_my_verdict is a REAL list when `author`
-    is passed (open ∧ non-wontfix ∧ quorum ∧ no verdict yet on the current
-    revision ∧ active); the "not_implemented" sentinel appears ONLY when
+    is passed (open ∧ non-wontfix ∧ quorum ∧ no verdict row at all ∧ active —
+    bump_revision clears every row in the same transaction, so "no row" is
+    revision-equivalent by construction, pi #362 pinned this; /attention's
+    my_verdicts field disambiguates "bumped, re-vote" from "never voted");
+    the "not_implemented" sentinel appears ONLY when
     author is omitted (dsh #89 minor-5: the old text claimed the field was
     unimplemented — members following it would ignore their top-priority
     signal).
@@ -1383,11 +1513,10 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
             )
     mentions = []
     if author:
-        marker = f"@{author}"
         mentions = [
             {"thread_id": r["thread_id"], "comment_id": r["id"]}
             for r in rows
-            if marker in (r["body"] or "")
+            if _mentioned(r["body"], author)
         ]
     awaiting: list | str
     with _connect() as conn:
@@ -1893,7 +2022,11 @@ def _board_html() -> str:
 async def ping(request: Request):
     """Health/liveness endpoint (Glama listing check + generic watchers):
     plain 200 as long as the process serves — no auth, no db touch."""
-    return JSONResponse({"status": "ok", "version": "2.4.2"})
+    return JSONResponse({"status": "ok", "version": "2.5.0"})
+
+
+_STARTED_AT = time.time()  # v2.5 observability: /attention uptime face
+_PROBE_ERRORS = 0          # probe-path exception counter (best-effort; no heavy monitoring)
 
 
 @mcp.custom_route("/attention", methods=["GET"])
@@ -1905,64 +2038,116 @@ async def attention_probe(request: Request):
     MCP polls (touch + C' unfreeze recompute, single SQLite write txn, idempotent).
     C3: NEVER advances last_read — the signal stays level-triggered (attention
     stays 1 across wake failures until list_comments_since actually delivers).
-    Returns {"attention": 0|1, "reason": ..., "threads": [...], "open_threads":
-    [...]} — open_threads lists the author's open quorum thread ids (batch 1,
-    thread #22 #5: lets a bound watcher notice "my thread resolved" and stop
-    by itself, no push needed).
+
+    v2.5 (thread #33) response and semantics:
+    - "reason": "verdict_stale" — the prober's standing object has >=2 of
+      their OWN newer comments (priority: awaiting > stale > mention > new).
+    - "budget": {tid: {used, cap}} — the REAL quota face (comments + costed
+      flips), the same _author_usage the gates use.
+    - "my_verdicts": {tid: {verdict, revision}} — lets a member tell
+      "bumped, re-vote" from "never voted" (awaiting alone cannot).
+    - "uptime_secs" / "errors" — liveness faces for the watcher kit.
+    - The prober's OWN comments are excluded from the undelivered scan
+      (B-2, relocated server-side — the watcher payload never carried
+      comment authors, so watcher-side filtering was impossible): a
+      member's own post must not re-raise their attention; others'
+      comments still wake them. list_comments_since (the read face) still
+      returns own comments untouched, and last_read semantics are
+      unchanged (C3 single write point).
     """
     author = request.query_params.get("author")
     if not author:
         return JSONResponse({"error": "author query param required"}, status_code=400)
-    with db() as conn:
-        heartbeat_and_recompute(conn, author)
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT last_read FROM participants WHERE author=?", (author,)
-        ).fetchone()
-        cutoff = (row["last_read"] if row and row["last_read"] else "1970-01-01 00:00:00")
-        open_quorum = [
-            r["id"]
-            for r in conn.execute(
-                "SELECT id, quorum FROM threads WHERE status='open' AND quorum IS NOT NULL"
+    global _PROBE_ERRORS
+    try:
+        with db() as conn:
+            heartbeat_and_recompute(conn, author)
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT last_read FROM participants WHERE author=?", (author,)
+            ).fetchone()
+            cutoff = (row["last_read"] if row and row["last_read"] else "1970-01-01 00:00:00")
+            open_quorum = [
+                r["id"]
+                for r in conn.execute(
+                    "SELECT id, quorum FROM threads WHERE status='open' AND quorum IS NOT NULL"
+                ).fetchall()
+                if author in json.loads(r["quorum"])
+            ]
+            awaiting = [
+                tid for tid in open_quorum
+                if conn.execute(
+                    "SELECT 1 FROM verdicts WHERE thread_id=? AND author=? LIMIT 1",
+                    (tid, author),
+                ).fetchone() is None
+            ]
+            # v2.5 (thread #33): the holder's OWN continued posting over a standing
+            # object wakes them to reconsider — priority BELOW awaiting_verdict
+            # (an uncast vote outranks a stale one), ABOVE mentions/new_comments.
+            stale_self = [
+                tid for tid in open_quorum
+                if author in _stale_object_holders(conn, tid)
+            ]
+            # v2.5 (thread #33 ④-1): the real quota face — members were billed
+            # blind; the only visible number was comments-only (wrong face).
+            budget_face = {}
+            my_state = {}
+            for tid in open_quorum:
+                trow = conn.execute(
+                    "SELECT per_author_budget, revision FROM threads WHERE id=?", (tid,)
+                ).fetchone()
+                v = conn.execute(
+                    "SELECT verdict FROM verdicts WHERE thread_id=? AND author=?",
+                    (tid, author),
+                ).fetchone()
+                budget_face[str(tid)] = {
+                    "used": _author_usage(conn, tid, author),
+                    "cap": trow["per_author_budget"],
+                }
+                my_state[str(tid)] = {
+                    "verdict": v["verdict"] if v else None,
+                    "revision": trow["revision"],
+                }
+            undelivered = conn.execute(
+                "SELECT thread_id, id, body FROM comments"
+                " WHERE created_at > ? AND author != ? ORDER BY id",
+                (cutoff, author),
             ).fetchall()
-            if author in json.loads(r["quorum"])
-        ]
-        awaiting = [
-            tid for tid in open_quorum
-            if conn.execute(
-                "SELECT 1 FROM verdicts WHERE thread_id=? AND author=? LIMIT 1",
-                (tid, author),
-            ).fetchone() is None
-        ]
-        marker = f"@{author}"
-        undelivered = conn.execute(
-            "SELECT thread_id, id, body FROM comments WHERE created_at > ? ORDER BY id",
-            (cutoff,),
-        ).fetchall()
-        mention_threads = sorted({r["thread_id"] for r in undelivered if marker in (r["body"] or "")})
-    if awaiting:
-        reason, threads = "awaiting_verdict", awaiting
-    elif mention_threads:
-        reason, threads = "mentioned", mention_threads
-    elif undelivered:
-        reason, threads = "new_comments", sorted({r["thread_id"] for r in undelivered})
-    else:
-        reason, threads = "idle", []
-    return JSONResponse({
-        "attention": 1 if reason != "idle" else 0,
-        "reason": reason,
-        "threads": threads,
-        "open_threads": open_quorum,
-        # thread #31 batch A: effective cutoff (NULL→epoch sentinel, the same
-        # value the probe itself uses above) for the watcher delivery judgment
-        # (delivered = fingerprint moved OR last_read advanced). Advanced ONLY
-        # by list_comments_since(author) — never by this probe (C3, single
-        # write point), so a watcher cannot fake its own member's delivery.
-        "last_read": cutoff,
-        "board_id": BOARD_INSTANCE_ID,  # stable instance identity (thread #27):
-        # a watcher pinned to EXPECTED_BOARD_ID can detect that this port now
-        # serves a DIFFERENT board and refuse to wake members against it.
-    })
+            mention_threads = sorted(
+                {r["thread_id"] for r in undelivered if _mentioned(r["body"], author)}
+            )
+        if awaiting:
+            reason, threads = "awaiting_verdict", awaiting
+        elif stale_self:
+            reason, threads = "verdict_stale", stale_self
+        elif mention_threads:
+            reason, threads = "mentioned", mention_threads
+        elif undelivered:
+            reason, threads = "new_comments", sorted({r["thread_id"] for r in undelivered})
+        else:
+            reason, threads = "idle", []
+        return JSONResponse({
+            "attention": 1 if reason != "idle" else 0,
+            "reason": reason,
+            "threads": threads,
+            "open_threads": open_quorum,
+            "budget": budget_face,
+            "my_verdicts": my_state,
+            # thread #31 batch A: effective cutoff (NULL→epoch sentinel, the same
+            # value the probe itself uses above) for the watcher delivery judgment
+            # (delivered = fingerprint moved OR last_read advanced). Advanced ONLY
+            # by list_comments_since(author) — never by this probe (C3, single
+            # write point), so a watcher cannot fake its own member's delivery.
+            "last_read": cutoff,
+            "board_id": BOARD_INSTANCE_ID,  # stable instance identity (thread #27):
+            # a watcher pinned to EXPECTED_BOARD_ID can detect that this port now
+            # serves a DIFFERENT board and refuse to wake members against it.
+            "uptime_secs": int(time.time() - _STARTED_AT),
+            "errors": _PROBE_ERRORS,
+        })
+    except Exception:
+        _PROBE_ERRORS += 1
+        raise
 
 
 @mcp.custom_route("/", methods=["GET"])

@@ -18,6 +18,11 @@
 #   Self-stop (needs protocol v2.4): WATCH_THREADS="21,22" — if none of the
 #   bound thread ids appear in any probe's open_threads, the round prints a
 #   notice and exits 3, so your scheduler wrapper can drop the cron job.
+#   v2.5 TEARDOWN CRITERION (thread #33 B-4): if this cron ALSO drives the
+#   wake for the whole board — not only your bound threads — retire it ONLY
+#   when no open quorum thread still depends on wake. Never tear the shared
+#   driver down because ONE thread converged (#33 field incident: retiring a
+#   thread-bound poll took the whole board's wake with it).
 #
 # Configure the wake_* functions below for your members, then:
 #   bash configs/host-watch.sh            # one round
@@ -75,7 +80,7 @@ wake() {
   local gate; gate=$(cat "$fails" 2>/dev/null || echo 0)
   if [ "${gate:-0}" -ge 3 ]; then echo "$(date +%T) $name: gate tripped (3 consecutive fails), skipping"; return 0; fi
   mkdir "$lock" 2>/dev/null || { echo "$(date +%T) $name: wake in flight, skip"; return 0; }
-  local resp att reason threads rc=0 after prc outcome p
+  local resp att reason threads rc=0 after prc outcome p pre_lr post_lr
   resp=$(probe_ok "$pauthor"); p=$?
   [ "$p" = "4" ] && exit 4        # identity mismatch propagates (win-test #11)
   if [ "$p" != "0" ]; then
@@ -84,7 +89,7 @@ wake() {
   fi
   att=$(jatt "$resp")
   if [ "$att" != "1" ]; then echo "$(date +%T) $name: idle"; rmdir "$lock" 2>/dev/null; return 0; fi
-  reason=$(jreason "$resp"); threads=$(jthreads "$resp")
+  reason=$(jreason "$resp"); threads=$(jthreads "$resp"); pre_lr=$(jget last_read "$resp")
   echo "$(date +%T) $name: attention=1 ($reason, threads=$threads) — waking"
   "$wakefn" "$reason" "$threads" > "$STATE_DIR/$name.last.log" 2>&1 || rc=$?
   prc=0; after=$(probe_ok "$pauthor"); p=$?
@@ -101,15 +106,22 @@ wake() {
     [ "$p" = "4" ] && exit 4
     [ "$p" != "0" ] && prc=1
   fi
-  outcome=$(wake_outcome "$rc" "$prc" "$after" "$reason" "$threads")
+  # thread #31 batch A (backported to the repo template in v2.5 — the
+  # deployed copy had it first, a copy-drift instance of exactly what
+  # thread #25 batch B set out to kill): delivery = fingerprint moved OR
+  # last_read advanced (strictly). last_read moves only when the member's
+  # own session polls (C3 single write point), so poll-then-post rounds
+  # bill as delivered instead of failing the F2 known-gap shape.
+  post_lr=$(jget last_read "$after")
+  outcome=$(wake_outcome "$rc" "$prc" "$after" "$reason" "$threads" "$pre_lr" "$post_lr")
   case "$outcome" in
     delivered)
       apply_billing delivered "$fails"
-      echo "$(date +%T) $name: delivered (attention consumed — delivery, not task-completion)" ;;
+      echo "$(date +%T) $name: delivered (fingerprint or last_read $pre_lr→$post_lr — delivery, not task-completion)" ;;
     failed)
       apply_billing failed "$fails"
       local n; n=$(cat "$fails" 2>/dev/null || echo 0)
-      echo "$(date +%T) $name: wake FAILED (rc=$rc, valid probe, attention unchanged after ${WAKE_GRACE_SECS}s grace) ($n/3)"
+      echo "$(date +%T) $name: wake FAILED (rc=$rc, valid probe, attention unchanged, last_read $pre_lr→$post_lr) ($n/3)"
       [ "$n" -ge 3 ] && echo "$(date +%T) $name: gate tripped — stop waking this member (recover: rm $fails)" ;;
     unverified)
       echo "$(date +%T) $name: unverified (post-wake probe failed — delivery unknown; counters untouched)" ;;

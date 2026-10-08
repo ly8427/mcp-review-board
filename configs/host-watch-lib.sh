@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# kit-version: 2.4.1 (drift check: compare with repo copy; update at will)
+# kit-version: 2.5.0 (drift check: compare with repo copy; update at will)
 # host-watch-lib.sh — probe + parse + judge helpers for host-watch.sh.
 # Split out so configs/host-watch-test.sh can source and test them directly
 # (thread #24 / PR #1 review: P2-6 python3 parsing, P3 scenario matrix).
@@ -159,8 +159,11 @@ jopen()    { jget open_threads "$1"; }
 #   exit 0 = delivered (attention fingerprint moved), exit 1 = billed FAILED.
 # Scenarios F1/F2 in host-watch-test.sh pin the semantics edges:
 #   F1 (someone else's comment re-raised attention: fingerprint changed) -> delivered
-#   F2 (the member's OWN comment re-raised it: fingerprint identical)     -> FAILED
-#      (known gap, documented — see header; not a task-completion judge)
+#   F2 (identical fingerprint, cursor frozen)                              -> FAILED
+#      (v2.5: the member's-own-comment re-raise shape is now prevented
+#       SERVER-side — /attention excludes the prober's own comments from the
+#       wake scan — so this lib-level FAILED remains correct for genuinely
+#       frozen rounds and no longer bills compliant poll-then-post members)
 judge_wake() {
   [ "$1" -eq 0 ] && { [ "$5" != "1" ] || [ "$6" != "$3" ] || [ "$7" != "$4" ]; }
 }
@@ -189,7 +192,8 @@ self_stop_check() {
     case ",$open_union," in *",$t,"*) any_open=1; break ;; esac
   done
   if [ "$any_open" = "0" ]; then
-    echo "$(date +%T) bound threads [$WATCH_THREADS] all closed (open union=[$open_union]) — host-watch done, drop the cron."
+    echo "$(date +%T) bound threads [$WATCH_THREADS] all closed (open union=[$open_union]) — host-watch done."
+    echo "  v2.5 note: drop the cron ONLY if no OTHER open quorum thread depends on this driver (thread #33 B-4)."
     exit 3
   fi
 }
