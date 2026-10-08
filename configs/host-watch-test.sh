@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# kit-version: 2.5.0 (drift check: compare with repo copy; update at will)
+# kit-version: 2.6.0 (drift check: compare with repo copy; update at will)
 # host-watch-test.sh — scenario matrix for host-watch.sh judgement logic
 # (thread #24 / PR #1 review: P3 + dsh condition (a)).
 # Sources configs/host-watch-lib.sh (the exact code host-watch.sh runs) and
@@ -98,6 +98,15 @@ expect_eq "LR-2 cursor frozen (F2 via wake_outcome)" \
   "$(wo 0 0 '{"attention":1,"reason":"new_comments","threads":[24]}' new_comments 24 '2026-10-02 10:00:00' '2026-10-02 10:00:00')" "failed"
 expect_eq "LR-3 old server (no last_read field) -> fingerprint fallback" \
   "$(wo 0 0 '{"attention":1,"reason":"new_comments","threads":[24]}' new_comments 24 '' '')" "failed"
+# LR-4..6 (v2.6, issue #3): the monotonic last_delivered_id face. LR-4 is
+# THE pin — a delivery inside one wall-clock second (last_read strings
+# EQUAL) must bill delivered; the old clock-face judgment called it failed.
+expect_eq "LR-4 same-second id advance -> delivered (issue #3 pin)" \
+  "$(wo 0 0 '{"attention":1,"reason":"new_comments","threads":[24]}' new_comments 24 '2026-10-02 10:00:05' '2026-10-02 10:00:05' 41 42)" "delivered"
+expect_eq "LR-5 id frozen, clock face advanced -> delivered (fallback order)" \
+  "$(wo 0 0 '{"attention":1,"reason":"new_comments","threads":[24]}' new_comments 24 '2026-10-02 10:00:00' '2026-10-02 10:05:03' 41 41)" "delivered"
+expect_eq "LR-6 both faces frozen -> failed" \
+  "$(wo 0 0 '{"attention":1,"reason":"new_comments","threads":[24]}' new_comments 24 '2026-10-02 10:00:00' '2026-10-02 10:00:00' 41 41)" "failed"
 TF=$(mktemp); echo 2 > "$TF"
 apply_billing unverified "$TF"
 expect_eq "billing unverified keeps 2"    "$(cat "$TF")" "2"

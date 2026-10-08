@@ -61,15 +61,43 @@ DB_PATH = Path(os.environ.get("REVIEWBOARD_DB", str(DATA_DIR / "reviewboard.db")
 # PROTOCOL_VERSION (governance semantics). Legacy databases (no meta table)
 # are identified by column probing and stamped; a db NEWER than the server is
 # refused loudly. The migration chain grows here.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 BOARD_INSTANCE_ID: str | None = None  # set by init_db; exposed via /attention
 # Forward migrations keyed by the version they upgrade FROM (GPT round-3 C2
 # + round-4 P3): _MIGRATIONS[4] upgrades a v4 db to v5. EVERY step up to
 # SCHEMA_VERSION must be EXPLICITLY declared — value None means "no shape
-# change needed, just stamp" (that is the entire v4->5 step today); a step
-# MISSING from the dict is a forgotten migration and fails closed at startup
-# instead of silently stamping over an unmigrated shape.
-_MIGRATIONS: dict[int, callable | None] = {4: None}
+# change needed, just stamp"; a step MISSING from the dict is a forgotten
+# migration and fails closed at startup instead of silently stamping over an
+# unmigrated shape.
+def _v6_id_cursor(conn: sqlite3.Connection) -> None:
+    """v5 -> v6 (issue #3): monotonic delivery watermark replaces the
+    second-resolution last_read comparison. last_read stays as a legacy
+    wall-clock face; the delivery truth is last_delivered_id. Backfill maps
+    each reader's old timestamp watermark to the newest comment id STRICTLY
+    BEFORE it — boundary rows (created_at == last_read, which the old strict
+    > never delivered and might have silently lost) sit ABOVE the backfilled
+    id, so they are re-delivered exactly once after the upgrade: a free
+    self-heal of any historical same-second drops. NULL last_read means
+    never-polled -> cursor 0 (their first poll runs the since-window)."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(participants)")}
+    if "last_delivered_id" not in cols:
+        # SQLite has no ADD COLUMN IF NOT EXISTS (same guard pattern as
+        # _legacy_shape_fixups): a meta-stamped-older db whose tables were
+        # already created in the v6 shape by executescript above must not
+        # crash on a duplicate column.
+        conn.execute(
+            "ALTER TABLE participants ADD COLUMN last_delivered_id"
+            " INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.execute(
+        """UPDATE participants SET last_delivered_id = COALESCE((
+               SELECT MAX(c.id) FROM comments c
+               WHERE c.created_at < participants.last_read), 0)
+           WHERE last_read IS NOT NULL"""
+    )
+
+
+_MIGRATIONS: dict[int, callable | None] = {4: None, 5: _v6_id_cursor}
 # Mirror of schema.sql for pipx/wheel-installed layouts: a top-level module
 # ships alone, so schema.sql does not exist next to it. The repo file stays
 # authoritative — when both exist, the file wins. Keep the two in sync when
@@ -103,11 +131,12 @@ CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments(thread_id);
 CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_created ON comments(created_at);
 CREATE TABLE IF NOT EXISTS participants (
-    author     TEXT PRIMARY KEY,
-    first_seen TEXT NOT NULL,
-    last_seen  TEXT NOT NULL,
-    last_read  TEXT,
-    meta       TEXT NOT NULL DEFAULT '{}'
+    author            TEXT PRIMARY KEY,
+    first_seen        TEXT NOT NULL,
+    last_seen         TEXT NOT NULL,
+    last_read         TEXT,
+    last_delivered_id INTEGER NOT NULL DEFAULT 0,
+    meta              TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS verdicts (
     thread_id  INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
@@ -164,7 +193,7 @@ SUSPEND_AFTER_HOURS = 24
 
 
 # --- v2 A1: participant registry / heartbeat --------------------------------
-mcp = FastMCP("ReviewBoard", version="2.5.0")  # align serverInfo with pyproject (was: fastmcp lib version)
+mcp = FastMCP("ReviewBoard", version="2.6.0")  # align serverInfo with pyproject (was: fastmcp lib version)
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -182,9 +211,14 @@ def _touch(conn: sqlite3.Connection, author: str | None) -> None:
     if cur.rowcount == 0:
         conn.execute(
             "INSERT INTO participants(author, first_seen, last_seen, last_read, meta)"
-            " VALUES (?,?,?,NULL,'{}')",
+            " VALUES(?,?,?,NULL,'{}')",
             (author, now, now),
         )
+        # v2.6 (issue #3): registration leaves cursor 0 / last_read NULL =
+        # never-polled. Their FIRST list_comments_since runs the since-window
+        # only (the v2.5 shape — no full-history dump), and an invitee's probe
+        # keeps seeing attention=1 until that first real read (invitee
+        # first-wake semantics unchanged).
 
 
 def _relative(utc: str) -> str:
@@ -217,7 +251,7 @@ def _is_active(last_seen: str | None, now: datetime | None = None) -> bool:
 
 
 # --- v2 A2: the protocol ----------------------------------------------------
-PROTOCOL_VERSION = "2.5"
+PROTOCOL_VERSION = "2.6"
 PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 
 ## 成员
@@ -258,7 +292,9 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 ## 轮询契约(每个成员)
 - 轮询 = list_comments_since(author=自己, since="now")——游标决定窗口(恰好=全部未投递);
   显式传更长的 since 可重读该窗口(union 语义:窗口 = since ∪ 未投递积压,永不漏)。
-  该调用是 last_read 游标的唯一推进者:游标 =「已投递给 LLM 的水位线」。
+  该调用是投递游标的唯一推进者:游标 =「已投递给 LLM 的水位线」。v2.6(issue #3)起
+  水位线是单调的 comments.id(last_delivered_id)——秒级时间戳水位曾把同秒评论永久
+  漏出严格大于比较;last_read 降为面向旧看门 kit 的墙钟遗留面,仍只在此推进。
   get_thread/探针/其它读取永不推进(C3)。
 - needs_attention 为空转时一句话终止,不读全帖;优先级 awaiting > mentions > new。
 - @点名是送达信号;被点名或被期待判定时应尽快回应(契约 W:自动唤起为默认,
@@ -1484,32 +1520,88 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
             fallback when no cursor exists yet).
         author: your tool name — poll WITH it, always.
     """
-    snapshot = _now_iso()  # watermark captured BEFORE the read (no swallow race)
+    snapshot = _now_iso()  # legacy wall-clock face (written below; see watermark)
     parsed_since = _parse_since(since)
     delivered = None
+    cursor_id = 0
     if author:
         with _connect() as conn:
             row = conn.execute(
-                "SELECT last_read FROM participants WHERE author=?", (author,)
+                "SELECT last_read, last_delivered_id FROM participants WHERE author=?",
+                (author,),
             ).fetchone()
-            if row and row["last_read"]:
-                delivered = row["last_read"]
+            if row:
+                cursor_id = row["last_delivered_id"] or 0
+                if row["last_read"]:
+                    delivered = row["last_read"]
     cutoff = min(parsed_since, delivered) if delivered else parsed_since
+    # v2.6 (issue #3): NULL last_read = never polled. Their first poll stays a
+    # pure time window (exactly the v2.5 first-poll shape); from then on the
+    # monotonic id watermark decides. This also keeps the invitee probe at
+    # attention=1 (cursor 0 = nothing delivered yet) until the first read.
+    use_id_window = bool(author and delivered)
     with db() as conn:
-        rows = conn.execute(
-            """SELECT c.id, c.thread_id, c.parent_id, c.author, c.body,
-                      c.file, c.line, c.severity, c.created_at
-               FROM comments c
-               WHERE c.created_at > ?
-               ORDER BY c.created_at ASC""",
-            (cutoff,),
-        ).fetchall()
+        # v2.6.1 (#374/#375/#376, all three independently reproduced): the
+        # watermark MUST be derived from THIS call's delivered set, never
+        # from a separate MAX(id) read taken AFTER the rows fetch. Python
+        # sqlite3 runs SELECTs as autocommit per-statement snapshots, so a
+        # post-fetch MAX could include a comment that committed between the
+        # two statements — absent from rows AND <= the written cursor — a
+        # permanent silent loss, the exact failure mode issue #3 exists to
+        # kill. Deriving from rows is loss-free by AUTOINCREMENT write-lock
+        # serialization: any comment absent from this snapshot committed
+        # after it, so its id exceeds every id present here and the next
+        # poll's `id > cursor` picks it up. Worst case is a duplicate,
+        # never a loss; with the floor taken as below there is not even a
+        # duplicate (watermark >= every id in rows by construction).
+        floor = cursor_id
+        if author and not use_id_window:
+            # never-polled first read: floor from a MAX read taken BEFORE
+            # the rows fetch (same ordering argument; post-read was the bug)
+            floor = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM comments"
+            ).fetchone()[0]
+        # The delivery window is the union of the monotonic id watermark and
+        # the `since` display window (the old shape was cutoff =
+        # min(parsed_since, last_read) over one time axis). The no-author and
+        # never-polled paths stay a pure time window — cursors are per-reader.
+        if use_id_window:
+            rows = conn.execute(
+                """SELECT c.id, c.thread_id, c.parent_id, c.author, c.body,
+                          c.file, c.line, c.severity, c.created_at
+                   FROM comments c
+                   WHERE c.id > ? OR c.created_at > ?
+                   ORDER BY c.id ASC""",
+                (cursor_id, parsed_since),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT c.id, c.thread_id, c.parent_id, c.author, c.body,
+                          c.file, c.line, c.severity, c.created_at
+                   FROM comments c
+                   WHERE c.created_at > ?
+                   ORDER BY c.id ASC""",
+                (parsed_since,),
+            ).fetchall()
         if author:
+            watermark = floor
+            for r in rows:
+                if r["id"] > watermark:
+                    watermark = r["id"]
+            # v2.6 (issue #3): same-second comments can no longer be lost —
+            # the old second-resolution last_read watermark did (strict >
+            # over truncated timestamps; the old "no swallow race" note
+            # assumed sub-second precision the format never had).
             # C1.1 shared heartbeat path (+ C' unfreeze recompute inside this
             # txn), cursor advance last; the fetch above already fixed delivery.
+            # last_read keeps its legacy wall-clock semantics for old watcher
+            # kits — C3's single write point is unchanged (still only this
+            # call writes either column).
             heartbeat_and_recompute(conn, author)
             conn.execute(
-                "UPDATE participants SET last_read=? WHERE author=?", (snapshot, author)
+                "UPDATE participants SET last_read=?, last_delivered_id=?"
+                " WHERE author=?",
+                (snapshot, watermark, author),
             )
     mentions = []
     if author:
@@ -2022,7 +2114,7 @@ def _board_html() -> str:
 async def ping(request: Request):
     """Health/liveness endpoint (Glama listing check + generic watchers):
     plain 200 as long as the process serves — no auth, no db touch."""
-    return JSONResponse({"status": "ok", "version": "2.5.0"})
+    return JSONResponse({"status": "ok", "version": "2.6.0"})
 
 
 _STARTED_AT = time.time()  # v2.5 observability: /attention uptime face
@@ -2064,9 +2156,11 @@ async def attention_probe(request: Request):
             heartbeat_and_recompute(conn, author)
         with _connect() as conn:
             row = conn.execute(
-                "SELECT last_read FROM participants WHERE author=?", (author,)
+                "SELECT last_read, last_delivered_id FROM participants WHERE author=?",
+                (author,),
             ).fetchone()
             cutoff = (row["last_read"] if row and row["last_read"] else "1970-01-01 00:00:00")
+            cursor_id = (row["last_delivered_id"] if row else 0) or 0
             open_quorum = [
                 r["id"]
                 for r in conn.execute(
@@ -2109,9 +2203,13 @@ async def attention_probe(request: Request):
                     "revision": trow["revision"],
                 }
             undelivered = conn.execute(
+                # v2.6 (issue #3): ids above the monotonic watermark, not
+                # created_at > last_read — same-second comments used to fall
+                # through the strict > on truncated timestamps. The v2.5
+                # own-comment exclusion (author != ?) carries over unchanged.
                 "SELECT thread_id, id, body FROM comments"
-                " WHERE created_at > ? AND author != ? ORDER BY id",
-                (cutoff, author),
+                " WHERE id > ? AND author != ? ORDER BY id",
+                (cursor_id, author),
             ).fetchall()
             mention_threads = sorted(
                 {r["thread_id"] for r in undelivered if _mentioned(r["body"], author)}
@@ -2139,6 +2237,10 @@ async def attention_probe(request: Request):
             # by list_comments_since(author) — never by this probe (C3, single
             # write point), so a watcher cannot fake its own member's delivery.
             "last_read": cutoff,
+        # v2.6 (issue #3): the delivery-truth watermark (monotonic comment
+        # id). Watcher kits prefer this face for delivery judgment — it can
+        # advance within the same wall-clock second where last_read cannot.
+        "last_delivered_id": cursor_id,
             "board_id": BOARD_INSTANCE_ID,  # stable instance identity (thread #27):
             # a watcher pinned to EXPECTED_BOARD_ID can detect that this port now
             # serves a DIFFERENT board and refuse to wake members against it.
