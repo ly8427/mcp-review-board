@@ -1541,6 +1541,26 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
     # attention=1 (cursor 0 = nothing delivered yet) until the first read.
     use_id_window = bool(author and delivered)
     with db() as conn:
+        # v2.6.1 (#374/#375/#376, all three independently reproduced): the
+        # watermark MUST be derived from THIS call's delivered set, never
+        # from a separate MAX(id) read taken AFTER the rows fetch. Python
+        # sqlite3 runs SELECTs as autocommit per-statement snapshots, so a
+        # post-fetch MAX could include a comment that committed between the
+        # two statements — absent from rows AND <= the written cursor — a
+        # permanent silent loss, the exact failure mode issue #3 exists to
+        # kill. Deriving from rows is loss-free by AUTOINCREMENT write-lock
+        # serialization: any comment absent from this snapshot committed
+        # after it, so its id exceeds every id present here and the next
+        # poll's `id > cursor` picks it up. Worst case is a duplicate,
+        # never a loss; with the floor taken as below there is not even a
+        # duplicate (watermark >= every id in rows by construction).
+        floor = cursor_id
+        if author and not use_id_window:
+            # never-polled first read: floor from a MAX read taken BEFORE
+            # the rows fetch (same ordering argument; post-read was the bug)
+            floor = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM comments"
+            ).fetchone()[0]
         # The delivery window is the union of the monotonic id watermark and
         # the `since` display window (the old shape was cutoff =
         # min(parsed_since, last_read) over one time axis). The no-author and
@@ -1564,17 +1584,14 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
                 (parsed_since,),
             ).fetchall()
         if author:
-            # v2.6 (issue #3): the watermark is the newest comment id visible
-            # to THIS transaction. AUTOINCREMENT ids are monotonic and never
-            # reused, so a comment committing after this read necessarily
-            # carries a higher id and stays undelivered for the next poll —
-            # the second-resolution last_read watermark used to permanently
-            # lose same-second comments here (strict > over truncated
-            # timestamps; the old "no swallow race" note assumed sub-second
-            # precision the format never had).
-            watermark = conn.execute(
-                "SELECT COALESCE(MAX(id), 0) FROM comments"
-            ).fetchone()[0]
+            watermark = floor
+            for r in rows:
+                if r["id"] > watermark:
+                    watermark = r["id"]
+            # v2.6 (issue #3): same-second comments can no longer be lost —
+            # the old second-resolution last_read watermark did (strict >
+            # over truncated timestamps; the old "no swallow race" note
+            # assumed sub-second precision the format never had).
             # C1.1 shared heartbeat path (+ C' unfreeze recompute inside this
             # txn), cursor advance last; the fetch above already fixed delivery.
             # last_read keeps its legacy wall-clock semantics for old watcher

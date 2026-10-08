@@ -12,8 +12,13 @@ comments.id watermark (participants.last_delivered_id):
      advances it (C3 unchanged — only list_comments_since writes).
   3. Own-comment exclusion carries over to the id path (v2.5 B-2), while
      the read face still returns own comments.
-  4. New-member registration initializes the cursor to MAX(id): the first
-     poll shows the since-window only, never a full-history dump.
+  4. A never-polled member's FIRST poll shows the since-window only, never a
+     full-history dump (registration leaves cursor 0 / last_read NULL; the
+     first read advances the watermark from its pre-fetch MAX floor).
+  5. Interleaved concurrency (#375/#376 requirement): concurrent posters vs
+     a live poller — every posted comment must appear in some poll response
+     (zero loss; the serial same-second regression cannot exercise the
+     rows-vs-watermark statement gap).
 
 Throwaway server on 8778. Run: .venv/bin/python test_v2_stage8.py
 """
@@ -159,9 +164,83 @@ def main():
         pd = probe("d")
         assert pd["attention"] == 0 and "last_delivered_id" in pd, pd
 
+        # --- 5. interleaved: concurrent posters vs poller, zero loss -------
+        # dsh #375 requirement / opencode #376 rider: with since="now" the
+        # time branch is fully bypassed and the id branch is the only safety
+        # net — the harshest shape, and the serial part-1 regression cannot
+        # exercise the rows-vs-watermark statement gap.
+        import itertools
+        import threading
+        _ids = itertools.count(10_000)
+
+        def call2(method, params=None, sid=None):
+            payload = {"jsonrpc": "2.0", "id": next(_ids), "method": method}
+            if params is not None:
+                payload["params"] = params
+            req = urllib.request.Request(
+                URL, data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json",
+                         "Accept": "application/json, text/event-stream"},
+                method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                got_sid = resp.headers.get("Mcp-Session-Id", sid)
+                body = resp.read().decode()
+                if body.startswith("event:") or body.startswith("data:"):
+                    for line in body.splitlines():
+                        if line.startswith("data:"):
+                            body = line[5:].strip()
+                            break
+                return json.loads(body), got_sid
+
+        out = tool("create_thread", {"title": "interleave", "author": "h",
+                                     "quorum": ["a", "b"],
+                                     "per_author_budget": 60})
+        tid2 = int(out.split("#")[1].split(":")[0])
+        posted, seen_text = [], []
+        plock = threading.Lock()
+        stop = threading.Event()
+
+        def poster(n):
+            for i in range(6):
+                tool("post_comment", {"thread_id": tid2, "author": "h",
+                                      "body": f"il-{n}-{i}"})
+                with plock:
+                    posted.append(f"il-{n}-{i}")
+
+        def poll_once(sid):
+            r, _ = call2("tools/call", {"name": "list_comments_since",
+                         "arguments": {"since": "now", "author": "a"}}, sid)
+            return r["result"]["content"][0]["text"]
+
+        _, sid2 = call2("initialize", {
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "clientInfo": {"name": "s8b", "version": "0"}})
+        call2("notifications/initialized", None, sid2)
+
+        def poller():
+            while not stop.is_set():
+                seen_text.append(poll_once(sid2))
+                time.sleep(0.02)
+
+        pt = threading.Thread(target=poller)
+        pt.start()
+        threads = [threading.Thread(target=poster, args=(n,)) for n in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        stop.set()
+        pt.join()
+        seen_text.append(poll_once(sid2))  # final drain
+        blob = "\n".join(seen_text)
+        lost = [b for b in posted if b not in blob]
+        assert len(posted) == 18, len(posted)
+        assert not lost, f"interleaved loss: {lost} — the #375/#376 race shape"
+
         print("✅ STAGE8 TESTS PASSED: monotonic id delivery watermark — "
               "same-second regression, probe C3 face, own-comment exclusion "
-              "on the id path, new-member registration init.")
+              "on the id path, never-polled first read, interleaved "
+              "posters-vs-poller zero loss.")
     finally:
         proc.send_signal(signal.SIGTERM)
         try:
