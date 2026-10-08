@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# kit-version: 2.5.0 (drift check: compare with repo copy; update at will)
+# kit-version: 2.6.0 (drift check: compare with repo copy; update at will)
 #
 # uninstall-watch.sh — scan common watcher entry points and clean residue
 # (thread #25 batch B; instance-scoped in batch D, thread #27 must-fix 2).

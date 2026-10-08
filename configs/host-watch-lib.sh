@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# kit-version: 2.5.0 (drift check: compare with repo copy; update at will)
+# kit-version: 2.6.0 (drift check: compare with repo copy; update at will)
 # host-watch-lib.sh — probe + parse + judge helpers for host-watch.sh.
 # Split out so configs/host-watch-test.sh can source and test them directly
 # (thread #24 / PR #1 review: P2-6 python3 parsing, P3 scenario matrix).
@@ -79,15 +79,22 @@ probe_ok() {
 #   → delivered | failed | unverified (thread #27 must-fix 1; v2 thread #31):
 #   probe failure is NEUTRAL — never billed, never touches the gate counter;
 #   rc!=0 is ALWAYS failed (crash/hang billing, witness #340 实错2);
-#   delivered = fingerprint moved OR last_read advanced (STRICT greater-than;
+#   delivered = fingerprint moved OR a delivery cursor advanced. v2.6
+#   (issue #3) prefers the monotonic last_delivered_id face (args 8/9,
+#   NUMERIC compare) — it can advance within one wall-clock second where
+#   last_read cannot; falls back to last_read strings (STRICT greater-than;
 #   both values are the /attention effective cutoff — 'YYYY-MM-DD HH:MM:SS'
-#   compares correctly as a string, never raw NULL). Empty last_read args
-#   (pre-2.5 server without the field) degrade to fingerprint-only, so old
-#   kit callers keep working unchanged.
+#   compares correctly as a string, never raw NULL), then to fingerprint.
+#   Empty faces (pre-2.6 server without the id field / pre-2.5 without
+#   last_read) degrade gracefully, so old kit callers keep working unchanged.
 wake_outcome() {
   local arc="$1" prc="$2" aj="$3" pr="$4" pt="$5" plr="${6:-}" qlr="${7:-}"
+  local pid_="${8:-}" qid_="${9:-}"
   if [ "$prc" != "0" ]; then echo unverified; return; fi
   if [ "$arc" != "0" ]; then echo failed; return; fi
+  if [ -n "$pid_" ] && [ -n "$qid_" ] && [ "$qid_" -gt "$pid_" ] 2>/dev/null; then
+    echo delivered; return
+  fi
   if [ -n "$plr" ] && [ -n "$qlr" ] && [[ "$qlr" > "$plr" ]]; then echo delivered; return; fi
   if judge_wake "$arc" "1" "$pr" "$pt" "$(jatt "$aj")" "$(jreason "$aj")" "$(jthreads "$aj")"; then
     echo delivered

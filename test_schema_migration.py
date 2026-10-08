@@ -177,6 +177,56 @@ def main() -> None:
             "SELECT name FROM sqlite_master WHERE type='table'")}
         check("f1 schema.sql == embedded fallback (table sets)", names(ta) == names(tb))
 
+        # g) v5 -> v6 (issue #3): id-cursor column added + backfill semantics.
+        #    Hand-built v5 db: participants WITHOUT last_delivered_id, meta
+        #    stamped '5', controlled comments around one reader's watermark.
+        db5 = td / "v5cursor.db"
+        c = sqlite3.connect(db5)
+        c.executescript((REPO / "schema.sql").read_text())
+        # rebuild participants in the v5 shape (schema.sql above created the
+        # v6 shape; SQLite cannot DROP COLUMN in place portably)
+        c.execute("DROP TABLE participants")
+        c.execute("""CREATE TABLE participants (author TEXT PRIMARY KEY,
+            first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+            last_read TEXT, meta TEXT NOT NULL DEFAULT '{}')""")
+        c.execute("INSERT OR REPLACE INTO meta(key, value)"
+                  " VALUES('schema_version', '5')")
+        c.executescript("""
+            INSERT INTO threads(title, author) VALUES ('cursor', 'h');
+            INSERT INTO comments(thread_id, author, body, created_at) VALUES
+                (1, 'h', 'before', '2026-01-01 00:00:01');
+            INSERT INTO comments(thread_id, author, body, created_at) VALUES
+                (1, 'h', 'same-sec-a', '2026-01-01 00:00:02');
+            INSERT INTO comments(thread_id, author, body, created_at) VALUES
+                (1, 'h', 'same-sec-b', '2026-01-01 00:00:02');
+            INSERT INTO comments(thread_id, author, body, created_at) VALUES
+                (1, 'h', 'after', '2026-01-01 00:00:03');
+            INSERT INTO participants(author, first_seen, last_seen, last_read)
+                VALUES ('reader', '2026-01-01 00:00:00', '2026-01-01 00:00:00',
+                        '2026-01-01 00:00:02');
+            INSERT INTO participants(author, first_seen, last_seen, last_read)
+                VALUES ('newbie', '2026-01-01 00:00:00', '2026-01-01 00:00:00',
+                        NULL);
+        """)
+        c.commit(); c.close()
+        _use_db(db5)
+        server.BOARD_INSTANCE_ID = None
+        server.init_db()
+        c = sqlite3.connect(db5)
+        cols = {r[1] for r in c.execute("PRAGMA table_info(participants)")}
+        got = dict(c.execute(
+            "SELECT author, last_delivered_id FROM participants").fetchall())
+        c.close()
+        check("g1 v5->v6: column added", "last_delivered_id" in cols)
+        check("g2 v5->v6: stamped", _meta(db5).get("schema_version") == str(server.SCHEMA_VERSION))
+        # reader watermark 00:00:02 -> newest id STRICTLY before it = id 1
+        # ('before'); the two same-second boundary comments (ids 2,3) sit
+        # ABOVE the backfill and re-deliver once — the self-heal.
+        check(f"g3 v5->v6: backfill strictly-before + self-heal boundary (got {got})",
+              got.get("reader") == 1)
+        check(f"g4 v5->v6: NULL last_read stays 0 / never-polled (got {got})",
+              got.get("newbie") == 0)
+
     print()
     if fails:
         print(f"❌ SCHEMA MIGRATION TESTS: {fails} failure(s)")

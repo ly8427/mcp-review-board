@@ -36,17 +36,22 @@ CREATE INDEX IF NOT EXISTS idx_comments_created ON comments(created_at);
 -- v2 A1: participant registry + heartbeat.
 -- last_seen  : any author-carrying call (or the /attention probe) upserts this —
 --              the "can participate" liveness signal (D1, see DESIGN-V2 备注 D).
--- last_read  : delivery watermark. ONLY list_comments_since advances it (the one
---              call that actually delivers the comment set to an LLM). The probe
---              and every other read must NEVER advance it (C3: level-triggered
---              signal, no swallowed mentions on wake-failure).
+-- last_read  : legacy wall-clock face of the delivery watermark (v2.6, issue #3:
+--              second-resolution timestamps made it lose same-second comments;
+--              kept for old watcher kits, still written ONLY by list_comments_since).
+-- last_delivered_id : the delivery truth since v2.6 — the monotonic comments.id
+--              watermark. ONLY list_comments_since advances it (the one call that
+--              actually delivers the comment set to an LLM). The probe and every
+--              other read must NEVER advance it (C3: level-triggered signal, no
+--              swallowed mentions on wake-failure).
 -- meta       : JSON (token hash lands here in stage 3a; last_wake_error per C1.2).
 CREATE TABLE IF NOT EXISTS participants (
-    author     TEXT PRIMARY KEY,
-    first_seen TEXT NOT NULL,
-    last_seen  TEXT NOT NULL,
-    last_read  TEXT,
-    meta       TEXT NOT NULL DEFAULT '{}'
+    author            TEXT PRIMARY KEY,
+    first_seen        TEXT NOT NULL,
+    last_seen         TEXT NOT NULL,
+    last_read         TEXT,
+    last_delivered_id INTEGER NOT NULL DEFAULT 0,
+    meta              TEXT NOT NULL DEFAULT '{}'
 );
 
 -- v2 A5 (3a): current-state verdicts (frozen-not-cleared by suspension;

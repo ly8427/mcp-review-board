@@ -80,7 +80,7 @@ wake() {
   local gate; gate=$(cat "$fails" 2>/dev/null || echo 0)
   if [ "${gate:-0}" -ge 3 ]; then echo "$(date +%T) $name: gate tripped (3 consecutive fails), skipping"; return 0; fi
   mkdir "$lock" 2>/dev/null || { echo "$(date +%T) $name: wake in flight, skip"; return 0; }
-  local resp att reason threads rc=0 after prc outcome p pre_lr post_lr
+  local resp att reason threads rc=0 after prc outcome p pre_lr post_lr pre_id post_id
   resp=$(probe_ok "$pauthor"); p=$?
   [ "$p" = "4" ] && exit 4        # identity mismatch propagates (win-test #11)
   if [ "$p" != "0" ]; then
@@ -90,6 +90,7 @@ wake() {
   att=$(jatt "$resp")
   if [ "$att" != "1" ]; then echo "$(date +%T) $name: idle"; rmdir "$lock" 2>/dev/null; return 0; fi
   reason=$(jreason "$resp"); threads=$(jthreads "$resp"); pre_lr=$(jget last_read "$resp")
+  pre_id=$(jget last_delivered_id "$resp")
   echo "$(date +%T) $name: attention=1 ($reason, threads=$threads) — waking"
   "$wakefn" "$reason" "$threads" > "$STATE_DIR/$name.last.log" 2>&1 || rc=$?
   prc=0; after=$(probe_ok "$pauthor"); p=$?
@@ -108,20 +109,23 @@ wake() {
   fi
   # thread #31 batch A (backported to the repo template in v2.5 — the
   # deployed copy had it first, a copy-drift instance of exactly what
-  # thread #25 batch B set out to kill): delivery = fingerprint moved OR
-  # last_read advanced (strictly). last_read moves only when the member's
-  # own session polls (C3 single write point), so poll-then-post rounds
-  # bill as delivered instead of failing the F2 known-gap shape.
+  # thread #25 batch B set out to kill): delivery = fingerprint moved OR a
+  # cursor advanced. v2.6 (issue #3) prefers the monotonic last_delivered_id
+  # (numeric; can move within one wall-clock second where last_read cannot),
+  # falling back to last_read, then fingerprint — a cursor moves only when
+  # the member's own session polls (C3 single write point), so poll-then-post
+  # rounds bill as delivered instead of failing the F2 known-gap shape.
   post_lr=$(jget last_read "$after")
-  outcome=$(wake_outcome "$rc" "$prc" "$after" "$reason" "$threads" "$pre_lr" "$post_lr")
+  post_id=$(jget last_delivered_id "$after")
+  outcome=$(wake_outcome "$rc" "$prc" "$after" "$reason" "$threads" "$pre_lr" "$post_lr" "$pre_id" "$post_id")
   case "$outcome" in
     delivered)
       apply_billing delivered "$fails"
-      echo "$(date +%T) $name: delivered (fingerprint or last_read $pre_lr→$post_lr — delivery, not task-completion)" ;;
+      echo "$(date +%T) $name: delivered (fingerprint/cursor: last_read $pre_lr→$post_lr, delivered_id $pre_id→$post_id — delivery, not task-completion)" ;;
     failed)
       apply_billing failed "$fails"
       local n; n=$(cat "$fails" 2>/dev/null || echo 0)
-      echo "$(date +%T) $name: wake FAILED (rc=$rc, valid probe, attention unchanged, last_read $pre_lr→$post_lr) ($n/3)"
+      echo "$(date +%T) $name: wake FAILED (rc=$rc, valid probe, attention unchanged, last_read $pre_lr→$post_lr, delivered_id $pre_id→$post_id) ($n/3)"
       [ "$n" -ge 3 ] && echo "$(date +%T) $name: gate tripped — stop waking this member (recover: rm $fails)" ;;
     unverified)
       echo "$(date +%T) $name: unverified (post-wake probe failed — delivery unknown; counters untouched)" ;;
