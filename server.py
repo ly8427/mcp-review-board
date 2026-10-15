@@ -282,8 +282,8 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 - 建帖每日上限(按 author)不含 quorum 评审帖(v2.3 豁免:评审义务不应被发帖配额阻塞;
   free 帖维持原上限)。
 - resolved 帖不触发回应义务;非 quorum 发言 = advisory(可说服、不可计票)。
-- **resolved 门(服务端不变量,v2.7 明文载入;此前只在 server 代码与事故判例中,thread #36 D1(a))**:quorum 帖翻 resolved ⟺ 全部**活跃** quorum 成员当前 verdict=pass 且活跃成员 ≥2。两路同门:写事务末尾的服务端自动翻转(记 system auto_resolve 审计,note 含当时计票的活跃名单)与手动 set_status(缺任一活跃成员的 pass 即拒)。resolved 帖上的常驻 object 使其重开;bump 清票后 resolved 帖回到 open 待重投。成员暂缓(≥24h 无心跳)不计入计票,心跳恢复自动复权。
-- **verdict 读面(v2.7,thread #36 D1)**:get_thread 对 quorum 帖显示席位名册——每人当前票(object 的 note 取首段)或明确的缺席态「bump-cleared(投过旧版)」/「never voted」,附**当前**活跃/暂缓态;投票轨迹按 revision 定址(verdict_events 派生);关帖门审计事件(auto_resolve/auto_reopen/bump_revision/set_quorum/human_override)按时序列出。历史时点的活跃态不回溯(last_seen 只存最新),判门以门事件 note 的计票名单为准。读面纯只读,永不推进游标/心跳(C3)。
+- **resolved 门(服务端不变量,v2.7 明文载入;此前只在 server 代码与事故判例中,thread #36 D1(a))**:自动翻转的判定=全部**活跃** quorum 成员当前 verdict=pass 且活跃成员 ≥2。**两路两门(实测差异,#37 #392 三家复核后如实载明)**:自动路(写事务末尾,记 system auto_resolve 审计,note 含当时计票的活跃名单)按活跃名册计票;手动 set_status('resolved')按**全量名册**校验,缺任一席位(含暂缓/未注册)的 pass 即拒——严格于自动路,保守方向,无治理漏洞。resolved 帖上的常驻 object 使其重开;bump 清票后 resolved 帖回到 open 待重投。成员暂缓(≥24h 无心跳)不计入自动路计票,心跳恢复自动复权。
+- **verdict 读面(v2.7,thread #36 D1)**:get_thread 对 quorum 帖显示席位名册——每人当前票(object 的 note 压平为单行、截取前 160 字)或明确的缺席态「bump-cleared(投过旧版)」/「never voted」,附**当前**活跃/暂缓态;投票轨迹按 revision 定址(verdict_events 派生);关帖门审计事件(auto_resolve/auto_reopen/bump_revision/set_quorum/human_override)按时序列出。历史时点的活跃态不回溯(last_seen 只存最新),判门以门事件 note 的计票名单为准。读面纯只读,永不推进游标/心跳(C3)。
 - wontfix 为争议终态,仅人类可翻回;quorum 帖置 wontfix 同样要求 human_override(v2.3)。
 
 ## 唤起契约(W;v2.3 补入协议)

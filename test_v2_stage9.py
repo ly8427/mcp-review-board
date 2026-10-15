@@ -23,6 +23,10 @@ Cases:
   5. C3: probe before/after two get_thread calls — cursor fields identical.
   6. free thread (no quorum) → no verdicts block at all.
   7. human_override status change lands in the gate trail.
+  8. two-gate asymmetry pinned (#37 #392/#393/#394): manual resolved gate
+     checks the FULL roster (rejects while a suspended member's pass is
+     missing) while the auto gate resolves on the ACTIVE roster — the
+     documented "两路两门" behavior, end to end.
 
 Throwaway server on 8779. Run: .venv/bin/python test_v2_stage9.py
 """
@@ -196,6 +200,41 @@ def main():
         gate = face.split("gate:")[1]
         assert "human_override" in gate and "by h" in gate, gate
         assert "[wontfix]" in face, face[:200]
+
+        # --- 8. two-gate asymmetry pinned (#37 #392/#393/#394) -------------
+        # The manual resolved gate checks the FULL roster (strict); the auto
+        # gate counts ACTIVE members only. Protocol v2.7 documents the
+        # asymmetry as "两路两门"; this pins it behaviorally end to end so
+        # neither side can drift silently.
+        out = tool("create_thread", {"title": "asym", "author": "h",
+                                     "quorum": ["a", "b", "c"]})
+        gid = int(out.split("#")[1].split(":")[0])
+        for m in ("a", "b", "c"):
+            poll(m)
+        tok["c"] = tool("claim_token", {"author": "c"}).split("\n")[1].strip()
+        tool("set_verdict", {"thread_id": gid, "verdict": "pass",
+                             "author": "a", "token": tok["a"]})
+        tool("set_verdict", {"thread_id": gid, "verdict": "pass",
+                             "author": "b", "token": tok["b"]})
+        tool("set_verdict", {"thread_id": gid, "verdict": "object",
+                             "author": "c", "note": "hold", "token": tok["c"]})
+        face = tool("get_thread", {"thread_id": gid})
+        assert "[open]" in face, face[:200]
+        con = sqlite3.connect(DB)   # c goes suspended; its object stands frozen
+        con.execute("UPDATE participants SET last_seen='2026-01-01 00:00:00'"
+                    " WHERE author='c'")
+        con.commit()
+        con.close()
+        # manual gate: FULL roster — c's missing pass rejects (stricter)
+        r = tool("set_status", {"thread_id": gid, "status": "resolved",
+                                "author": "h"})
+        assert "missing 'pass' verdicts from" in r and "'c'" in r, r
+        # auto gate: ACTIVE roster only — a's next heartbeat resolves
+        poll("a")
+        face = tool("get_thread", {"thread_id": gid})
+        assert "[resolved]" in face, face[:200]
+        gate = face.split("gate:")[1]
+        assert "active quorum unanimous: a pass · b pass" in gate, gate
     finally:
         proc.send_signal(signal.SIGTERM)
         proc.wait(timeout=10)
