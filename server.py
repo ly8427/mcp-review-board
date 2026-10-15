@@ -193,7 +193,7 @@ SUSPEND_AFTER_HOURS = 24
 
 
 # --- v2 A1: participant registry / heartbeat --------------------------------
-mcp = FastMCP("ReviewBoard", version="2.6.0")  # align serverInfo with pyproject (was: fastmcp lib version)
+mcp = FastMCP("ReviewBoard", version="2.7.0")  # align serverInfo with pyproject (was: fastmcp lib version)
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -250,8 +250,15 @@ def _is_active(last_seen: str | None, now: datetime | None = None) -> bool:
     return (now - then).total_seconds() < SUSPEND_AFTER_HOURS * 3600
 
 
+def _oneline(s: str, limit: int) -> str:
+    """Collapse to one line and truncate with an ellipsis marker (v2.7 read
+    faces: verdict/gate notes stay scannable; the full text lives in storage)."""
+    flat = " ".join(s.split())
+    return flat if len(flat) <= limit else flat[:limit] + "…"
+
+
 # --- v2 A2: the protocol ----------------------------------------------------
-PROTOCOL_VERSION = "2.6"
+PROTOCOL_VERSION = "2.7"
 PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 
 ## 成员
@@ -275,6 +282,8 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 - 建帖每日上限(按 author)不含 quorum 评审帖(v2.3 豁免:评审义务不应被发帖配额阻塞;
   free 帖维持原上限)。
 - resolved 帖不触发回应义务;非 quorum 发言 = advisory(可说服、不可计票)。
+- **resolved 门(服务端不变量,v2.7 明文载入;此前只在 server 代码与事故判例中,thread #36 D1(a))**:quorum 帖翻 resolved ⟺ 全部**活跃** quorum 成员当前 verdict=pass 且活跃成员 ≥2。两路同门:写事务末尾的服务端自动翻转(记 system auto_resolve 审计,note 含当时计票的活跃名单)与手动 set_status(缺任一活跃成员的 pass 即拒)。resolved 帖上的常驻 object 使其重开;bump 清票后 resolved 帖回到 open 待重投。成员暂缓(≥24h 无心跳)不计入计票,心跳恢复自动复权。
+- **verdict 读面(v2.7,thread #36 D1)**:get_thread 对 quorum 帖显示席位名册——每人当前票(object 的 note 取首段)或明确的缺席态「bump-cleared(投过旧版)」/「never voted」,附**当前**活跃/暂缓态;投票轨迹按 revision 定址(verdict_events 派生);关帖门审计事件(auto_resolve/auto_reopen/bump_revision/set_quorum/human_override)按时序列出。历史时点的活跃态不回溯(last_seen 只存最新),判门以门事件 note 的计票名单为准。读面纯只读,永不推进游标/心跳(C3)。
 - wontfix 为争议终态,仅人类可翻回;quorum 帖置 wontfix 同样要求 human_override(v2.3)。
 
 ## 唤起契约(W;v2.3 补入协议)
@@ -1082,17 +1091,87 @@ def get_thread(thread_id: int) -> str:
             if t["quorum"] and t["status"] == "open"
             else []
         )
+        # v2.7 (thread #36 D1): verdict read face — quorum seats, per-revision
+        # trails and the gate trail, all derived read-only in this same
+        # snapshot (C3 by construction: no _touch, no cursor writes — dsh
+        # #382 ② is pinned by stage9 part 5).
+        names: list[str] = []
+        cur_verdicts: dict[str, sqlite3.Row] = {}
+        v_events: list[sqlite3.Row] = []
+        liveness: dict[str, str] = {}
+        trails: dict[str, list[str]] = {}
+        last_voted_rev: dict[str, int] = {}
+        gate_events: list[sqlite3.Row] = []
+        if t["quorum"]:
+            try:
+                names = json.loads(t["quorum"])
+            except (ValueError, TypeError):
+                names = []
+            cur_verdicts = {
+                r["author"]: r for r in conn.execute(
+                    "SELECT author, verdict, note, updated_at FROM verdicts"
+                    " WHERE thread_id=?", (thread_id,)
+                ).fetchall()
+            }
+            v_events = conn.execute(
+                "SELECT * FROM verdict_events WHERE thread_id=? ORDER BY id ASC",
+                (thread_id,),
+            ).fetchall()
+            for n in names:
+                row = conn.execute(
+                    "SELECT last_seen FROM participants WHERE author=?", (n,)
+                ).fetchone()
+                liveness[n] = (
+                    "unregistered" if row is None
+                    else "active" if _is_active(row["last_seen"])
+                    else "suspended"
+                )
+            for ev in v_events:
+                if ev["action"] in ("verdict", "verdict_free"):
+                    trails.setdefault(ev["author"], []).append(
+                        f"r{ev['revision']}:{ev['from_v'] or '∅'}→{ev['to_v']}")
+                    last_voted_rev[ev["author"]] = ev["revision"]
+                elif ev["action"] in ("auto_resolve", "auto_reopen", "bump_revision",
+                                      "set_quorum", "human_override"):
+                    gate_events.append(ev)
     out = [
         f"Thread #{t['id']}: {t['title']}  [{t['status']}]",
         f"  created: {t['created_at']}   comments: {len(all_comments)}/{THREAD_CAP}",
     ]
     if t["quorum"]:
-        try:
-            names = json.loads(t["quorum"])
-        except (ValueError, TypeError):
-            names = []
         stale_flag = f"   ⚠ stale-object: {stale}" if stale else ""
         out.append(f"  quorum: {names}   revision: {t['revision']}   budget: {usage or '—'}{stale_flag}")
+        # v2.7 (thread #36 D1) seats face: every roster seat shows its current
+        # verdict, an explicit bump-cleared / never-voted absence (dsh #382 ①),
+        # and the CURRENT liveness label. Historical liveness per event is not
+        # reconstructible (last_seen keeps only the latest); gate adjudication
+        # follows the recorded tally inside auto_resolve notes (pi #384 ③).
+        out.append(f"  verdicts (rev {t['revision']}):")
+        for n in names:
+            v = cur_verdicts.get(n)
+            if v is not None:
+                seg = f"    {n}: {v['verdict']} @ {v['updated_at']} [{liveness[n]}]"
+                if v["note"]:
+                    seg += f"  note: {_oneline(str(v['note']), 160)}"
+                if trails.get(n):
+                    seg += f"  trail: {' '.join(trails[n])}"
+            else:
+                state = (
+                    f"bump-cleared (voted r{last_voted_rev[n]}, not r{t['revision']})"
+                    if n in last_voted_rev else "never voted"
+                )
+                seg = f"    {n}: — {state} [{liveness[n]}]"
+                if trails.get(n):
+                    seg += f"  trail: {' '.join(trails[n])}"
+            out.append(seg)
+        if gate_events:
+            parts = []
+            for ev in gate_events:
+                rev = f" r{ev['revision']}" if ev["revision"] is not None else ""
+                parts.append(
+                    f"{ev['created_at']} {ev['action']}{rev} by {ev['author']}"
+                    f" ({_oneline(str(ev['note'] or ''), 120)})")
+            out.append("  gate: " + " · ".join(parts))
 
     by_parent: dict[int | None, list[sqlite3.Row]] = {}
     for c in all_comments:
@@ -2114,7 +2193,7 @@ def _board_html() -> str:
 async def ping(request: Request):
     """Health/liveness endpoint (Glama listing check + generic watchers):
     plain 200 as long as the process serves — no auth, no db touch."""
-    return JSONResponse({"status": "ok", "version": "2.6.0"})
+    return JSONResponse({"status": "ok", "version": "2.7.0"})
 
 
 _STARTED_AT = time.time()  # v2.5 observability: /attention uptime face
