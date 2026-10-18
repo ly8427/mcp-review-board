@@ -382,10 +382,32 @@ def list_participants() -> str:
 
 
 # --- db helpers ------------------------------------------------------------
+class _AutoCloseConnection(sqlite3.Connection):
+    """`with conn:` on a stock sqlite3 connection only commits/rollbacks — it
+    does NOT close. The cursor<->connection reference cycle then outlives the
+    function return until cyclic GC, keeping the file handle + lock open
+    (Windows: TemporaryDirectory cleanup dies with WinError 32; any OS: a
+    long-lived server process silently accumulates handles/-wal). v2.8
+    follow-up #440 fix A: exit = super().__exit__ FIRST (transaction semantics
+    untouched — commit on success, rollback on exception, exceptions
+    propagate), close in finally. pi #442 verified this ordering on the
+    service-side sqlite (3.45.1); dsh #440 verified end-to-end on an
+    unmasked Windows run."""
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
 def _connect() -> sqlite3.Connection:
     """One connection per call. WAL + busy_timeout absorbs the 3 concurrent
-    writers (clients hit the single server process; SQLite serializes writes)."""
-    conn = sqlite3.connect(DB_PATH, timeout=10)  # 10s fallback for busy
+    writers (clients hit the single server process; SQLite serializes writes).
+    Every `with _connect() as conn:` site now closes on block exit (factory
+    above — pre-existing lifecycle debt, fixed per #440/#441/#442 ruling A)."""
+    conn = sqlite3.connect(DB_PATH, timeout=10,
+                           factory=_AutoCloseConnection)  # 10s fallback for busy
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=5000;")

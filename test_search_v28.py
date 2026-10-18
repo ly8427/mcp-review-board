@@ -405,6 +405,43 @@ def main() -> None:
         poll = server.list_comments_since(since="now", author="smoke")
         check("A15 poll face unaffected", poll.startswith("needs_attention:"))
 
+        # ---- #440 fix A anti-regression (pi #442 gate 2, Linux-judgeable) ----
+        # Record every connection the server layer creates; after the calls
+        # return, each must be CLOSED (execute raises ProgrammingError) —
+        # `with conn:` alone never closed them, the failure only surfaced on
+        # Windows as WinError 32 at tempdir cleanup.
+        db_leak = td / "leak.db"
+        _use_db(db_leak)
+        server.init_db()
+        seed(db_leak, [("leak", "open")],
+             [(1, "zcode", "连接关闭探针正文", "2026-10-05 10:00:00")])
+        recorded: list = []
+        orig_connect = server._connect
+
+        def recording_connect():
+            c = orig_connect()
+            recorded.append(c)
+            return c
+
+        server._connect = recording_connect
+        try:
+            server.init_db()
+            server.list_comments_since(since="now", author="leak-probe")
+            server.get_thread(1)
+            json.loads(server.search_comments(["连接关闭"]))
+        finally:
+            server._connect = orig_connect
+        open_handles = []
+        for c in recorded:
+            try:
+                c.execute("SELECT 1")
+                open_handles.append(c)   # still usable = NOT closed
+            except sqlite3.ProgrammingError:
+                pass                      # closed — the contract
+        check("#440A anti-regression: every server connection closed after return",
+              not open_handles, f"{len(open_handles)} still-open of {len(recorded)}")
+        _use_db(db)
+
     print()
     if fails:
         print(f"❌ SEARCH v2.8 ACCEPTANCE: {fails} failure(s)")
