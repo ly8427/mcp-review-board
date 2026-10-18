@@ -324,7 +324,7 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 - **字面量默认**:每个词按字面量短语加引号(内嵌双引号双写);裸 FTS5 语法仅 syntax:"fts5" 显式透传,非法语法返回 error 不静默回退。
 - **返回契约**:status(ok/timeout/unavailable/error)+ search_complete + results_truncated + total_count(仅 complete 时可判)+ mode{{route,syntax}}(正例负例都带;路由确定前失败为 null)。**零命中仅在 status=ok 且 search_complete=true 时可判「确实没有」**——未命中≠不存在的检索语义(#29 纪律)在此被做成可机器判定的字段。超时=执行层中断预算(默认 2s,含连接与锁等待),超时返回 timeout 不返回伪装的空结果。
 - **已知行为(如实文档化,非缺陷)**:大小写折叠按路径固有——FTS 路径折叠 Unicode(über 命中 ÜBER),LIKE 仅折叠 ASCII;不做 Unicode 规范化(NFD 查询可能 miss NFC 正文);rank=FTS 子查询 bm25 分(仅反映 ≥3 字词,越小越相关),like_scan 按 id 倒序。
-- **启动自检三层**:能力(SQLite≥3.34+FTS5+trigram)/结构(表+触发器)/一致性(就绪标记+行数+FTS5 integrity-check,写通道执行);不满足则**拒启用 search**+留审计(只记原因枚举+时间+版本,**不记查询正文**),核心服务不受影响;/ping 暴露 search 状态。被禁用时调用返回 unavailable,**绝不伪造零命中**。
+- **启动自检三层**:能力(SQLite≥3.34+FTS5+trigram)/结构(表+触发器)/一致性(就绪标记+行数+全量内容指纹 sha256,启动重算比对——比 integrity-check 更确定地抓陈旧索引);不满足则**拒启用 search**+留审计(只记原因枚举+时间+版本,**不记查询正文**),核心服务不受影响;/ping 暴露 search 状态。被禁用时调用返回 unavailable,**绝不伪造零命中**。
 - is_self=身份提示(author 自报口径,同 list_comments_since;未验证),**非独立性证明**,只标注不过滤不降权;context=同帖时间相邻评论(非因果),辅助阅读材料,不得当独立检索命中计数。
 
 ## 可靠性画像(v2.2,版本闸条款)
@@ -2194,10 +2194,10 @@ def search_comments(
     conn = _connect_ro()
     deadline = t0 + budget_s
     try:
-        if time.monotonic() > deadline:  # connect/lock wait already ate the budget
+        if time.monotonic() >= deadline:  # connect/lock wait already ate the budget (>=: a zero budget must abort deterministically even inside one OS timer tick — dsh #432)
             return payload("timeout", route, complete=False)
         conn.set_progress_handler(
-            lambda: 1 if time.monotonic() > deadline else 0, 500)
+            lambda: 1 if time.monotonic() >= deadline else 0, 500)
         base_sql = (
             f"SELECT c.id, c.thread_id, c.author, c.body, c.created_at,"
             f" th.title AS th_title, th.status AS th_status, {rank_sel}"
@@ -2241,7 +2241,7 @@ def search_comments(
             })
         return payload("ok", route, results, total=total)
     except sqlite3.Error as e:
-        if time.monotonic() > deadline:
+        if time.monotonic() >= deadline:
             return payload("timeout", route, complete=False)
         return payload("error", route,
                        extra={"error": _oneline(str(e), 200)}, complete=False)

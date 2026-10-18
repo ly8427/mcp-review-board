@@ -155,6 +155,11 @@ def main() -> None:
         r = search(["0%"])   # len 2 -> LIKE route: % must be escaped, not a wildcard
         check("M3-④a2 short % term via LIKE, literal", r["mode"]["route"] == "like_scan"
               and r["total_count"] == 1)
+        r = search(["*"])            # 1-codepoint literal must ride LIKE, never a silent FTS zero (pi #434)
+        r2 = search(['"'])
+        check("M3-④c 1-2 codepoint literals route to LIKE and hit",
+              r["mode"]["route"] == "like_scan" and r["total_count"] >= 1
+              and r2["mode"]["route"] == "like_scan" and r2["status"] == "ok")
         r = search(["a_b"])
         r2 = search(["aXb"])
         check("M3-④b _ not a wildcard (a_b misses aXb)",
