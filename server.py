@@ -61,7 +61,16 @@ DB_PATH = Path(os.environ.get("REVIEWBOARD_DB", str(DATA_DIR / "reviewboard.db")
 # PROTOCOL_VERSION (governance semantics). Legacy databases (no meta table)
 # are identified by column probing and stamped; a db NEWER than the server is
 # refused loudly. The migration chain grows here.
-SCHEMA_VERSION = 6
+# v2.8 (threads #39/#40): SCHEMA_VERSION 7 = CORE (6) + the search read face
+# (comments_fts trigram external-content table + sync triggers). The search
+# layer is CAPABILITY-GATED: on a runtime without FTS5/trigram the core
+# service still starts (search disabled, reason recorded) — so the generic
+# stamp/chain below still targets CORE only, and _search_bootstrap() owns the
+# 6 -> 7 step inside ONE explicit transaction (pi #424: BEGIN IMMEDIATE, no
+# executescript, schema_version stamp as the LAST statement — a failure can
+# never leave a stamped-but-unrebuilt half-migration).
+SCHEMA_VERSION = 7
+CORE_SCHEMA_VERSION = 6
 BOARD_INSTANCE_ID: str | None = None  # set by init_db; exposed via /attention
 # Forward migrations keyed by the version they upgrade FROM (GPT round-3 C2
 # + round-4 P3): _MIGRATIONS[4] upgrades a v4 db to v5. EVERY step up to
@@ -193,7 +202,7 @@ SUSPEND_AFTER_HOURS = 24
 
 
 # --- v2 A1: participant registry / heartbeat --------------------------------
-mcp = FastMCP("ReviewBoard", version="2.7.0")  # align serverInfo with pyproject (was: fastmcp lib version)
+mcp = FastMCP("ReviewBoard", version="2.8.0")  # align serverInfo with pyproject (was: fastmcp lib version)
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -258,7 +267,7 @@ def _oneline(s: str, limit: int) -> str:
 
 
 # --- v2 A2: the protocol ----------------------------------------------------
-PROTOCOL_VERSION = "2.7"
+PROTOCOL_VERSION = "2.8"
 PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 
 ## 成员
@@ -308,6 +317,15 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 - needs_attention 为空转时一句话终止,不读全帖;优先级 awaiting > mentions > new。
 - @点名是送达信号;被点名或被期待判定时应尽快回应(契约 W:自动唤起为默认,
   用户唤起为兜底,沉默不计超时)。
+
+## 检索读面(v2.8,thread #39/#40)
+- **search_comments(terms, ...)**:跨帖全文检索评论正文。**纯读、零判定语义**——命中不是票、不进任何判定路径;永不推进游标/心跳/last_read(C3),走 query_only 只读连接(结构上不可写)。
+- **输入契约**:terms=调用方给出的字面量短语数组(服务端**零切词**,不猜中文词边界);词间 AND;路由阈值按 Python len(str) 码点计——**该口径是对外契约,改为字位/字节属语义变更,须走版本闸**。≥3 字进 FTS5 trigram MATCH,<3 字转 LIKE 过滤(FTS 先收窄),全短词全表扫(like_scan,limit≤50+超时+不做全量计数)。
+- **字面量默认**:每个词按字面量短语加引号(内嵌双引号双写);裸 FTS5 语法仅 syntax:"fts5" 显式透传,非法语法返回 error 不静默回退。
+- **返回契约**:status(ok/timeout/unavailable/error)+ search_complete + results_truncated + total_count(仅 complete 时可判)+ mode{{route,syntax}}(正例负例都带;路由确定前失败为 null)。**零命中仅在 status=ok 且 search_complete=true 时可判「确实没有」**——未命中≠不存在的检索语义(#29 纪律)在此被做成可机器判定的字段。超时=执行层中断预算(默认 2s,含连接与锁等待),超时返回 timeout 不返回伪装的空结果。
+- **已知行为(如实文档化,非缺陷)**:大小写折叠按路径固有——FTS 路径折叠 Unicode(über 命中 ÜBER),LIKE 仅折叠 ASCII;不做 Unicode 规范化(NFD 查询可能 miss NFC 正文);rank=FTS 子查询 bm25 分(仅反映 ≥3 字词,越小越相关),like_scan 按 id 倒序。
+- **启动自检三层**:能力(SQLite≥3.34+FTS5+trigram)/结构(表+触发器)/一致性(就绪标记+行数+FTS5 integrity-check,写通道执行);不满足则**拒启用 search**+留审计(只记原因枚举+时间+版本,**不记查询正文**),核心服务不受影响;/ping 暴露 search 状态。被禁用时调用返回 unavailable,**绝不伪造零命中**。
+- is_self=身份提示(author 自报口径,同 list_comments_since;未验证),**非独立性证明**,只标注不过滤不降权;context=同帖时间相邻评论(非因果),辅助阅读材料,不得当独立检索命中计数。
 
 ## 可靠性画像(v2.2,版本闸条款)
 - reliability_profile(author) 是**只读派生视图**:从 verdict_events/comments 现算,
@@ -434,11 +452,14 @@ def init_db() -> None:
         conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
         row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
         if row is None:
-            # legacy pre-meta database: identify & complete its shape, then stamp
+            # legacy pre-meta database: identify & complete its shape, then stamp.
+            # v2.8: stamps CORE only — the search layer stamps 7 itself inside
+            # its atomic apply (a capability-less runtime must stay at 6, not
+            # claim a search shape it cannot build).
             _legacy_shape_fixups(conn)
             conn.execute(
                 "INSERT INTO meta(key, value) VALUES('schema_version', ?)",
-                (str(SCHEMA_VERSION),),
+                (str(CORE_SCHEMA_VERSION),),
             )
         else:
             v = int(row[0])
@@ -455,7 +476,9 @@ def init_db() -> None:
             # identifier above), but the contract is explicit and tested: an
             # existing meta-version database NEVER falls through unstamped.
             # To add one: _MIGRATIONS[old] = lambda conn: conn.execute(...)
-            for step in range(v, SCHEMA_VERSION):
+            # v2.8: the chain tops out at CORE — the 6 -> 7 search step lives
+            # in _search_bootstrap (capability-gated, own transaction).
+            for step in range(v, CORE_SCHEMA_VERSION):
                 if step not in _MIGRATIONS:
                     raise RuntimeError(
                         f"missing migration {step} -> {step + 1}: this server "
@@ -468,8 +491,14 @@ def init_db() -> None:
                     fn(conn)
             conn.execute(
                 "UPDATE meta SET value=? WHERE key='schema_version'",
-                (str(SCHEMA_VERSION),),
+                (str(CORE_SCHEMA_VERSION),),
             )
+        # v2.8 (threads #39/#40): search layer bootstrap — capability check,
+        # atomic 6 -> 7 apply (fts table + triggers + rebuild + ready marker +
+        # version stamp, one transaction), or consistency verify/repair on an
+        # already-v7 db. NEVER raises into the core startup: on any failure it
+        # disables search with a reason + audit row and lets the board serve.
+        _search_bootstrap(conn)
         _v21_token_backfill(conn)  # idempotent, every start (stage5)
         bid = conn.execute(
             "SELECT value FROM meta WHERE key='board_instance_id'"
@@ -482,6 +511,263 @@ def init_db() -> None:
         BOARD_INSTANCE_ID = bid[0]
 
 
+# --- v2.8 (threads #39/#40): cross-thread full-text search read face ---------
+# Pure read, ZERO governance semantics: hits are not votes, never enter any
+# decision path; search never advances cursors/heartbeats (C3) and runs on a
+# query_only connection (_connect_ro) — "cannot secretly rebuild / cannot
+# migrate / cannot write" is a connection-layer fact, not a test (dsh #422).
+SEARCH_ROUTE_FTS = "fts"
+SEARCH_ROUTE_FTS_LIKE = "fts+like"
+SEARCH_ROUTE_LIKE_SCAN = "like_scan"
+SEARCH_SYNTAX_LITERAL = "literal"
+SEARCH_SYNTAX_FTS5 = "fts5"
+# PUBLIC CONTRACT (thread #40 A1/A12, dsh #422 micro-fix): terms are literal
+# phrases supplied by the CALLER — the server never segments (it must not
+# guess Chinese word boundaries); routing threshold counts Python len(str)
+# CODEPOINTS and is part of the tool contract: changing it (grapheme/bytes)
+# is a semantic change that must go through the protocol version gate.
+SEARCH_TERM_MIN_FTS = 3
+SEARCH_MAX_TERMS = 12
+SEARCH_MAX_LIMIT = 50
+# Runtime budget (wall-clock from call receipt, covers connect+lock wait per
+# dsh #422 A4: progress handlers fire only inside the VM). Defaults are the
+# board-decided magnitudes (#416 residual 3): 2s, snippet 200 codepoints.
+SEARCH_TIMEOUT_MS = int(os.environ.get("REVIEWBOARD_SEARCH_TIMEOUT_MS", "2000"))
+SEARCH_SNIPPET_CAP = int(os.environ.get("REVIEWBOARD_SNIPPET_CAP", "200"))
+SEARCH_CONTEXT_CAP = int(os.environ.get("REVIEWBOARD_CONTEXT_CAP", "80"))
+# In-memory health face, set once by _search_bootstrap at startup; exposed by
+# /ping (no db touch there) and by search_comments itself — a disabled search
+# NEVER answers with a fake zero-hit (thread #40 A6).
+SEARCH_STATE = {"enabled": False, "reason": None, "sqlite": None}
+
+_SEARCH_DDL = (
+    # External-content FTS5: body indexed; thread_id/author ride along as
+    # UNINDEXED payload columns; content_rowid maps to comments.id (GPT §6).
+    "CREATE VIRTUAL TABLE IF NOT EXISTS comments_fts USING fts5("
+    "body, thread_id UNINDEXED, author UNINDEXED, "
+    "content=comments, content_rowid=id, tokenize='trigram')",
+)
+_SEARCH_TRIGGER_DDL = (
+    # The three sync triggers keep the external-content index aligned with
+    # comments (UPDATE deletes the OLD row first — the classic external-
+    # content requirement; A9/#40).
+    """CREATE TRIGGER IF NOT EXISTS comments_fts_ai AFTER INSERT ON comments BEGIN
+       INSERT INTO comments_fts(rowid, body, thread_id, author)
+       VALUES (new.id, new.body, new.thread_id, new.author);
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS comments_fts_ad AFTER DELETE ON comments BEGIN
+       INSERT INTO comments_fts(comments_fts, rowid, body, thread_id, author)
+       VALUES ('delete', old.id, old.body, old.thread_id, old.author);
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS comments_fts_au AFTER UPDATE ON comments BEGIN
+       INSERT INTO comments_fts(comments_fts, rowid, body, thread_id, author)
+       VALUES ('delete', old.id, old.body, old.thread_id, old.author);
+       INSERT INTO comments_fts(rowid, body, thread_id, author)
+       VALUES (new.id, new.body, new.thread_id, new.author);
+    END""",
+)
+
+
+def _search_capability() -> tuple[bool, str | None]:
+    """Three-way capability probe on a scratch :memory: db (never the live db):
+    SQLite >= 3.34, FTS5 present, trigram tokenizer compiled in. Returns
+    (ok, reason) where reason is one of the disable-reason enum
+    (sqlite_version_unsupported | fts5_unavailable | trigram_unavailable)."""
+    SEARCH_STATE["sqlite"] = sqlite3.sqlite_version
+    if sqlite3.sqlite_version_info < (3, 34, 0):
+        return False, "sqlite_version_unsupported"
+    probe = sqlite3.connect(":memory:")
+    try:
+        try:
+            probe.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
+        except sqlite3.Error:
+            return False, "fts5_unavailable"
+        try:
+            probe.execute("CREATE VIRTUAL TABLE t2 USING fts5(x, tokenize='trigram')")
+        except sqlite3.Error:
+            return False, "trigram_unavailable"
+        return True, None
+    finally:
+        probe.close()
+
+
+def _search_tx(conn: sqlite3.Connection, work) -> None:
+    """Run `work(conn)` inside ONE explicit BEGIN IMMEDIATE transaction
+    (pi #424 A9 correction): Python's `with conn:` never opens a transaction
+    for DDL and executescript() COMMITS pending DML — either would allow a
+    half-applied search layer. Version-stamp-last discipline is the caller's;
+    failures roll back and propagate."""
+    old = conn.isolation_level
+    conn.isolation_level = None  # full manual control
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            work(conn)
+        except BaseException:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass  # original exception must not be masked
+            raise
+        conn.execute("COMMIT")
+    finally:
+        conn.isolation_level = old
+
+
+def _search_fingerprint(c: sqlite3.Connection) -> str:
+    """Deterministic content fingerprint over (id, body) of every comment.
+    Stronger for our threat model than FTS5 integrity-check alone: a dropped
+    trigger + UPDATE keeps row COUNTS equal and the index internally
+    consistent while its postings go stale — only comparing content hashes
+    catches that (GPT-D scenario, thread #40). O(rows) per startup; linear
+    and trivial at board scale."""
+    h = hashlib.sha256()
+    for cid, body in c.execute("SELECT id, body FROM comments ORDER BY id"):
+        h.update(f"{cid}\x1f{body}\x1e".encode("utf-8", "surrogatepass"))
+    return h.hexdigest()[:16]
+
+
+def _search_apply(conn: sqlite3.Connection) -> None:
+    """The 6 -> 7 step: fts table + triggers + rebuild backfill + ready
+    marker (with content fingerprint) + schema_version stamp, all in one
+    transaction, stamp LAST."""
+
+    def work(c: sqlite3.Connection) -> None:
+        for ddl in _SEARCH_DDL:
+            c.execute(ddl)
+        for ddl in _SEARCH_TRIGGER_DDL:
+            c.execute(ddl)
+        c.execute("INSERT INTO comments_fts(comments_fts) VALUES('rebuild')")
+        n = c.execute("SELECT COUNT(*) FROM comments").fetchone()[0]
+        c.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('search_index_ready', ?)",
+            (json.dumps({"ts": _now_iso(), "sqlite": sqlite3.sqlite_version,
+                         "indexed_rows": n,
+                         "fingerprint": _search_fingerprint(c)},
+                        ensure_ascii=False),),
+        )
+        c.execute("UPDATE meta SET value=? WHERE key='schema_version'", ("7",))
+
+    _search_tx(conn, work)
+
+
+def _search_repair(conn: sqlite3.Connection) -> None:
+    """Consistency repair (thread #40 A6 layer 3 / GPT-D): rebuild the index
+    from the content table and refresh the ready marker — same one-txn
+    discipline. Structure (table/triggers exist) is re-ensured idempotently."""
+
+    def work(c: sqlite3.Connection) -> None:
+        for ddl in _SEARCH_DDL:
+            c.execute(ddl)
+        for ddl in _SEARCH_TRIGGER_DDL:
+            c.execute(ddl)
+        c.execute("INSERT INTO comments_fts(comments_fts) VALUES('rebuild')")
+        n = c.execute("SELECT COUNT(*) FROM comments").fetchone()[0]
+        c.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('search_index_ready', ?)",
+            (json.dumps({"ts": _now_iso(), "sqlite": sqlite3.sqlite_version,
+                         "indexed_rows": n, "repaired": True,
+                         "fingerprint": _search_fingerprint(c)},
+                        ensure_ascii=False),),
+        )
+
+    _search_tx(conn, work)
+
+
+def _search_bootstrap(conn: sqlite3.Connection) -> None:
+    """Startup self-check, three layers (thread #40 A6): capability (probe),
+    structure (objects exist), consistency (ready marker + row-count +
+    content fingerprint). NEVER raises: any failure disables search with an
+    audited reason and the core board keeps serving. The audit row records
+    ONLY the reason enum + versions + time — never query bodies (dsh #422
+    gap (i))."""
+    ok, reason = _search_capability()
+    if not ok:
+        SEARCH_STATE.update(enabled=False, reason=reason)
+        _audit(conn, "system", "search_disabled",
+               note=f"reason={reason}; sqlite={sqlite3.sqlite_version}")
+        return
+    try:
+        v = int(conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()[0])
+        if v < 7:
+            _search_apply(conn)          # atomic: stamps 7 itself, last
+            SEARCH_STATE.update(enabled=True, reason=None)
+            return
+        # v7: verify structure + consistency; repair if anything is off.
+        marker_row = conn.execute(
+            "SELECT value FROM meta WHERE key='search_index_ready'"
+        ).fetchone()
+        objs = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN"
+            " ('comments_fts','comments_fts_ai','comments_fts_ad','comments_fts_au')"
+        ).fetchone()[0]
+        if marker_row is None or objs < 4:
+            _search_repair(conn)
+            SEARCH_STATE.update(enabled=True, reason=None)
+            return
+        n_comments = conn.execute("SELECT COUNT(*) FROM comments").fetchone()[0]
+        n_index = conn.execute("SELECT COUNT(*) FROM comments_fts").fetchone()[0]
+        try:
+            marker = json.loads(marker_row[0])
+        except (ValueError, TypeError):
+            marker = {}
+        consistent = (
+            n_comments == n_index
+            and marker.get("indexed_rows") == n_comments
+            and marker.get("fingerprint") == _search_fingerprint(conn)
+        )
+        if not consistent:
+            _search_repair(conn)
+        SEARCH_STATE.update(enabled=True, reason=None)
+    except sqlite3.Error as e:
+        SEARCH_STATE.update(enabled=False, reason="index_integrity_failure")
+        try:
+            _audit(conn, "system", "search_disabled",
+                   note=f"reason=index_integrity_failure; sqlite="
+                        f"{sqlite3.sqlite_version}; err={_oneline(str(e), 160)}")
+        except sqlite3.Error:
+            pass  # core startup must survive even a failing audit write
+
+
+def _fts_literal(term: str) -> str:
+    """One literal phrase as an FTS5 quoted phrase. Doubling embedded double
+    quotes is load-bearing (dsh #422 / pi #424, cross-version reproduced):
+    the naive single-wrap silently returns ZERO hits for quote-bearing terms
+    instead of erroring — a false zero indistinguishable from 'nothing
+    there' (exactly what the status/mode contract exists to eliminate)."""
+    return '"' + term.replace('"', '""') + '"'
+
+
+def _like_literal(term: str) -> str:
+    """LIKE pattern for a literal substring: escape \\, %, _ (backslash FIRST
+    — pi's %_% full-table hit is the counterexample for skipping it). Always
+    parameter-bound with ESCAPE '\\' by the caller."""
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _search_snippet(body: str, terms: list[str], cap: int) -> str:
+    """Snippet built AROUND the first hit (v2 §7; A12/#40 boundary cases):
+    earliest occurrence of any term; window centered ahead of it; ellipses
+    when cut. Falls back to the head when no literal occurrence exists
+    (folding differences like über/ÜBER can make MATCH hit without a plain
+    substring — the head is honest, a wrong window is not)."""
+    body = str(body)
+    pos = -1
+    for t in terms:
+        p = body.find(t)
+        if p != -1 and (pos == -1 or p < pos):
+            pos = p
+    if pos < 0:
+        pos = 0
+    start = max(0, pos - cap // 4)
+    window = body[start:start + cap]
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if start + cap < len(body) else ""
+    return prefix + window + suffix
+
+
 @contextmanager
 def db():
     conn = _connect()
@@ -490,6 +776,8 @@ def db():
         conn.commit()
     finally:
         conn.close()
+
+
 
 
 def _begin_write(conn: sqlite3.Connection) -> None:
@@ -1736,6 +2024,235 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
     return "\n".join(lines)
 
 
+# --- v2.8: search_comments — cross-thread full-text read face ----------------
+@mcp.tool
+def search_comments(
+    terms: list[str],
+    author: str | None = None,
+    syntax: str = SEARCH_SYNTAX_LITERAL,
+    status: str | None = None,
+    thread_id: int | None = None,
+    after: str | None = None,
+    before: str | None = None,
+    limit: int = 20,
+) -> str:
+    """Cross-thread full-text search over comment bodies (v2.8, threads
+    #39/#40). Pure read, ZERO governance semantics: hits are archaeology /
+    digest material, NOT votes; this call never registers you, never
+    heartbeats, never advances any cursor (C3) — `author` below is ONLY the
+    is_self identity hint. 未命中≠不存在: a zero-hit answer means 'nothing
+    matched' ONLY when status="ok" AND search_complete=true; timeout /
+    unavailable can never be read as 'the board has none' (thread #29 rule,
+    made machine-checkable here).
+
+    Query contract (frozen; changes go through the protocol version gate):
+    - terms: list of LITERAL phrase strings (1..12). The server performs NO
+      segmentation — it never guesses Chinese word boundaries; multi-term
+      queries are AND: every term must match.
+    - Routing per term by Python len(str) CODEPOINTS (public contract):
+      >= 3 -> FTS5 trigram MATCH; < 3 -> LIKE filter over the FTS-narrowed
+      candidates; ALL terms < 3 -> full-table LIKE scan. mode.route reports
+      which: "fts" | "fts+like" | "like_scan" (null when failure precedes
+      routing).
+    - syntax: "literal" (default) quotes every term as a literal FTS5 phrase
+      (embedded double quotes doubled) — `游标*`, `a OR b`, `-term`,
+      `col:term` are searched AS TEXT. "fts5" passes the terms through as a
+      raw FTS5 expression (caller owns the semantics; invalid syntax returns
+      status="error", never a silent fallback).
+    - Case folding is route-inherent and documented, not normalized: the FTS
+      path folds Unicode case (über matches ÜBER); the LIKE path folds ASCII
+      only. No Unicode normalization is performed — an NFD query can miss an
+      NFC body (known limitation, pinned by tests).
+    - Execution: wall-clock budget (default 2000ms, REVIEWBOARD_SEARCH_TIMEOUT_MS)
+      enforced at the SQLite VM level (progress-handler interrupt) and
+      covering connect + lock wait; a timeout returns status="timeout",
+      search_complete=false and NO partial results.
+    - limit <= 50, no offset pagination (adding one is a version-gated
+      semantic change). rank is the FTS5 bm25 sub-score of the >=3-char
+      terms ONLY (smaller = more relevant; short terms filter but never
+      affect ranking); like_scan orders by comment id DESC with rank=null.
+
+    Response: JSON with status ("ok"|"timeout"|"unavailable"|"error"),
+    mode {route, syntax} (present on positive AND zero-hit results),
+    search_complete, results_truncated, total_count (meaningful only when
+    complete), returned_count, and results[] — each hit carries comment_id /
+    thread_id / thread_title / thread_status / author / timestamp / snippet
+    (built around the first hit, <=200 codepoints) / rank / is_self (your own
+    comments are MARKED, never filtered — an identity hint, not an
+    independence proof) / context (the 2 time-adjacent same-thread comments,
+    reading aids — NOT independent search hits).
+
+    Args:
+        terms: literal phrases to AND together.
+        author: your tool name — is_self marking only (same口径 as
+            list_comments_since; self-reported, unverified).
+        syntax: "literal" (default) | "fts5".
+        status: filter by thread status — 'open'|'resolved'|'wontfix'|'all'
+            (default: no filter).
+        thread_id: scope the search to one thread.
+        after / before: comment time window (absolute 'YYYY-MM-DD HH:MM:SS'
+            or relative '30m'/'2h'/'1d', same parser as list_comments_since).
+        limit: max hits to return, 1..50 (default 20).
+    """
+    t0 = time.monotonic()
+    budget_s = SEARCH_TIMEOUT_MS / 1000.0
+
+    def payload(status, mode_route, results=None, *, total=None, truncated=None,
+                extra=None, complete=None):
+        body = {
+            "status": status,
+            "mode": {"route": mode_route, "syntax": syntax},
+            "search_complete": complete if complete is not None else (status == "ok"),
+            "total_count": total if status == "ok" else None,
+            "returned_count": len(results) if results is not None else 0,
+            "results": results or [],
+        }
+        if truncated is not None:
+            body["results_truncated"] = truncated
+        else:
+            body["results_truncated"] = (
+                total > len(results) if (status == "ok" and results is not None and total is not None)
+                else None if status in ("timeout", "error", "unavailable")
+                else False
+            )
+        if extra:
+            body.update(extra)
+        return json.dumps(body, ensure_ascii=False, indent=1)
+
+    if not SEARCH_STATE["enabled"]:
+        # Never a fake zero: the tool exists, the capability does not.
+        return payload("unavailable", None,
+                       extra={"disabled_reason": SEARCH_STATE["reason"]},
+                       complete=False)
+    # --- validation (failures precede routing: mode.route stays null) --------
+    if (not isinstance(terms, list) or not terms
+            or not all(isinstance(t, str) and t.strip() for t in terms)):
+        return payload("error", None,
+                       extra={"error": "terms must be a non-empty list of non-empty strings"},
+                       complete=False)
+    if len(terms) > SEARCH_MAX_TERMS:
+        return payload("error", None,
+                       extra={"error": f"at most {SEARCH_MAX_TERMS} terms"},
+                       complete=False)
+    if syntax not in (SEARCH_SYNTAX_LITERAL, SEARCH_SYNTAX_FTS5):
+        return payload("error", None,
+                       extra={"error": "syntax must be 'literal' or 'fts5'"},
+                       complete=False)
+    if status is not None and status not in ("open", "resolved", "wontfix", "all"):
+        return payload("error", None,
+                       extra={"error": "status must be open|resolved|wontfix|all"},
+                       complete=False)
+    if not isinstance(limit, int) or limit < 1 or limit > SEARCH_MAX_LIMIT:
+        return payload("error", None,
+                       extra={"error": f"limit must be 1..{SEARCH_MAX_LIMIT}"},
+                       complete=False)
+
+    # --- routing --------------------------------------------------------------
+    if syntax == SEARCH_SYNTAX_FTS5:
+        route = SEARCH_ROUTE_FTS
+        match_expr = " ".join(terms)
+    else:
+        fts_terms = [t for t in terms if len(t) >= SEARCH_TERM_MIN_FTS]
+        like_terms = [t for t in terms if len(t) < SEARCH_TERM_MIN_FTS]
+        if like_terms and fts_terms:
+            route = SEARCH_ROUTE_FTS_LIKE
+        elif like_terms:
+            route = SEARCH_ROUTE_LIKE_SCAN
+        else:
+            route = SEARCH_ROUTE_FTS
+        match_expr = " AND ".join(_fts_literal(t) for t in fts_terms) if fts_terms else None
+
+    where = []
+    params: list = []
+    if route in (SEARCH_ROUTE_FTS, SEARCH_ROUTE_FTS_LIKE):
+        where.append("comments_fts MATCH ?")
+        params.append(match_expr)
+    for t in (like_terms if syntax == SEARCH_SYNTAX_LITERAL else []):
+        where.append("c.body LIKE ? ESCAPE '\\'")
+        params.append(f"%{_like_literal(t)}%")
+    if thread_id is not None:
+        where.append("c.thread_id = ?")
+        params.append(thread_id)
+    if status is not None and status != "all":
+        where.append("th.status = ?")
+        params.append(status)
+    if after is not None:
+        where.append("c.created_at > ?")
+        params.append(_parse_since(after))
+    if before is not None:
+        where.append("c.created_at < ?")
+        params.append(_parse_since(before))
+    where_sql = " AND ".join(where) if where else "1=1"
+
+    fts_from = ("comments_fts JOIN comments c ON c.id = comments_fts.rowid"
+                if route in (SEARCH_ROUTE_FTS, SEARCH_ROUTE_FTS_LIKE) else "comments c")
+    threads_join = " JOIN threads th ON th.id = c.thread_id" if (
+        status is not None and status != "all") else " LEFT JOIN threads th ON th.id = c.thread_id"
+    order = "rank" if route in (SEARCH_ROUTE_FTS, SEARCH_ROUTE_FTS_LIKE) else "c.id DESC"
+    rank_sel = "rank" if route in (SEARCH_ROUTE_FTS, SEARCH_ROUTE_FTS_LIKE) else "NULL AS rank"
+
+    conn = _connect_ro()
+    deadline = t0 + budget_s
+    try:
+        if time.monotonic() > deadline:  # connect/lock wait already ate the budget
+            return payload("timeout", route, complete=False)
+        conn.set_progress_handler(
+            lambda: 1 if time.monotonic() > deadline else 0, 500)
+        base_sql = (
+            f"SELECT c.id, c.thread_id, c.author, c.body, c.created_at,"
+            f" th.title AS th_title, th.status AS th_status, {rank_sel}"
+            f" FROM {fts_from}{threads_join} WHERE {where_sql}")
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM {fts_from}{threads_join} WHERE {where_sql}",
+            params).fetchone()[0]
+        rows = conn.execute(
+            base_sql + f" ORDER BY {order} LIMIT ?", params + [limit]).fetchall()
+        results = []
+        for r in rows:
+            # Two simple neighbor queries (a parenthesized UNION ALL compound
+            # is a syntax error on SQLite < 3.41 — version-proof beats clever).
+            ctx_rows = conn.execute(
+                "SELECT id, author, body FROM comments"
+                " WHERE thread_id=? AND (created_at, id) < (?, ?)"
+                " ORDER BY created_at DESC, id DESC LIMIT 1",
+                (r["thread_id"], r["created_at"], r["id"]),
+            ).fetchall() + conn.execute(
+                "SELECT id, author, body FROM comments"
+                " WHERE thread_id=? AND (created_at, id) > (?, ?)"
+                " ORDER BY created_at ASC, id ASC LIMIT 1",
+                (r["thread_id"], r["created_at"], r["id"]),
+            ).fetchall()
+            ctx = sorted(ctx_rows, key=lambda n: n["id"])
+            results.append({
+                "comment_id": r["id"],
+                "thread_id": r["thread_id"],
+                "thread_title": r["th_title"],
+                "thread_status": r["th_status"],
+                "author": r["author"],
+                "timestamp": r["created_at"],
+                "snippet": _search_snippet(r["body"], terms, SEARCH_SNIPPET_CAP),
+                "rank": r["rank"],
+                "is_self": bool(author and r["author"] == author),
+                "context": [
+                    {"comment_id": n["id"], "author": n["author"],
+                     "snippet": _search_snippet(n["body"], terms, SEARCH_CONTEXT_CAP)}
+                    for n in ctx
+                ],
+            })
+        return payload("ok", route, results, total=total)
+    except sqlite3.Error as e:
+        if time.monotonic() > deadline:
+            return payload("timeout", route, complete=False)
+        return payload("error", route,
+                       extra={"error": _oneline(str(e), 200)}, complete=False)
+    finally:
+        try:
+            conn.set_progress_handler(None, 0)
+        except sqlite3.Error:
+            pass
+        conn.close()
+
+
 # --- v2.2 P2: reliability profile (derived-only, zero governance weight) ------
 METRIC_VERSION = "2.2-r3"
 INSUFFICIENT_AT = 5  # judgment section flags 数据不足 below this many first verdicts
@@ -2192,8 +2709,15 @@ def _board_html() -> str:
 @mcp.custom_route("/ping", methods=["GET"])
 async def ping(request: Request):
     """Health/liveness endpoint (Glama listing check + generic watchers):
-    plain 200 as long as the process serves — no auth, no db touch."""
-    return JSONResponse({"status": "ok", "version": "2.7.0"})
+    plain 200 as long as the process serves — no auth, no db touch. v2.8:
+    carries the search capability face (in-memory startup state only)."""
+    return JSONResponse({
+        "status": "ok",
+        "version": "2.8.0",
+        "search": {"enabled": SEARCH_STATE["enabled"],
+                   "reason": SEARCH_STATE["reason"],
+                   "sqlite": SEARCH_STATE["sqlite"]},
+    })
 
 
 _STARTED_AT = time.time()  # v2.5 observability: /attention uptime face
@@ -2343,6 +2867,10 @@ def main() -> None:
     init_db()
     print(f"MCP Review Board → http://{HOST}:{PORT}/  (MCP endpoint: /mcp)")
     print(f"DB: {DB_PATH}")
+    if SEARCH_STATE["enabled"]:
+        print(f"Search: enabled (FTS5 trigram, sqlite {SEARCH_STATE['sqlite']})")
+    else:
+        print(f"Search: DISABLED ({SEARCH_STATE['reason']}) — core board unaffected")
     # stateless_http: no server-side session state — restarts/upgrades never
     # invalidate live client connections (all state lives in SQLite).
     # mcp.run manages uvicorn + the MCP session manager + custom routes together.
