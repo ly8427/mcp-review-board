@@ -31,7 +31,11 @@ def _use_db(path: Path) -> None:
 
 
 def _meta(db) -> dict:
-    return dict(sqlite3.connect(db).execute("SELECT key, value FROM meta").fetchall())
+    c = sqlite3.connect(db)
+    try:  # close before return: an open handle kills Windows tempdir cleanup (dsh #444)
+        return dict(c.execute("SELECT key, value FROM meta").fetchall())
+    finally:
+        c.close()
 
 
 def main() -> None:
@@ -176,6 +180,7 @@ def main() -> None:
         names = lambda cx: {r[0] for r in cx.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         check("f1 schema.sql == embedded fallback (table sets)", names(ta) == names(tb))
+        ta.close(); tb.close()  # dsh #444: same WinError 32 shape as the v2.8 matrix had
 
         # g) v5 -> v6 (issue #3): id-cursor column added + backfill semantics.
         #    Hand-built v5 db: participants WITHOUT last_delivered_id, meta
