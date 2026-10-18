@@ -66,6 +66,12 @@ def audit(root: pathlib.Path):
             conn = Counter()
             close = Counter()
             lines = {}
+            # dsh #458: the exemption must be PER-VARIABLE — only the var whose
+            # connect sits inside `with closing(...)/enter_context(...)`. The
+            # old function-wide blanket hid a co-resident leaked named connect
+            # (fixture-proven false negative; dead code on this tree, but the
+            # M6 item (i) verdict depends on it).
+            wrapped_vars = set()
             for n in ast.walk(fn):
                 if is_connect(n):
                     par = pm.get(n)
@@ -74,17 +80,19 @@ def audit(root: pathlib.Path):
                         var = par.targets[0].id
                     elif isinstance(par, ast.withitem) and isinstance(par.optional_vars, ast.Name):
                         var = par.optional_vars.id
+                        ctx = par.context_expr
+                        if (isinstance(ctx, ast.Call) and isinstance(ctx.func, ast.Attribute)
+                                and ctx.func.attr in ("closing", "enter_context")):
+                            wrapped_vars.add(var)
                     if var:
                         conn[var] += 1
                         lines.setdefault(var, []).append(n.lineno)
                 elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                       and n.func.attr == "close" and isinstance(n.func.value, ast.Name)):
                     close[n.func.value.id] += 1
-            wrapped = any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                          and n.func.attr in ("closing", "enter_context") for n in ast.walk(fn))
             for var, c in conn.items():
                 file_sites += c
-                if wrapped:
+                if var in wrapped_vars:
                     continue
                 ncl = close[var]
                 if ncl < c:
@@ -105,12 +113,23 @@ def selfcheck() -> int:
              'def g(db):\n    c = sqlite3.connect(db)\n'
              '    try:\n        return c.execute("SELECT 1").fetchone()\n'
              '    finally:\n        c.close()\n')
+    # dsh #458 mixed fixture: a wrapped connect AND a leaked named connect in
+    # the SAME function — the old function-wide exemption read this as clean.
+    mixed = ('import sqlite3\nimport contextlib\n'
+             'def h(a, b):\n'
+             '    with contextlib.closing(sqlite3.connect(b)) as ok:\n'
+             '        ok.execute("SELECT 1")\n'
+             '    leak = sqlite3.connect(a)\n'
+             '    return leak.execute("SELECT 1").fetchone()\n')
     with tempfile.TemporaryDirectory() as td:
         root = pathlib.Path(td)
         (root / "leaky.py").write_text(leaky, encoding="utf-8")
         (root / "clean.py").write_text(clean, encoding="utf-8")
+        (root / "mixed.py").write_text(mixed, encoding="utf-8")
         f, s, d = audit(root)
-        ok = (f, s) == (2, 2) and len(d) == 1 and d[0][0] == "leaky.py"
+        ok = ((f, s) == (3, 3) and len(d) == 2
+              and {x[0] for x in d} == {"leaky.py", "mixed.py"}
+              and all(x[2] == "leak" or x[0] == "leaky.py" for x in d))
         print("selfcheck:", "PASS" if ok else f"FAIL ({f} files, {s} sites, deficits={d})")
         return 0 if ok else 1
 
