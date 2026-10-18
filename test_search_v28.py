@@ -405,6 +405,83 @@ def main() -> None:
         poll = server.list_comments_since(since="now", author="smoke")
         check("A15 poll face unaffected", poll.startswith("needs_attention:"))
 
+        # ---- stamp stability (pre-release catch 2026-10-18 + dsh #432 f3) ----
+        db_s = td / "stamp.db"
+        _use_db(db_s)
+        server.init_db()
+        # NO writes between these two inits: the marker must be untouched —
+        # the pre-release stamp bug forced a full re-apply (rebuild) every boot.
+        m1 = q1(db_s, "SELECT value FROM meta WHERE key='search_index_ready'")[0]
+        server.BOARD_INSTANCE_ID = None
+        server.init_db()
+        m2 = q1(db_s, "SELECT value FROM meta WHERE key='search_index_ready'")[0]
+        check("stamp: no-write re-init leaves marker untouched (no per-boot rebuild)",
+              m1 == m2 and "repaired" not in m2
+              and q1(db_s, "SELECT value FROM meta WHERE key='schema_version'")[0] == "7")
+        seed(db_s, [("stamp", "open")], [(1, "zcode", "戳稳定性探针", "2026-10-06 09:00:00")])
+        server._search_capability = lambda: (False, "trigram_unavailable")
+        server.BOARD_INSTANCE_ID = None
+        server.init_db()
+        keep_v = q1(db_s, "SELECT value FROM meta WHERE key='schema_version'")[0]
+        n_trig = sqlite3.connect(db_s).execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger'"
+            " AND name LIKE 'comments_fts_%'").fetchone()[0]
+        cx = sqlite3.connect(db_s); cx.close()
+        check("stamp: incapable runtime KEEPS v7 stamp + objects (f3 option b)",
+              keep_v == "7" and n_trig == 3
+              and server.SEARCH_STATE["enabled"] is False)
+        server._search_capability = saved_cap
+        _use_db(db)
+
+        # ---- concurrency: writers x searchers (M6 pre-release item, #432/#434) ----
+        import threading
+        db_cx = td / "conc.db"
+        _use_db(db_cx)
+        server.init_db()
+        seed(db_cx, [("并发", "open")], [(1, "seed", "种子内容并发基线", "2026-10-06 10:00:00")])
+        errors: list = []
+        search_status: list = []
+
+        def writer(k: int) -> None:
+            try:
+                for i in range(15):
+                    c = sqlite3.connect(db_cx, timeout=10)
+                    c.execute("PRAGMA busy_timeout=5000")
+                    c.execute("BEGIN IMMEDIATE")
+                    c.execute(
+                        "INSERT INTO comments(thread_id, author, body, created_at)"
+                        " VALUES(1,?,?,?)",
+                        (f"w{k}", f"并发写入行 w{k}-{i} 唯一标记{k}x{i}",
+                         f"2026-10-06 11:{k:02d}:{i:02d}"))
+                    c.commit()
+                    c.close()
+            except Exception as e:  # noqa: BLE001 — record, don't kill the thread
+                errors.append(("write", k, repr(e)))
+
+        def searcher(k: int) -> None:
+            try:
+                for _ in range(8):
+                    search_status.append(search(["并发写入行"])["status"])
+            except Exception as e:  # noqa: BLE001
+                errors.append(("search", k, repr(e)))
+
+        ts = ([threading.Thread(target=writer, args=(k,)) for k in range(3)]
+              + [threading.Thread(target=searcher, args=(k,)) for k in range(2)])
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        cc = sqlite3.connect(db_cx)
+        n_comments = cc.execute("SELECT COUNT(*) FROM comments").fetchone()[0]
+        n_fts = cc.execute("SELECT COUNT(*) FROM comments_fts").fetchone()[0]
+        cc.close()
+        r = search(["唯一标记2x7"])
+        check("concurrency: 3x15 writes + 2x8 searches — zero errors, aligned, findable",
+              not errors and all(x == "ok" for x in search_status)
+              and n_comments == n_fts == 46 and r["total_count"] == 1,
+              str(errors[:2]))
+        _use_db(db)
+
         # ---- #440 fix A anti-regression (pi #442 gate 2, Linux-judgeable) ----
         # Record every connection the server layer creates; after the calls
         # return, each must be CLOSED (execute raises ProgrammingError) —

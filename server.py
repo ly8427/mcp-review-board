@@ -511,10 +511,20 @@ def init_db() -> None:
                 fn = _MIGRATIONS[step]
                 if fn is not None:
                     fn(conn)
-            conn.execute(
-                "UPDATE meta SET value=? WHERE key='schema_version'",
-                (str(CORE_SCHEMA_VERSION),),
-            )
+            if v < CORE_SCHEMA_VERSION:
+                # Pre-release catch (2026-10-18): stamp ONLY when we actually
+                # migrated up from below CORE. The old unconditional write
+                # downgraded a v7 db back to 6 on EVERY start — on capable
+                # runtimes that forced a pointless full index rebuild per boot,
+                # on incapable ones it left a v6 stamp over v7 objects (dsh
+                # #432 f3). f3 ruling (option b): an incapable runtime KEEPS
+                # the v7 stamp and the objects, disables search with an audit
+                # row, and the consistency layer re-syncs when a capable
+                # runtime returns.
+                conn.execute(
+                    "UPDATE meta SET value=? WHERE key='schema_version'",
+                    (str(CORE_SCHEMA_VERSION),),
+                )
         # v2.8 (threads #39/#40): search layer bootstrap — capability check,
         # atomic 6 -> 7 apply (fts table + triggers + rebuild + ready marker +
         # version stamp, one transaction), or consistency verify/repair on an
