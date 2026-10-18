@@ -64,6 +64,17 @@ def db_dump(db: Path) -> str:
     return "\n".join(lines)
 
 
+def q1(db, sql):
+    """One-shot query that CLOSES its connection — Windows TemporaryDirectory
+    cleanup raises WinError 32 on a still-open handle (dsh #436; piggyback
+    fix endorsed by #437/#438); POSIX hides this, Windows re-runners don't."""
+    c = sqlite3.connect(db)
+    try:
+        return c.execute(sql).fetchone()
+    finally:
+        c.close()
+
+
 def main() -> None:
     fails = 0
 
@@ -86,8 +97,7 @@ def main() -> None:
         server.init_db()
         check("bootstrap: fresh db stamps v7 + search enabled",
               server.SEARCH_STATE["enabled"] is True
-              and sqlite3.connect(db).execute(
-                  "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "7")
+              and q1(db, "SELECT value FROM meta WHERE key='schema_version'")[0] == "7")
         seed(db,
              [("检索试点", "open"), ("已决历史", "resolved")],
              [
@@ -142,12 +152,10 @@ def main() -> None:
               (3, "dsh", "只有 全量计数 的那句", "2026-10-02 09:01:00")])
         r_all = search(["心跳", "全量计数"])
         ids = {h["comment_id"] for h in r_all["results"]}
-        only_long = sqlite3.connect(db).execute(
-            "SELECT id FROM comments WHERE body='只有 全量计数 的那句'").fetchone()[0]
+        only_long = q1(db, "SELECT id FROM comments WHERE body='只有 全量计数 的那句'")[0]
         check("M3-③b exact set: FTS-narrowed then LIKE-filtered",
               r_all["total_count"] == 1 and ids == {
-                  sqlite3.connect(db).execute(
-                      "SELECT id FROM comments WHERE body LIKE '%同现一句%'").fetchone()[0]}
+                  q1(db, "SELECT id FROM comments WHERE body LIKE '%同现一句%'")[0]}
               and only_long not in ids)
         r = search(["100%"])
         check("M3-④a % literal (fts route)", r["mode"]["route"] == "fts"
@@ -185,10 +193,13 @@ def main() -> None:
         server._search_capability = lambda: (False, "trigram_unavailable")
         server.init_db()
         r = search(["任意"])
-        v = sqlite3.connect(db_dis).execute(
-            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-        audit = sqlite3.connect(db_dis).execute(
-            "SELECT note FROM verdict_events WHERE action='search_disabled'").fetchall()
+        v = q1(db_dis, "SELECT value FROM meta WHERE key='schema_version'")[0]
+        audit_c = sqlite3.connect(db_dis)
+        try:
+            audit = audit_c.execute(
+                "SELECT note FROM verdict_events WHERE action='search_disabled'").fetchall()
+        finally:
+            audit_c.close()
         check("M3-⑦ incapable runtime: core starts, v stays 6, search unavailable",
               r["status"] == "unavailable"
               and r["disabled_reason"] == "trigram_unavailable"
@@ -217,6 +228,7 @@ def main() -> None:
         cx = sqlite3.connect(db)
         expect = {row[0] for row in cx.execute(
             "SELECT id FROM comments WHERE body LIKE '%游标%' AND body LIKE '%全量计数%'")}
+        cx.close()
         check("GPT-A AND exact set (all-short)", r["total_count"] == len(expect)
               and both_ids == expect)
 
@@ -252,8 +264,12 @@ def main() -> None:
               and False in self_flags and len(r["results"]) == r["total_count"])
 
         # ---- A5 differential vs python reference ------------------------------
-        corpus_bodies = sqlite3.connect(db).execute(
-            "SELECT id, body FROM comments ORDER BY id").fetchall()
+        corpus_c = sqlite3.connect(db)
+        try:
+            corpus_bodies = corpus_c.execute(
+                "SELECT id, body FROM comments ORDER BY id").fetchall()
+        finally:
+            corpus_c.close()
         _ASCII_FOLD = {ord(u): ord(l) for u, l in zip(
             "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")}
 
@@ -315,6 +331,7 @@ def main() -> None:
             "SELECT id FROM comments WHERE thread_id=? AND id>? ORDER BY id ASC LIMIT 1",
             (hit["thread_id"], hit["comment_id"])).fetchone()
         expect_ctx = [x[0] for x in (prev_id, next_id) if x]
+        cx.close()
         check("context = 2 time-adjacent same-thread neighbors (self excluded)",
               cids == expect_ctx and hit["comment_id"] not in cids)
         long_body = "前奏" + "很长的正文" * 200 + "命中词在尾部"
@@ -380,8 +397,7 @@ def main() -> None:
         r = search(["存量评论"])
         check("M5b retry applies cleanly: backfill hits pre-v7 rows",
               r["status"] == "ok" and r["total_count"] == 1
-              and sqlite3.connect(db6).execute(
-                  "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "7")
+              and q1(db6, "SELECT value FROM meta WHERE key='schema_version'")[0] == "7")
 
         # ---- A15 regression smoke: legacy faces intact after migration ---------
         out = server.get_thread(1)
