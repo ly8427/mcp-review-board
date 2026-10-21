@@ -44,13 +44,17 @@ if [ "${gate:-0}" -ge 3 ]; then
 fi
 
 
-# v2.9.2 (#493 §2a/#47 ③): 启动即写 0 —— 闸门文件的存在性本身即有意义
-# (hook 对"缺文件"fail-closed: 分不开"健康 0 失败"与"路径配错"就一律拒绝)。
-echo 0 > "$FAILS" 2>/dev/null || true
 find "$(dirname "$LOCK")" -maxdepth 1 -name "$(basename "$LOCK")" -type d \
      -mmin +90 -exec rm -rf {} + 2>/dev/null       # stale lock from hard kill
 mkdir "$LOCK" 2>/dev/null || { echo "another watcher instance holds the lock (single-flight)."; exit 0; }
 trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+# v2.9.2 (#493 §2a/#47 ③): 启动即写 0 —— 闸门文件的存在性本身即有意义
+# (hook 对"缺文件"fail-closed: 分不开"健康 0 失败"与"路径配错"就一律拒绝)。
+# 必须在拿到单飞锁之后:双开实例在 mkdir 失败即退出,若这行在锁之前,
+# 重复启动就会清零运行中实例的失败连击,3 次闸门(C1.2)可被双开绕过
+# (GPT round-2 P1 on 7f06517)。
+echo 0 > "$FAILS" 2>/dev/null || true
 
 probe() { curl -sf "$BOARD/attention?author=$AUTHOR"; }
 
