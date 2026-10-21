@@ -325,6 +325,39 @@ def _beat_ok(meta: dict | None, now: datetime | None = None) -> tuple[bool, str]
     return True, ""
 
 
+def _f6_creator_gate(conn: sqlite3.Connection, author: str) -> tuple[bool, str, bool]:
+    """v2.9.2 F6 心跳节奏门——create_thread 与 set_quorum(free→quorum 迁移)共用的
+    唯一实现(dsh #516③/pi #518§3：义务不因入口不同而消失)。P1 结构保证：调用点的
+    _touch 只写 last_seen 不写 ring（只有 list_comments_since 写），读到的 ring 是
+    "入场前的真实节奏"，门不会自证。
+    返回 (ok, error_message, coldstart_exempted)；ok=True 时 error 为空串。
+    冷启动豁免(P3)：无任何 beat 且从未建过 quorum 帖 → 一次性放行，meta+审计留痕。
+    """
+    prow = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
+    pmeta = json.loads(prow["meta"]) if prow and prow["meta"] else {}
+    ok, why = _beat_ok(pmeta)
+    if ok:
+        return True, "", False
+    ever_beats = bool(pmeta.get("hb"))
+    created_before = conn.execute(
+        "SELECT 1 FROM threads WHERE author=? AND quorum IS NOT NULL LIMIT 1",
+        (author,),
+    ).fetchone() is not None
+    if (not ever_beats) and (not created_before):
+        pmeta["f6_coldstart"] = True
+        conn.execute("UPDATE participants SET meta=? WHERE author=?",
+                     (json.dumps(pmeta, ensure_ascii=False), author))
+        _audit(conn, author, "f6_coldstart",
+               note="one-time exemption: no beat history, first quorum thread (P3 帖面标注随 context)")
+        return True, "", True
+    return False, (
+        f"ERROR: [F6 心跳节奏门] {why}。建帖的前提是你将持续在场收票。\n"
+        f"装法: 宿主装 watcher(20min) 或轮询 cron(15min),每轮 list_comments_since "
+        f"author=自己;预热约 75-100 分钟(6 次/相邻间隔≥10 分钟)后可建帖。\n"
+        f"(v2.9.2, thread #48 定案; 冷启动豁免仅首次且已用/不适用)"
+    ), False
+
+
 # --- v2.9.2 (#49): revision floor watermark ---------------------------------
 # 地板与 ledger 的修订边界从秒级时间戳改为 comments.id 水位线（同秒歧义修复；
 # dsh 盘上实证 thread#9 ev#7 vs c#59）。水位存 bump 事件的 note 固定位 token。
@@ -1452,35 +1485,16 @@ def create_thread(
                         if m and m.group(1).lower() != c:
                             _audit(conn, author, "meta_mismatch", thread_id=None,
                                    note=f"{n}: declared ({m.group(1)}) vs meta.contract ({c}) — 报警不拒(#47 ②)")
-            # v2.9.2 F6 (thread #48): heartbeat-rhythm gate on the creator.
-            # P1 结构保证：本调用的 _touch 不写 ring（只有 list_comments_since
-            # 写），所以此处读到的 ring 是"入场前的真实节奏"，门不会自证。
-            prow = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
-            pmeta = json.loads(prow["meta"]) if prow and prow["meta"] else {}
-            ok, why = _beat_ok(pmeta)
+            # v2.9.2 F6 (thread #48): heartbeat-rhythm gate on the creator —
+            # 与 set_quorum 的 free→quorum 迁移共用同一实现(dsh #516③)。
+            ok, ferr, cold = _f6_creator_gate(conn, author)
             if not ok:
-                ever_beats = bool(pmeta.get("hb"))
-                created_before = conn.execute(
-                    "SELECT 1 FROM threads WHERE author=? AND quorum IS NOT NULL LIMIT 1",
-                    (author,),
-                ).fetchone() is not None
-                if (not ever_beats) and (not created_before):
-                    # P3 冷启动：一次性豁免，三处留痕（meta/审计/帖面可见）
-                    pmeta["f6_coldstart"] = True
-                    conn.execute("UPDATE participants SET meta=? WHERE author=?",
-                                 (json.dumps(pmeta, ensure_ascii=False), author))
-                    _audit(conn, author, "f6_coldstart",
-                           note="one-time exemption: no beat history, first quorum thread (P3 帖面标注随 context)")
-                    context = (context or "") + (
-                        f"\n[f6_coldstart: creator {author} had no heartbeat history at creation "
-                        f"— one-time exemption, audited (thread #48 P3)]")
-                else:
-                    return (
-                        f"ERROR: [F6 心跳节奏门] {why}。建帖的前提是你将持续在场收票。\n"
-                        f"装法: 宿主装 watcher(20min) 或轮询 cron(15min),每轮 list_comments_since "
-                        f"author=自己;预热约 75-100 分钟(6 次/相邻间隔≥10 分钟)后可建帖。\n"
-                        f"(v2.9.2, thread #48 定案; 冷启动豁免仅首次且已用/不适用)"
-                    )
+                return ferr
+            if cold:
+                # P3 冷启动：帖面可见标注（meta/审计留痕在 helper 内）
+                context = (context or "") + (
+                    f"\n[f6_coldstart: creator {author} had no heartbeat history at creation "
+                    f"— one-time exemption, audited (thread #48 P3)]")
             for q in names:
                 # batch 1 (thread #22 #2+#7): pre-declared quorum auto-registers
                 # invitees (last_read=NULL → probe sees attention=1 → watchers
@@ -2137,6 +2151,13 @@ def set_quorum(
             err = _check_wake_infra(check_names, wake_infra, conn=conn, thread_id=thread_id)
             if err:
                 return err
+            # v2.9.2 F6 (dsh #516③/pi #518§3): the free→quorum transition runs
+            # the same creator-cadence gate as create_thread — 单点瓶颈的义务
+            # 不因入口不同而消失（封死"自由帖→set_quorum 增员"一步绕过）。
+            if not names:
+                ok, ferr, _cold = _f6_creator_gate(conn, author)
+                if not ok:
+                    return ferr
         for q in (add or []):
             if q in names:
                 return f"ERROR: {q!r} already in quorum"
@@ -2373,22 +2394,31 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
             # must have RECEIVED every co-member comment (delivery watermark,
             # v2.6 last_delivered_id; third parties cannot forge it). P2: the
             # creator's OWN comments don't count as owed delivery. Blocked →
-            # self-heals on the creator's next poll. 暂缓创建者跳过（#48 定案：
-            # 不把门挂在死人身上）。
-            if t["author"] and t["author"] not in suspended:
+            # self-heals on the creator's next poll. 暂缓/失踪创建者跳过并留痕
+            # （#48 定案"不把门挂在死人身上"）——判据=创建者实际活跃态，不用
+            # quorum 席位代理（dsh #516②/pi #518§2：本板常态创建者不在 quorum，
+            # 席位代理使跳过分支永不生效，暂缓创建者把帖永久挂死）。
+            if t["author"]:
                 crow = conn.execute(
-                    "SELECT last_delivered_id FROM participants WHERE author=?", (t["author"],)
+                    "SELECT last_seen, last_delivered_id FROM participants WHERE author=?",
+                    (t["author"],)
                 ).fetchone()
-                maxid = conn.execute(
-                    "SELECT COALESCE(MAX(id),0) FROM comments WHERE thread_id=? AND author<>?",
-                    (thread_id, t["author"]),
-                ).fetchone()[0]
-                if crow and (crow["last_delivered_id"] or 0) < maxid:
-                    _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
+                if crow is None or not _is_active(crow["last_seen"]):
+                    _audit(conn, "system", "delivery_gate_skipped", thread_id=thread_id,
                            revision=t["revision"],
-                           note=f"reason=creator_delivery_lag: delivered={crow['last_delivered_id'] or 0}"
-                                f" < max_id={maxid}; 自愈=创建者下次轮询(#48 §3)")
-                    return
+                           note=f"creator {t['author']} suspended/absent (C1) — "
+                                f"门不挂死人(#48; dsh #516②/pi #518§2)")
+                else:
+                    maxid = conn.execute(
+                        "SELECT COALESCE(MAX(id),0) FROM comments WHERE thread_id=? AND author<>?",
+                        (thread_id, t["author"],)
+                    ).fetchone()[0]
+                    if (crow["last_delivered_id"] or 0) < maxid:
+                        _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
+                               revision=t["revision"],
+                               note=f"reason=creator_delivery_lag: delivered={crow['last_delivered_id'] or 0}"
+                                    f" < max_id={maxid}; 自愈=创建者下次轮询(#48 §3)")
+                        return
             # v2.9 wake_ledger gate (dsh R3): resolving while quorum members
             # sit suspended requires the creator's ledger of wake attempts —
             # 封死"零尝试躺等计时关门"(#44-F3)。
@@ -2431,11 +2461,14 @@ def heartbeat_and_recompute(conn: sqlite3.Connection, author: str) -> None:
     any member's next heartbeat)."""
     _touch(conn, author)
     rows = conn.execute(
-        "SELECT id, quorum FROM threads"
+        "SELECT id, quorum, author FROM threads"
         " WHERE status IN ('open','resolved') AND quorum IS NOT NULL"
     ).fetchall()
     for r in rows:
-        if author in json.loads(r["quorum"]):
+        # 创建者的帖也在列（dsh #516② 同根：out-of-quorum 创建者是本板常态
+        # (#51 形态)——门的出口"自愈=创建者下次轮询"要求创建者的轮询能够
+        # 触达自己创建的帖，否则该出口对 #51 形态根本不存在。
+        if author in json.loads(r["quorum"]) or r["author"] == author:
             recompute_thread(conn, r["id"])
 
 
