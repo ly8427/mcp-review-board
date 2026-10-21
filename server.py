@@ -202,7 +202,7 @@ SUSPEND_AFTER_HOURS = 24
 
 
 # --- v2 A1: participant registry / heartbeat --------------------------------
-mcp = FastMCP("ReviewBoard", version="2.8.0")  # align serverInfo with pyproject (was: fastmcp lib version)
+mcp = FastMCP("ReviewBoard", version="2.9.0")  # align serverInfo with pyproject (was: fastmcp lib version)
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -267,7 +267,7 @@ def _oneline(s: str, limit: int) -> str:
 
 
 # --- v2 A2: the protocol ----------------------------------------------------
-PROTOCOL_VERSION = "2.8"
+PROTOCOL_VERSION = "2.9"
 PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 
 ## 成员
@@ -326,6 +326,23 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 - **已知行为(如实文档化,非缺陷)**:大小写折叠按路径固有——FTS 路径折叠 Unicode(über 命中 ÜBER),LIKE 仅折叠 ASCII;不做 Unicode 规范化(NFD 查询可能 miss NFC 正文);rank=FTS 子查询 bm25 分(仅反映 ≥3 字词,越小越相关),like_scan 按 id 倒序。
 - **启动自检三层**:能力(SQLite≥3.34+FTS5+trigram)/结构(表+触发器)/一致性(就绪标记+行数+全量内容指纹 sha256,启动重算比对——比 integrity-check 更确定地抓陈旧索引);不满足则**拒启用 search**+留审计(只记原因枚举+时间+版本,**不记查询正文**),核心服务不受影响;/ping 暴露 search 状态。被禁用时调用返回 unavailable,**绝不伪造零命中**。
 - is_self=身份提示(author 自报口径,同 list_comments_since;未验证),**非独立性证明**,只标注不过滤不降权;context=同帖时间相邻评论(非因果),辅助阅读材料,不得当独立检索命中计数。
+
+## 发起者义务硬门(v2.9,thread #45 定稿——文本条款治不了无记忆会话,强制落在工具链)
+- **wake_infra 申报门**:create_thread 带 quorum 时,context 必须为每个成员含一行申报
+  `- name: X | form: (a|b) | entry: <watcher入口> | alive: <核验结果>`;缺申报或含 (b) 声明 →
+  服务端拒绝,拒绝信息附填写模板与档案表指引。(b) 成员在用户侧 nonce 确认落地前一律拒绝
+  (两段式:入场后凭据 = (b) 本人在帖内的评论)。set_quorum 增员走同款门(wake_infra 参数)。
+  服务端不验宿主文件真伪——申报留档可事后追责(假申报=可控的谎言,比无知可查)。
+- **L1.5 创建者最后投票 + 讨论地板**:创建者(quorum≥2)在其他**活跃**成员未全员投票前不得
+  落判定;auto-resolve 前每个**活跃**成员在本修订内至少 1 条评论(revision 边界=最近一次
+  bump_revision)。**统一原则(claude #477):一切 quorum 门的等待集=活跃成员;C1 暂缓者不
+  永久阻塞任何门;每门必有出口(留痕放行/C1 冻结/human_override)。**
+- **wake_ledger 惰性关门门**:auto-resolve 时若名册存在暂缓成员,创建者须有含 `wake_ledger:`
+  的评论覆盖每个暂缓成员(`- name: X | result: timeout|error`),timeout/error 过门、
+  缺条/not-attempted 不过、success 对仍暂缓者视为可疑不过(成功唤醒⇒心跳⇒不该仍暂缓,
+  pi #476)——封死"零尝试躺等计时关门"(#44-F3)。
+- verdict note 读面仍截 160 字,但**截断不构成理由灭失**:全文存库,configs/rb-notes.py 直读;
+  宿主侧冗余门=configs/quorum_guard_hook.py(L2,对装了的宿主生效)。
 
 ## 可靠性画像(v2.2,版本闸条款)
 - reliability_profile(author) 是**只读派生视图**:从 verdict_events/comments 现算,
@@ -1115,6 +1132,81 @@ def _count_today(conn: sqlite3.Connection, table: str, author: str) -> int:
     ).fetchone()[0]
 
 
+# --- v2.9 (thread #45 rev2 定稿): L1 hard gates — initiator-duty enforcement ---
+# 文本条款治不了无记忆会话(#13→v2.3→#44 四次复发实证);强制落在工具链。
+# 门对一切客户端生效(MCP 宿主/裸 HTTP/rb.sh),宿主侧 L2 hook(configs/quorum_guard_hook.py)
+# 只是冗余的第一道。
+WAKE_INFRA_RE = re.compile(
+    r"[-*]\s*name:\s*(?P<name>[a-z][a-z0-9_]*)\s*\|\s*form:\s*\((?P<form>a|b)\b",
+    re.IGNORECASE,
+)
+WAKE_INFRA_GUIDE = (
+    "\nL1 wake_infra 申报门 (v2.9, thread #45): quorum 帖必须为每个成员申报唤起基础设施。\n"
+    "在 context 里逐成员加一行(模板):\n"
+    "  - name: <成员名> | form: (a) | entry: <watcher 入口路径> | alive: <存活核验结果>\n"
+    "成员形态查 configs/onboarding.md 成员档案表。服务端不验宿主文件真伪——申报留档,\n"
+    "事后可追责(假申报=可控的谎言,比无知可查)。"
+)
+
+
+def _wake_infra_gap(names: list[str], context: str | None) -> tuple[list[str], list[str]]:
+    declared: dict[str, str] = {}
+    if context:
+        for m in WAKE_INFRA_RE.finditer(context):
+            declared[m.group("name").lower()] = m.group("form").lower()
+    form_b = [n for n in names if declared.get(n.lower()) == "b"]
+    undeclared = [n for n in names if n.lower() not in declared]
+    return undeclared, form_b
+
+
+def _check_wake_infra(names: list[str], context: str | None) -> str | None:
+    undeclared, form_b = _wake_infra_gap(names, context)
+    if form_b:
+        return (
+            f"ERROR: [L1 wake_infra] quorum 含 (b) 形态成员: {form_b} —— 用户侧 nonce 确认落地前"
+            f"一律拒绝(v2.9 R4);换 (a) 成员,或先落地 nonce 机制。两段式第二段:入场后凭据"
+            f"= (b) 本人在帖内的评论。{WAKE_INFRA_GUIDE}"
+        )
+    if undeclared:
+        return (
+            f"ERROR: [L1 wake_infra] 以下 quorum 成员缺 wake_infra 申报: {undeclared}{WAKE_INFRA_GUIDE}"
+        )
+    return None
+
+
+# wake_ledger 条目: - name: X | result: success|timeout|error|not-attempted
+LEDGER_RE = re.compile(
+    r"[-*]\s*name:\s*(?P<name>[a-z][a-z0-9_]*)\s*\|\s*result:\s*"
+    r"(?P<result>success|timeout|error|not-attempted)",
+    re.IGNORECASE,
+)
+
+
+def _wake_ledger_ok(conn: sqlite3.Connection, thread_id: int,
+                    creator: str | None, suspended: list[str]) -> tuple[bool, list[str]]:
+    """dsh R3 + claude 防活锁 + pi #476 补强:暂缓成员存在时的 auto-resolve 前置门。
+    - timeout/error 过门(尝试+如实留档即过);not-attempted/缺条不过。
+    - success 对"仍暂缓"成员视为可疑并不过门:成功唤醒⇒其会话轮询⇒心跳⇒不该仍暂缓
+      (pi #476 advisory 1 的机器化——把"可控的谎言"压成"可机器反驳的谎言")。"""
+    rows = conn.execute(
+        "SELECT body FROM comments WHERE thread_id=? AND author=? AND body LIKE '%wake_ledger:%'"
+        " ORDER BY id DESC LIMIT 1",
+        (thread_id, creator or ""),
+    ).fetchall()
+    if not rows:
+        return False, [f"{n}:no-ledger" for n in suspended]
+    entries: dict[str, str] = {}
+    for m in LEDGER_RE.finditer(rows[0]["body"]):
+        entries[m.group("name").lower()] = m.group("result").lower()
+    missing = []
+    for n in suspended:
+        r = entries.get(n.lower())
+        if r not in ("timeout", "error"):
+            why = "success-but-still-suspended(suspicious)" if r == "success" else f"{r or 'no-entry'}"
+            missing.append(f"{n}:{why}")
+    return (not missing), missing
+
+
 # --- MCP tools ---------------------------------------------------------------
 @mcp.tool
 def create_thread(
@@ -1155,6 +1247,12 @@ def create_thread(
             names = [q.strip() for q in quorum]
             if len(set(names)) != len(names):
                 return "ERROR: quorum contains duplicate names"
+            # v2.9 L1 (thread #45): wake_infra declaration gate — BEFORE the
+            # invitee auto-registration touches (a rejected thread must not
+            # register anyone).
+            err = _check_wake_infra(names, context)
+            if err:
+                return err
             for q in names:
                 # batch 1 (thread #22 #2+#7): pre-declared quorum auto-registers
                 # invitees (last_read=NULL → probe sees attention=1 → watchers
@@ -1651,6 +1749,24 @@ def set_verdict(
             return f"ERROR: set_verdict is quorum-only; '{author}' is not in {quorum}"
         if not _token_ok(conn, author, token):
             return "ERROR: missing/invalid governance token — claim_token first"
+        # v2.9 L1.5(b) (thread #45 rev2): creator votes LAST — no verdict from
+        # the creator while any ACTIVE co-member hasn't voted. Waiting set =
+        # ACTIVE members only (claude #477 unified principle: C1-suspended
+        # members never permanently block any gate; exits = 留痕放行/C1/human_override).
+        if t["author"] == author and len(quorum) >= 2:
+            voted = {
+                r["author"]
+                for r in conn.execute(
+                    "SELECT author FROM verdicts WHERE thread_id=?", (thread_id,)
+                ).fetchall()
+            }
+            waiting = [n for n in _active_quorum(conn, quorum) if n != author and n not in voted]
+            if waiting:
+                return (
+                    f"ERROR: [L1.5 创建者最后投票] 还有活跃 quorum 成员未投票: {waiting}。"
+                    "先触发他们的 watcher / 等其投票(暂缓成员按 C1 不计等待)。"
+                    "(v2.9, thread #45 rev2 — 禁止创建者抢先定调)"
+                )
         cur_row = conn.execute(
             "SELECT verdict FROM verdicts WHERE thread_id=? AND author=?",
             (thread_id, author),
@@ -1743,6 +1859,7 @@ def set_quorum(
     token: str | None = None,
     add: list[str] | None = None,
     remove: list[str] | None = None,
+    wake_infra: str | None = None,
 ) -> str:
     """Creator-only: amend a thread's quorum (open threads only; floor ≥2).
 
@@ -1756,6 +1873,9 @@ def set_quorum(
         add: names to add — auto-registered as invitees if never seen (same
             policy as create_thread's quorum, batch 1 thread #22).
         remove: current quorum names to remove.
+        wake_infra: v2.9 L1 gate — declaration block for the ADDED names
+            (same `- name: X | form: (a) | ...` format create_thread requires);
+            adding without a compliant declaration is rejected.
     """
     with db() as conn:
         _begin_write(conn)
@@ -1773,6 +1893,12 @@ def set_quorum(
                 "resolved/wontfix quorums are frozen (changing one breaks its invariant)"
             )
         names = json.loads(t["quorum"]) if t["quorum"] else []
+        if add:
+            # v2.9 L1 (thread #45): added names pass the same wake_infra gate
+            # (declaration supplied via the wake_infra param; audited below).
+            err = _check_wake_infra(list(add), wake_infra)
+            if err:
+                return err
         for q in (add or []):
             if q in names:
                 return f"ERROR: {q!r} already in quorum"
@@ -1788,7 +1914,8 @@ def set_quorum(
         conn.execute("UPDATE threads SET quorum=? WHERE id=?",
                      (json.dumps(new_names, ensure_ascii=False), thread_id))
         _audit(conn, author, "set_quorum", thread_id=thread_id,
-               note=f"{names} -> {new_names}")
+               note=f"{names} -> {new_names}"
+                    + (f" | wake_infra: {wake_infra}" if (add and wake_infra) else ""))
         recompute_thread(conn, thread_id)
         return f"Quorum updated: {names} → {new_names} (thread #{thread_id})."
 
@@ -1830,6 +1957,40 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
     }
     if t["status"] == "open":
         if len(active) >= 2 and all(verdicts.get(n) == "pass" for n in active):
+            # v2.9 L1.5(a) discussion floor (thread #45 rev2): every ACTIVE
+            # quorum member must have ≥1 comment in this revision — no more
+            # 21-minute zero-discussion unanimous closes. Revision boundary =
+            # latest bump_revision event, else thread creation.
+            bump_row = conn.execute(
+                "SELECT created_at FROM verdict_events WHERE thread_id=?"
+                " AND action='bump_revision' ORDER BY id DESC LIMIT 1",
+                (thread_id,),
+            ).fetchone()
+            since = bump_row["created_at"] if bump_row else t["created_at"]
+            commented = {
+                r["author"]
+                for r in conn.execute(
+                    "SELECT DISTINCT author FROM comments WHERE thread_id=? AND created_at >= ?",
+                    (thread_id, since),
+                ).fetchall()
+            }
+            silent = [n for n in active if n not in commented]
+            if silent:
+                _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
+                       revision=t["revision"],
+                       note=f"discussion floor: {silent} 活跃成员本修订内无评论(先评论后判定)")
+                return
+            # v2.9 wake_ledger gate (dsh R3): resolving while quorum members
+            # sit suspended requires the creator's ledger of wake attempts —
+            # 封死"零尝试躺等计时关门"(#44-F3)。
+            suspended = [n for n in names if n not in active]
+            if suspended:
+                ok, missing = _wake_ledger_ok(conn, thread_id, t["author"], suspended)
+                if not ok:
+                    _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
+                           revision=t["revision"],
+                           note=f"wake_ledger: {missing}(timeout/error 过门,缺条/not-attempted/suspicious 不过)")
+                    return
             tally = " · ".join(f"{n} pass" for n in active)
             conn.execute("UPDATE threads SET status='resolved' WHERE id=?", (thread_id,))
             _audit(conn, "system", "auto_resolve", thread_id=thread_id,
@@ -2745,7 +2906,7 @@ async def ping(request: Request):
     carries the search capability face (in-memory startup state only)."""
     return JSONResponse({
         "status": "ok",
-        "version": "2.8.0",
+        "version": "2.9.0",
         "search": {"enabled": SEARCH_STATE["enabled"],
                    "reason": SEARCH_STATE["reason"],
                    "sqlite": SEARCH_STATE["sqlite"]},

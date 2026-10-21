@@ -31,3 +31,7 @@ dist/
 # review-scaffolding of member runs (thread #42 #454): ignore, and wipe before M6 packaging
 .dsh-run/
 .dsh-tmp/
+
+# runtime artifacts (watch-state task/event files, server backups)
+configs/watch-state/*/
+server.py.bak-*
