@@ -26,6 +26,8 @@ import tempfile
 import time
 import urllib.request
 
+import test_fixture as fx  # v2.9.2 fixture: wake_infra ctx + F6 beat priming
+
 PORT = 8776
 URL = f"http://localhost:{PORT}/mcp"
 DB = None
@@ -83,6 +85,7 @@ def main():
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         wait_port(PORT)
+        fx.prime_beats(DB, ['a', 'b', 'c', 'd', 'e', 'h'])  # v2.9.2: F6 预热(合成心跳环)
         res, sid = call("initialize", {
             "protocolVersion": "2025-03-26", "capabilities": {},
             "clientInfo": {"name": "s7", "version": "0"}})
@@ -100,7 +103,9 @@ def main():
 
         out = tool("create_thread", {"title": "stale", "author": "h",
                                      "quorum": ["a", "b"],
-                                     "per_author_budget": 6})
+                                     "per_author_budget": 6,
+                                     "context": fx.wi('h', 'a', 'b'),
+  })
         tid = int(out.split("#")[1].split(":")[0])
 
         # a objects (free first verdict), then keeps posting over it
@@ -143,7 +148,9 @@ def main():
         tool("list_comments_since", {"since": "now", "author": "c"})
         tok["c"] = tool("claim_token", {"author": "c"}).split("\n")[1].strip()
         out = tool("create_thread", {"title": "budget", "author": "h",
-                                     "quorum": ["c"], "per_author_budget": 2})
+                                     "quorum": ["c"], "per_author_budget": 2,
+                                     "context": fx.wi('h', 'c'),
+  })
         tid2 = int(out.split("#")[1].split(":")[0])
         tool("set_verdict", {"thread_id": tid2, "verdict": "object",
                              "author": "c", "note": "x", "token": tok["c"]})
@@ -170,7 +177,9 @@ def main():
         tool("list_comments_since", {"since": "now", "author": "d"})
         tok["d"] = tool("claim_token", {"author": "d"}).split("\n")[1].strip()
         out = tool("create_thread", {"title": "billed", "author": "h",
-                                     "quorum": ["d"], "per_author_budget": 6})
+                                     "quorum": ["d"], "per_author_budget": 6,
+                                     "context": fx.wi('h', 'd'),
+  })
         tid3 = int(out.split("#")[1].split(":")[0])
         tool("set_verdict", {"thread_id": tid3, "verdict": "pass",
                              "author": "d", "token": tok["d"]})
@@ -192,7 +201,9 @@ def main():
         # observability fields
         tool("list_comments_since", {"since": "now", "author": "e"})
         out = tool("create_thread", {"title": "wake", "author": "h",
-                                     "quorum": ["e"], "per_author_budget": 6})
+                                     "quorum": ["e"], "per_author_budget": 6,
+                                     "context": fx.wi('h', 'e'),
+  })
         tid4 = int(out.split("#")[1].split(":")[0])
         # my_verdicts face BEFORE voting: verdict None (distinguishable later)
         p = probe("e")

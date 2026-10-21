@@ -32,6 +32,10 @@ if [ "${gate:-0}" -ge 3 ]; then
   exit 1
 fi
 
+
+# v2.9.2 (#493 §2a/#47 ③): 启动即写 0 —— 闸门文件的存在性本身即有意义
+# (hook 对"缺文件"fail-closed: 分不开"健康 0 失败"与"路径配错"就一律拒绝)。
+echo 0 > "$FAILS" 2>/dev/null || true
 find "$(dirname "$LOCK")" -maxdepth 1 -name "$(basename "$LOCK")" -type d \
      -mmin +90 -exec rm -rf {} + 2>/dev/null
 mkdir "$LOCK" 2>/dev/null || { echo "another watcher instance holds the lock (single-flight)."; exit 0; }

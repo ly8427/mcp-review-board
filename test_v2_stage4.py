@@ -26,6 +26,8 @@ import tempfile
 import time
 import urllib.request
 
+import test_fixture as fx  # v2.9.2 fixture: wake_infra ctx + F6 beat priming
+
 PORT = 8773
 BASE = f"http://localhost:{PORT}"
 _req_id = 0
@@ -80,6 +82,7 @@ def main():
     db = os.path.join(tmp, "s4.db")
     try:
         wait_port(PORT)
+        fx.prime_beats(env["REVIEWBOARD_DB"], ["a", "b", "w"])  # v2.9.2: F6 预热(合成心跳环)
         res, sid = call("initialize", {
             "protocolVersion": "2025-03-26", "capabilities": {},
             "clientInfo": {"name": "s4", "version": "0"}})
@@ -94,7 +97,9 @@ def main():
             tool("list_comments_since", {"since": "now", "author": m})
         tok_a = tool("claim_token", {"author": "a"}).splitlines()[1].strip()
         out = tool("create_thread", {"title": "probe-t", "author": "a",
-                                     "quorum": ["a", "w"]})
+                                     "quorum": ["a", "w"],
+                                     "context": fx.wi('a', 'w'),
+  })
         tid = int(out.split("#")[1].split(":")[0])
 
         # 1. probe heartbeats: w's last_seen advances via probe alone
@@ -115,9 +120,9 @@ def main():
             assert p["attention"] == 1, "level-triggered: probe must keep attention=1"
 
         # 3. mention priority beats new_comments: post a @w comment
+        # (v2.9.2 L1.5: creator a's vote HERE would be rejected — w hasn't
+        # voted yet; a votes after w in step 4 instead)
         tool("post_comment", {"thread_id": tid, "author": "b", "body": "hey @w look"})
-        tool("set_verdict", {"thread_id": tid, "verdict": "pass",
-                             "author": "a", "token": tok_a})
         # w still awaiting (no verdict) -> awaiting stays top priority
         p = probe("w")
         assert p["reason"] == "awaiting_verdict", p
@@ -129,6 +134,12 @@ def main():
         assert "hey @w look" in out, "cursor-authoritative poll must deliver backlog"
         tool("set_verdict", {"thread_id": tid, "verdict": "pass",
                              "author": "w", "token": tok_w})
+        # v2.9.2 L1.5: creator votes LAST — w has voted, so a polls (delivery
+        # gate) then votes; the discussion floor keeps the thread open (w
+        # never comments), which step 5 relies on via a's verdict row.
+        tool("list_comments_since", {"since": "now", "author": "a"})
+        tool("set_verdict", {"thread_id": tid, "verdict": "pass",
+                             "author": "a", "token": tok_a})
         p = probe("w")
         assert p["attention"] == 0 and p["reason"] == "idle", p
 

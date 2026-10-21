@@ -21,6 +21,8 @@ import tempfile
 import time
 import urllib.request
 
+import test_fixture as fx  # v2.9.2 fixture: wake_infra ctx + F6 beat priming
+
 PORT = 8770
 URL = f"http://localhost:{PORT}/mcp"
 _req_id = 0
@@ -69,6 +71,7 @@ def main():
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         wait_port(PORT)
+        fx.prime_beats(env["REVIEWBOARD_DB"], ["ghost", "me", "other"])  # v2.9.2: F6 预热(合成心跳环)
         res, sid = call("initialize", {
             "protocolVersion": "2025-03-26", "capabilities": {},
             "clientInfo": {"name": "s2", "version": "0"}})
@@ -85,7 +88,9 @@ def main():
         #    invitees instead of being rejected — and the invitee's first poll
         #    shows the awaiting verdict
         out = tool("create_thread", {"title": "t1", "author": "me",
-                                     "quorum": ["me", "ghost"]})
+                                     "quorum": ["me", "ghost"],
+                                     "context": fx.wi('me', 'ghost'),
+  })
         assert out.startswith("Created thread #"), f"invitee auto-registration must pass: {out}"
         tid = int(out.split("#")[1].split(":")[0])
         out = tool("list_comments_since", {"since": "now", "author": "ghost"})
@@ -98,7 +103,9 @@ def main():
         # 3. per-author budget (set 2)
         out = tool("create_thread", {"title": "t2", "author": "me",
                                      "quorum": ["me", "other"],
-                                     "per_author_budget": 2})
+                                     "per_author_budget": 2,
+                                     "context": fx.wi('me', 'other'),
+  })
         tid2 = int(out.split("#")[1].split(":")[0])
         assert "Posted" in tool("post_comment", {"thread_id": tid2, "author": "me", "body": "a"})
         assert "Posted" in tool("post_comment", {"thread_id": tid2, "author": "me", "body": "b"})
@@ -116,7 +123,9 @@ def main():
         # 5. daily post limit: other has 1 post; allow up to 50 with a big budget thread
         out = tool("create_thread", {"title": "flood", "author": "other",
                                      "quorum": ["me", "other"],
-                                     "per_author_budget": 100})
+                                     "per_author_budget": 100,
+                                     "context": fx.wi('other', 'me'),
+  })
         tid3 = int(out.split("#")[1].split(":")[0])
         # 1 already used by other on tid2; posts are counted per author per day
         ok, rejected_at = 0, None

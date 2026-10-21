@@ -21,6 +21,8 @@ import tempfile
 import time
 import urllib.request
 
+import test_fixture as fx  # v2.9.2 fixture: wake_infra ctx + F6 beat priming
+
 PORT = 8771
 URL = f"http://localhost:{PORT}/mcp"
 DB = None
@@ -84,6 +86,7 @@ def main():
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         wait_port(PORT)
+        fx.prime_beats(DB, ['a', 'b', 'c', 'd', 'ghost'])  # v2.9.2: F6 预热(合成心跳环)
         res, sid = call("initialize", {
             "protocolVersion": "2025-03-26", "capabilities": {},
             "clientInfo": {"name": "s3", "version": "0"}})
@@ -106,7 +109,9 @@ def main():
 
         out = tool("create_thread", {"title": "gov", "author": "a",
                                      "quorum": ["a", "b", "c"],
-                                     "per_author_budget": 6})
+                                     "per_author_budget": 6,
+                                     "context": fx.wi('a', 'b', 'c'),
+  })
         tid = int(out.split("#")[1].split(":")[0])
 
         # token gates
@@ -130,22 +135,31 @@ def main():
             "status": "resolved", "author": "a", "thread_id": tid})
 
         # AUTO-RESOLVE: a,b pass; c objects -> open (standing object)
-        out = tool("set_verdict", {
-            "thread_id": tid, "verdict": "pass", "author": "a", "token": tok["a"]})
-        assert not out.startswith("ERROR") and "(billed" not in out, out
+        # v2.9.2: L1.5 创建者末票——b 先投;b/c 补本修订评论(讨论地板),a 收齐投递后末票
+        tool("post_comment", {"thread_id": tid, "author": "b", "body": "b review"})
+        tool("post_comment", {"thread_id": tid, "author": "c", "body": "c will object"})
+        tool("post_comment", {"thread_id": tid, "author": "a", "body": "a opening"})
+        tool("list_comments_since", {"since": "1h", "author": "a"})
+        tool("list_comments_since", {"since": "1h", "author": "a"})
         out = tool("set_verdict", {
             "thread_id": tid, "verdict": "pass", "author": "b", "token": tok["b"]})
         assert not out.startswith("ERROR") and "(billed" not in out, out
         tool("set_verdict", {"thread_id": tid, "verdict": "object",
                              "author": "c", "token": tok["c"],
                              "note": "needs tests"})
+        out = tool("set_verdict", {
+            "thread_id": tid, "verdict": "pass", "author": "a", "token": tok["a"]})
+        assert not out.startswith("ERROR") and "(billed" not in out, out
         assert status(tid) == "open", "standing object must block resolve"
 
         # C': c goes stale (2 days) -> a's next heartbeat recomputes ->
         # active {a,b} unanimous >=2 -> auto-resolve over frozen objection
         backdate("c", 2)
+        # v2.9.2 wake_ledger: 越过暂缓成员关门需创建者台账(timeout/error 过门)
+        tool("post_comment", {"thread_id": tid, "author": "a",
+                              "body": "wake_ledger:\n- name: c | result: timeout"})
         tool("list_comments_since", {"since": "now", "author": "a"})
-        assert status(tid) == "resolved", "suspended objector must not block"
+        assert status(tid) == "resolved", "suspended objector must not block (with ledger)"
 
         # C' restore: c returns (heartbeat) -> frozen object re-stands -> reopen
         out = tool("list_comments_since", {"since": "now", "author": "c"})
@@ -172,29 +186,42 @@ def main():
         assert "Revision bumped to 2" in out
         assert status(tid) == "open", "cleared verdicts break resolved invariant"
         # re-vote first-free on rev2 + auto-resolve
+        # v2.9.2: L1.5 创建者末票(b/c 先投) + 修订地板(rev2 内人人先评论) + 创建者收齐投递
         for m in ("a", "b", "c"):
+            tool("post_comment", {"thread_id": tid, "author": m, "body": f"{m} rev2 note"})
+        tool("list_comments_since", {"since": "now", "author": "a"})
+        for m in ("b", "c"):
             out = tool("set_verdict", {"thread_id": tid, "verdict": "pass",
                                        "author": m, "token": tok[m]})
             assert "(billed" not in out, f"rev2 first verdict free: {out}"
+        out = tool("set_verdict", {"thread_id": tid, "verdict": "pass",
+                                   "author": "a", "token": tok["a"]})
+        assert "(billed" not in out, f"rev2 first verdict free: {out}"
         assert status(tid) == "resolved"
 
         # set_quorum: frozen on resolved; floor; unseen add joins as invitee (v2.4)
         assert "open-thread-only" in tool("set_quorum", {
             "thread_id": tid, "author": "a", "token": tok["a"], "remove": ["c"]})
         out = tool("create_thread", {"title": "q2", "author": "a",
-                                     "quorum": ["a", "b"]})
+                                     "quorum": ["a", "b"],
+                                     "context": fx.wi('a', 'b'),
+  })
         tid2 = int(out.split("#")[1].split(":")[0])
         assert "Quorum updated" in tool("set_quorum", {
-            "thread_id": tid2, "author": "a", "token": tok["a"], "add": ["zz"]})
+            "thread_id": tid2, "author": "a", "token": tok["a"], "add": ["zz"],
+            "wake_infra": fx.wi('a', 'zz')})
         assert "< 2" in tool("set_quorum", {
             "thread_id": tid2, "author": "a", "token": tok["a"], "remove": ["zz", "b"]})
         assert "Quorum updated" in tool("set_quorum", {
-            "thread_id": tid2, "author": "a", "token": tok["a"], "add": ["c"]})
+            "thread_id": tid2, "author": "a", "token": tok["a"], "add": ["c"],
+            "wake_infra": fx.wi('a', 'c')})
 
         # awaiting_my_verdict: fresh member d in quorum, never voted
         tool("list_comments_since", {"since": "now", "author": "d"})
         out = tool("create_thread", {"title": "aw", "author": "a",
-                                     "quorum": ["a", "d"]})
+                                     "quorum": ["a", "d"],
+                                     "context": fx.wi('a', 'd'),
+  })
         tid3 = int(out.split("#")[1].split(":")[0])
         tool("set_verdict", {"thread_id": tid3, "verdict": "pass",
                              "author": "a", "token": tok["a"]})

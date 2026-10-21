@@ -32,6 +32,8 @@ import tempfile
 import time
 import urllib.request
 
+import test_fixture as fx  # v2.9.2 fixture: wake_infra ctx + F6 beat priming
+
 PORT = 8778
 URL = f"http://localhost:{PORT}/mcp"
 DB = None
@@ -89,6 +91,7 @@ def main():
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         wait_port(PORT)
+        fx.prime_beats(DB, ['a', 'b', 'h'])  # v2.9.2: F6 预热(合成心跳环)
         res, sid = call("initialize", {
             "protocolVersion": "2025-03-26", "capabilities": {},
             "clientInfo": {"name": "s8", "version": "0"}})
@@ -108,7 +111,9 @@ def main():
             tok[m] = tool("claim_token", {"author": m}).split("\n")[1].strip()
 
         out = tool("create_thread", {"title": "idcursor", "author": "h",
-                                     "quorum": ["a", "b"]})
+                                     "quorum": ["a", "b"],
+                                     "context": fx.wi('h', 'a', 'b'),
+  })
         tid = int(out.split("#")[1].split(":")[0])
         # a passes, b objects with a note — an open thread with a standing
         # object: no auto-resolve, and a's probe reasons stay new/idle only.
@@ -194,7 +199,9 @@ def main():
 
         out = tool("create_thread", {"title": "interleave", "author": "h",
                                      "quorum": ["a", "b"],
-                                     "per_author_budget": 60})
+                                     "per_author_budget": 60,
+                                     "context": fx.wi('h', 'a', 'b'),
+  })
         tid2 = int(out.split("#")[1].split(":")[0])
         posted, seen_text = [], []
         plock = threading.Lock()

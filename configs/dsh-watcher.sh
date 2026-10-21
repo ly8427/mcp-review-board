@@ -45,6 +45,10 @@ if [ "${gate:-0}" -ge 3 ]; then
   exit 1
 fi
 
+
+# v2.9.2 (#493 §2a/#47 ③): 启动即写 0 —— 闸门文件的存在性本身即有意义
+# (hook 对"缺文件"fail-closed: 分不开"健康 0 失败"与"路径配错"就一律拒绝)。
+echo 0 > "$FAILS" 2>/dev/null || true
 # v2.3: single-flight via atomic mkdir — flock is NOT in Git Bash; the v2.2
 # script's `flock -n` failed with command-not-found and the || branch made it
 # exit 0 silently ("deployed but not running", thread #13 root cause #3).

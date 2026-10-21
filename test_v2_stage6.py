@@ -37,6 +37,8 @@ import tempfile
 import time
 import urllib.request
 
+import test_fixture as fx  # v2.9.2 fixture: wake_infra ctx + F6 beat priming
+
 PORT = 8775
 URL = f"http://localhost:{PORT}/mcp"
 REPO = os.path.dirname(os.path.abspath(__file__))
@@ -110,6 +112,7 @@ def spawn(db, patch=None):
     proc = subprocess.Popen(argv, env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     wait_port(PORT)
+    fx.prime_beats(db, ['a', 'b', 'c'])  # nobody 保持未注册(原断言依赖)  # v2.9.2: F6 预热(合成心跳环)
     return proc
 
 
@@ -157,7 +160,9 @@ def part_a_semantics():
 
         def mk(title, quorum):
             tid = int(tool("create_thread", {"title": title, "author": "a",
-                                             "quorum": quorum}).split("#")[1].split(":")[0])
+                                             "quorum": quorum,
+                                     "context": fx.wi(*dict.fromkeys(["a"] + list(quorum))),
+  }).split("#")[1].split(":")[0])
             tool("post_comment", {"thread_id": tid, "author": "b",
                                   "body": f"b spoke {title}"})
             return tid
@@ -181,7 +186,13 @@ def part_a_semantics():
         # TD O→O→P (resolves)
         td = mk("TD", ["a", "b"])
         sv(td, "object", "b", note="TD r1"); bump(td); sv(td, "object", "b", note="TD r2")
-        bump(td); sv(td, "pass", "b"); sv(td, "pass", "a")
+        bump(td)
+        # v2.9.2: 决议需地板(活跃成员本修订评论)+创建者投递收齐(双轮询=自愈节奏)
+        tool("post_comment", {"thread_id": td, "author": "a", "body": "a r3"})
+        tool("post_comment", {"thread_id": td, "author": "b", "body": "b r3"})
+        tool("list_comments_since", {"since": "1h", "author": "a"})
+        tool("list_comments_since", {"since": "1h", "author": "a"})
+        sv(td, "pass", "b"); sv(td, "pass", "a")
         assert "resolved" in tool("get_thread", {"thread_id": td})
         # TE O→O→O (open ending)
         te = mk("TE", ["a", "b"])
@@ -196,12 +207,20 @@ def part_a_semantics():
         # TF same-revision flip (no revision involved)
         tf = mk("TF", ["a", "b", "c"])
         sv(tf, "object", "b", note="TF r1"); sv(tf, "pass", "b")
-        sv(tf, "pass", "a"); sv(tf, "pass", "c")
+        tool("post_comment", {"thread_id": tf, "author": "a", "body": "a rev1"})
+        tool("post_comment", {"thread_id": tf, "author": "c", "body": "c rev1"})
+        tool("list_comments_since", {"since": "1h", "author": "a"})
+        tool("list_comments_since", {"since": "1h", "author": "a"})
+        sv(tf, "pass", "c"); sv(tf, "pass", "a")  # L1.5: 创建者 a 末票
         assert "resolved" in tool("get_thread", {"thread_id": tf})
         # TG creator self-loop (object → own bump → pass)
         tg = mk("TG", ["a", "b"])
-        sv(tg, "object", "a", note="self play"); bump(tg)
-        sv(tg, "pass", "a"); sv(tg, "pass", "b")
+        sv(tg, "object", "b", note="r1 objection"); bump(tg)  # v2.9.2 L1.5:创建者首票即被拦,自环场景改为 b 先 object
+        tool("post_comment", {"thread_id": tg, "author": "a", "body": "a r2"})
+        tool("post_comment", {"thread_id": tg, "author": "b", "body": "b r2"})
+        tool("list_comments_since", {"since": "1h", "author": "a"})
+        tool("list_comments_since", {"since": "1h", "author": "a"})
+        sv(tg, "pass", "b"); sv(tg, "pass", "a")
         assert "resolved" in tool("get_thread", {"thread_id": tg})
         # TI standing object + wontfix terminal
         # (v2.3: quorum-thread wontfix is gated — only human_override lands it)
@@ -212,10 +231,23 @@ def part_a_semantics():
         # TH object → bump → absent on R+1 → suspension → resolved without b
         th = mk("TH", ["a", "b", "c"])
         sv(th, "object", "b", note="TH r1"); bump(th)
-        sv(th, "pass", "a"); sv(th, "pass", "c")
+        # v2.9.2: r2 地板(活跃成员 a/c 评论)+创建者投递收齐
+        tool("post_comment", {"thread_id": th, "author": "c", "body": "c r2"})
+        tool("post_comment", {"thread_id": th, "author": "a", "body": "a r2 opening"})
+        tool("list_comments_since", {"since": "1h", "author": "a"})
+        tool("list_comments_since", {"since": "1h", "author": "a"})
+        # v2.9.2 L1.5: b 的票已被 bump 清空,先暂缓 b(其 r2 不投),a 才可落末票
         sqlite_do(db, "UPDATE participants SET last_seen=datetime('now','-2 days')"
                       " WHERE author='b'")
+        sv(th, "pass", "c")
+        # v2.9.2 wake_ledger: 暂缓 b 存在时关门需创建者台账(timeout/error 过门)
+        tool("post_comment", {"thread_id": th, "author": "a",
+                              "body": "wake_ledger:\n- name: b | result: timeout"})
         tool("list_comments_since", {"since": "now", "author": "a"})  # heartbeat → recompute
+        tool("list_comments_since", {"since": "now", "author": "a"})  # 自愈节奏
+        out = sv(th, "pass", "a")
+        assert "Verdict recorded" in out, out
+        tool("list_comments_since", {"since": "now", "author": "c"})  # 末票后触发 recompute
         assert "resolved" in tool("get_thread", {"thread_id": th})
         # watcher-gate flag on b (current-state signal)
         sqlite_do(db, "UPDATE participants SET meta=? WHERE author='b'",
@@ -225,22 +257,24 @@ def part_a_semantics():
         j = pb["judgment"]
         assert pb["metric_version"] == "2.2-r3" and pb["derived_only"] is True
         assert pb["governance_weight"] == 0
-        assert j["first_verdicts"] == 19, j          # TA4 TB3 TC2 TD3 TE3 TF1 TG1 TH1 TI1
-        assert j["object_firsts"] == 14, j
+        assert j["first_verdicts"] == 20, j         # v2.9.2 语义更新: TA4 TB3 TC2 TD3 TE3 TF1 TG3 TH3 TI1
+        # (旧值 19: TG 原为创建者自环 1 票类——L1.5 后该形态结构性不可能,
+        #  self_loop_excluded 归 0,TG 改 b-object 流程后计 3 票)
+        assert j["object_firsts"] == 15, j         # v2.9.2: +1 = TG 自环禁用改 b-object
         o = j["outcomes"]
-        assert o["revision_absorbed"] == 4, o        # TA r1+r3, TB r1, TD r2
+        assert o["revision_absorbed"] == 5, o        # TA r1+r3, TB r1, TD r2, TG(v2.9.2 b-r2)
         assert o["active_overridden"] == 1, o        # TF
         assert o["frozen_unadjudicated"] == 4, o     # TB r3, TC r2, TE r3, TH r1
         assert o["wontfix"] == 1, o                  # TI
         assert o["self_loop_excluded"] == 0, o       # b never self-bumped
         assert o["continued"] == 4, o                # TC r1, TD r1, TE r1+r2
-        assert j["stance_flips"] == {"cross_revision_flips": 6,      # TA3 TB2 TD1
+        assert j["stance_flips"] == {"cross_revision_flips": 7,      # TA3 TB2 TD1 TG1(v2.9.2)
                                      "same_revision_flips": 1}, j    # TF
-        assert j["co_objection"] == {"co_objected": 1, "lone": 13}, j  # TB r1 (c)
+        assert j["co_objection"] == {"co_objected": 1, "lone": 14}, j  # TB r1 (c); +1 lone=TG(v2.9.2)
         assert j["insufficient"] is False
         # TA..TE were backdated 1 day (rate-limit dodge): their rev1 first
         # verdicts fall in the 3-day band; everything else is same-day.
-        assert pb["latency"]["当天内"] == 14, pb["latency"]
+        assert pb["latency"]["当天内"] == 15, pb["latency"]  # v2.9.2: +1 TG
         assert pb["latency"]["3 天内"] == 5, pb["latency"]
         assert "gate_excluded" not in pb["latency"]   # dropped in 2.2-r3
         assert pb["participation"]["watcher_gate"]["currently_gated"] is True
@@ -251,8 +285,8 @@ def part_a_semantics():
         assert pb["participation"]["vote_coverage"]["d"] == 5
 
         pa = json.loads(tool("reliability_profile", {"author": "a"}))
-        assert pa["judgment"]["outcomes"]["self_loop_excluded"] == 1, pa
-        assert pa["judgment"]["stance_flips"]["cross_revision_flips"] == 1, pa
+        assert pa["judgment"]["outcomes"]["self_loop_excluded"] == 0, pa  # v2.9.2: L1.5 后创建者自环不可能发生
+        assert pa["judgment"]["stance_flips"]["cross_revision_flips"] == 0, pa  # v2.9.2: a 全 pass 无翻票
 
         pc = json.loads(tool("reliability_profile", {"author": "c"}))
         assert pc["judgment"]["outcomes"]["revision_absorbed"] == 1, pc   # TB r1
@@ -263,12 +297,12 @@ def part_a_semantics():
 
         # part C (reuse this live server): protocol gate + board raw components
         proto = tool("get_protocol", {})
-        assert "v2.8" in proto.splitlines()[0] and "版本闸" in proto, proto[:120]
+        assert "v2.9.2" in proto.splitlines()[0] and "版本闸" in proto, proto[:120]
         page = urllib.request.urlopen(f"http://localhost:{PORT}/", timeout=10).read().decode()
         assert "画像:数据不足" in page           # c (4 firsts) → insufficient branch
-        assert "首判19" in page                   # b → raw components, no composite
+        assert "首判20" in page                   # b → raw components, no composite (v2.9.2: TG 改 b-object 后 b 首判 19→20)
         assert "2.2-r3" in page                   # metric version travels with the brief
-        assert "协议 protocol v2.8" in page
+        assert "协议 protocol v2.9.2" in page
     finally:
         proc.send_signal(signal.SIGTERM); proc.wait(timeout=10)
     print("✅ part A+C: adversarial sequence matrix — episode-local five-way "
@@ -297,7 +331,9 @@ def run_governance_script(db, patch):
                 "thread_id": t, "verdict": v, "author": m, "token": toks[m], **kw})
 
         t1 = int(tool("create_thread", {"title": "inv1", "author": "a",
-                                        "quorum": ["a", "b", "c"]}).split("#")[1].split(":")[0])
+                                        "quorum": ["a", "b", "c"],
+                                     "context": fx.wi('a', 'b', 'c'),
+  }).split("#")[1].split(":")[0])
         gov.append(tool("post_comment", {"thread_id": t1, "author": "a", "body": "x"}))
         gov.append(tool("post_comment", {"thread_id": t1, "author": "b", "body": "y"}))
         gov.append(sv(t1, "object", "b", note="why"))
@@ -306,13 +342,18 @@ def run_governance_script(db, patch):
         gov.append(sv(t1, "pass", "c"))
         prof_mid = tool("reliability_profile", {"author": "b"})   # read mid-governance
         t2 = int(tool("create_thread", {"title": "inv2", "author": "a",
-                                        "quorum": ["a", "b"]}).split("#")[1].split(":")[0])
-        gov.append(sv(t2, "object", "a", note="self"))
+                                        "quorum": ["a", "b"],
+                                     "context": fx.wi('a', 'b'),
+  }).split("#")[1].split(":")[0])
+        gov.append(sv(t2, "object", "b", note="why"))   # v2.9.2 L1.5: 创建者末票,先 b 后 a
+        gov.append(sv(t2, "pass", "a", note="flip"))
         gov.append(tool("bump_revision", {"thread_id": t2, "author": "a", "token": toks["a"]}))
-        gov.append(sv(t2, "pass", "a"))
         gov.append(sv(t2, "pass", "b"))
+        gov.append(sv(t2, "pass", "a"))
         t3 = int(tool("create_thread", {"title": "inv3", "author": "a",
-                                        "quorum": ["a", "b"]}).split("#")[1].split(":")[0])
+                                        "quorum": ["a", "b"],
+                                     "context": fx.wi('a', 'b'),
+  }).split("#")[1].split(":")[0])
         gov.append(sv(t3, "object", "b", note="keep"))
         gov.append(sv(t3, "pass", "a"))
         gov.append(tool("set_status", {"thread_id": t3, "status": "wontfix", "author": "a", "human_override": True}))

@@ -28,6 +28,8 @@ import tempfile
 import time
 import urllib.request
 
+import test_fixture as fx  # v2.9.2 fixture: wake_infra ctx + F6 beat priming
+
 PORT = 8774
 URL = f"http://localhost:{PORT}/mcp"
 DB = None
@@ -75,6 +77,7 @@ def spawn(db, unacked_min="0"):
         [sys.executable, os.path.join(os.path.dirname(__file__) or ".", "server.py")],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     wait_port(PORT)
+    fx.prime_beats(db, ['a', 'b', 'c', 'legacy', 'x'])  # v2.9.2: F6 预热(合成心跳环)
     return proc
 
 
@@ -115,7 +118,18 @@ def main():
         assert "REISSUED" in out and "never persisted" not in out, out
         tok2 = out.splitlines()[-1].strip()
         tid = int(tool("create_thread", {"title": "t", "author": "a",
-                                         "quorum": ["a", "b", "c"]}).split("#")[1].split(":")[0])
+                                         "quorum": ["a", "b", "c"],
+                                     "context": fx.wi('a', 'b', 'c'),
+  }).split("#")[1].split(":")[0])
+        # v2.9.2 L1.5(b): creator votes LAST — b/c must hold verdict rows
+        # before a's vote can record (first-for-revision, free; the discussion
+        # floor keeps the thread open, which this token test never asserts on)
+        tokb0 = tool("claim_token", {"author": "b"}).splitlines()[1].strip()
+        tokc0 = tool("claim_token", {"author": "c"}).splitlines()[1].strip()
+        tool("set_verdict", {"thread_id": tid, "verdict": "pass",
+                             "author": "b", "token": tokb0})
+        tool("set_verdict", {"thread_id": tid, "verdict": "pass",
+                             "author": "c", "token": tokc0})
         assert "token" in tool("set_verdict", {  # old token now invalid
             "thread_id": tid, "verdict": "pass", "author": "a", "token": tok1})
         assert "Verdict recorded" in tool("set_verdict", {  # new works
@@ -130,6 +144,9 @@ def main():
         assert "via 'auto'" in out and "1h" in out, out
 
         # 2. ack_token paths (member b)
+        # (b was auto-acked by the L1.5 pre-vote above — reset to re-exercise
+        # the provisional claim → ack_token flow on a fresh token)
+        assert "cleared" in tool("reset_token", {"author": "b", "human_override": True})
         tokb = tool("claim_token", {"author": "b"}).splitlines()[1].strip()
         assert "mismatch" in tool("ack_token", {"author": "b", "token": "0" * 32})
         assert "acknowledged" in tool("ack_token", {"author": "b", "token": tokb})
@@ -156,8 +173,9 @@ def main():
             "thread_id": tid, "verdict": "object", "author": "a",
             "token": tok3, "note": "for test"})
         # cleanup object -> pass so thread can resolve later; also member c
-        tokc = tool("claim_token", {"author": "c"}).splitlines()[1].strip()
-        tool("set_verdict", {"thread_id": tid, "verdict": "pass", "author": "c", "token": tokc})
+        # (c's L1.5 pre-vote token above is acked and still valid — reuse it)
+        tool("set_verdict", {"thread_id": tid, "verdict": "pass",
+                             "author": "c", "token": tokc0})
         tool("set_verdict", {"thread_id": tid, "verdict": "pass", "author": "a", "token": tok3})
 
         # 5. reset_token
@@ -194,6 +212,9 @@ def main():
     proc.send_signal(signal.SIGTERM); proc.wait(timeout=10)
     con = sqlite3.connect(db3, timeout=10)
     con.execute("PRAGMA busy_timeout=5000")
+    # spawn() 的 F6 预热会给 'legacy' 插一行空 meta 占位——清掉,还原本部分
+    # 要的"前 v2.1 时代裸行"(仅 token_hash,无 token_acked 键)的前置状态
+    con.execute("DELETE FROM participants WHERE author='legacy'")
     now = "2026-09-16 00:00:00"
     con.execute("INSERT INTO participants(author, first_seen, last_seen, last_read, meta)"
                 " VALUES ('legacy', ?, ?, NULL, ?)",

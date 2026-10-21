@@ -42,6 +42,8 @@ import tempfile
 import time
 import urllib.request
 
+import test_fixture as fx  # v2.9.2 fixture: wake_infra ctx + F6 beat priming
+
 PORT = 8779
 URL = f"http://localhost:{PORT}/mcp"
 DB = None
@@ -99,6 +101,7 @@ def main():
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         wait_port(PORT)
+        fx.prime_beats(DB, ['a', 'b', 'c', 'h'])  # v2.9.2: F6 预热(合成心跳环)
         res, sid = call("initialize", {
             "protocolVersion": "2025-03-26", "capabilities": {},
             "clientInfo": {"name": "s9", "version": "0"}})
@@ -118,7 +121,9 @@ def main():
             tok[m] = tool("claim_token", {"author": m}).split("\n")[1].strip()
 
         out = tool("create_thread", {"title": "verdict face", "author": "h",
-                                     "quorum": ["a", "b"]})
+                                     "quorum": ["a", "b"],
+                                     "context": fx.wi('h', 'a', 'b'),
+  })
         tid = int(out.split("#")[1].split(":")[0])
 
         # --- 1. fresh seats face ------------------------------------------
@@ -151,6 +156,11 @@ def main():
         assert (before["last_delivered_id"] == after["last_delivered_id"]
                 and before["last_read"] == after["last_read"]), (before, after)
 
+        # v2.9.2 L1.5(a) 讨论地板 + #48 §3 创建者投递门: a/b 本修订内先评论,
+        # h 收齐投递,收敛翻转才能真正关门
+        tool("post_comment", {"thread_id": tid, "author": "a", "body": "a note"})
+        tool("post_comment", {"thread_id": tid, "author": "b", "body": "b note"})
+        poll("h")
         # convergence flip → auto_resolve with tally
         tool("set_verdict", {"thread_id": tid, "verdict": "pass",
                              "author": "b", "token": tok["b"]})
@@ -207,7 +217,9 @@ def main():
         # asymmetry as "两路两门"; this pins it behaviorally end to end so
         # neither side can drift silently.
         out = tool("create_thread", {"title": "asym", "author": "h",
-                                     "quorum": ["a", "b", "c"]})
+                                     "quorum": ["a", "b", "c"],
+                                     "context": fx.wi('h', 'a', 'b', 'c'),
+  })
         gid = int(out.split("#")[1].split(":")[0])
         for m in ("a", "b", "c"):
             poll(m)
@@ -220,11 +232,18 @@ def main():
                              "author": "c", "note": "hold", "token": tok["c"]})
         face = tool("get_thread", {"thread_id": gid})
         assert "[open]" in face, face[:200]
+        # v2.9.2: 讨论地板(a/b 本修订先评论) + 创建者收齐投递
+        for m in ("a", "b"):
+            tool("post_comment", {"thread_id": gid, "author": m, "body": f"{m} asym note"})
+        poll("h")
         con = sqlite3.connect(DB)   # c goes suspended; its object stands frozen
         con.execute("UPDATE participants SET last_seen='2026-01-01 00:00:00'"
                     " WHERE author='c'")
         con.commit()
         con.close()
+        # v2.9 wake_ledger: 越过暂缓的 c 关门需创建者台账(timeout 过门)
+        tool("post_comment", {"thread_id": gid, "author": "h",
+                              "body": "wake_ledger:\n- name: c | result: timeout"})
         # manual gate: FULL roster — c's missing pass rejects (stricter)
         r = tool("set_status", {"thread_id": gid, "status": "resolved",
                                 "author": "h"})

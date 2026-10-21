@@ -112,7 +112,11 @@ def check_quorum_names(names, roster) -> None:
             try:
                 n = int(open(gate_path).read().strip() or 0)
             except OSError:
-                n = 0
+                # v2.9.2 (#493 §2/(a)+pi #476 条件2 收口): 缺文件 = 配错（watcher
+                # 启动即写 0，存在性即有意义）——fail-closed，不再当"0 次失败"放行。
+                die(f"[quorum-guard fail-closed] '{name}' 的 watcher 闸门文件不存在: {gate_path}\n"
+                    f"两种可能: watcher 从未启动(配错) 或 RB_GATE_DIR 指错目录——门分不开这两者,一律拒绝。\n"
+                    f"修复: 启动 {REPO}/configs/{name}-watcher.sh(它会在启动时写入 0),或设 RB_WATCHER_GATES_JSON。")
             if n >= 3:
                 die(f"[quorum-guard] '{name}' 的 watcher 闸门已锁死（连续 {n} 次唤醒失败, C1.2）。\n"
                     f"修复（把恢复做成本——先恢复再建帖）:\n"
@@ -183,13 +187,52 @@ def check_poll_marker() -> None:
             f"打卡由重复刷新维持新鲜——单次 touch 骗不过时间。")
 
 
+def _guard_data(thread_id: int):
+    """v2.9.2 (#47 ③): endpoint-first — GET /guard (read-only, no DB file
+    dependency, no WAL ambiguity). Returns parsed dict or None (caller falls
+    back to the DB path)."""
+    try:
+        with urllib.request.urlopen(f"{BOARD_URL}/guard?thread={thread_id}", timeout=3) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
 def guard_set_verdict(payload) -> None:
-    """L1.5(b) 创建者最后投票门（server 端另有同款，本层为宿主侧冗余）+ R5 暂缓出口。"""
+    """L1.5(b) 创建者最后投票门（server 端另有同款，本层为宿主侧冗余）+ R5 暂缓出口。
+    v2.9.2: /guard 端点优先，DB 直读退化（dsh R6 正解——跨宿主无文件访问）。"""
     authors = [a for a in find_keys(payload, "author") if isinstance(a, str)]
     tids = [t for t in find_keys(payload, "thread_id") if isinstance(t, (int, str))]
     if not authors or not tids:
         return
     author, tid = authors[0], int(tids[0])
+    g = _guard_data(tid)
+    if g and g.get("thread"):
+        th = g["thread"]
+        quorum = th.get("quorum") or []
+        if not quorum or th.get("creator") != author or author not in quorum or len(quorum) < 2:
+            return
+        voted = {a for a, v in (g.get("verdicts") or {}).items() if v.get("verdict")}
+        now = _now()
+        import datetime as _dt
+        sus = set()
+        for n, p in (g.get("participants") or {}).items():
+            ls = p.get("last_seen")
+            try:
+                then = _dt.datetime.strptime(ls, "%Y-%m-%d %H:%M:%S").replace(tzinfo=_dt.timezone.utc)
+                if (now - then).total_seconds() >= SUSPEND_HOURS * 3600:
+                    sus.add(n)
+            except (TypeError, ValueError):
+                sus.add(n)
+        for n in quorum:
+            if n not in (g.get("participants") or {}):
+                sus.add(n)
+        waiting = [m for m in quorum if m != author and m not in voted and m not in sus]
+        if waiting:
+            die(f"[quorum-guard L1.5] 创建者最后投票：thread#{tid} 还有活跃 quorum 成员未投票: {', '.join(waiting)}。\n"
+                f"修复: 先触发他们的 watcher / 等其投票。（暂缓成员已按 C1 排除并留痕;数据源=/guard 端点）")
+        return
+    # --- DB fallback (R6: ro → immutable → readable die) ---
     conn = _connect()
     try:
         row = conn.execute("SELECT author, quorum FROM threads WHERE id=?", (tid,)).fetchone()

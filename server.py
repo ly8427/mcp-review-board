@@ -202,7 +202,7 @@ SUSPEND_AFTER_HOURS = 24
 
 
 # --- v2 A1: participant registry / heartbeat --------------------------------
-mcp = FastMCP("ReviewBoard", version="2.9.0")  # align serverInfo with pyproject (was: fastmcp lib version)
+mcp = FastMCP("ReviewBoard", version="2.9.2")  # align serverInfo with pyproject (was: fastmcp lib version)
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -266,8 +266,114 @@ def _oneline(s: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[:limit] + "…"
 
 
+# --- v2.9.2 F6 (thread #48): heartbeat-rhythm gate --------------------------
+# 发起者必须在场：创建 quorum 帖要求近 24h 的真实轮询节奏（beat 只认
+# list_comments_since 的 author 分支——P1：探针/邀请/写工具都不喂 ring，
+# "从不读票的 cron curl" 造不出心跳）。参数各一处常量（C3/P4 口径单点）。
+BEAT_RING_MAX = 64          # ring 定长（meta["hb"]），防 JSON 无界膨胀
+BEAT_DEDUP_S = 120          # 写入去重阈值
+F6_BEATS_24H = 6            # 近 24h ≥6 条
+F6_GAPS_MIN = 5             # 其中 ≥5 个相邻间隔…
+F6_GAP_S = 600              # …每个 ≥10 分钟
+F6_FRESH_S = 45 * 60        # 最新一条 ≤45 分钟（与 L2 打卡门同一数字）
+
+
+def _beat(conn: sqlite3.Connection, author: str | None) -> None:
+    """Append one heartbeat to the author's ring. Call sites: list_comments_since's
+    author branch ONLY (thread #48 P1 — probes/invites never feed the ring)."""
+    if not author:
+        return
+    row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
+    meta = json.loads(row["meta"]) if row and row["meta"] else {}
+    ring = list(meta.get("hb") or [])
+    now = _now_iso()
+    if ring:
+        try:
+            last_t = datetime.strptime(ring[-1], "%Y-%m-%d %H:%M:%S")
+            if (datetime.strptime(now, "%Y-%m-%d %H:%M:%S") - last_t).total_seconds() < BEAT_DEDUP_S:
+                return  # dedup window
+        except ValueError:
+            pass
+    ring.append(now)
+    del ring[:-BEAT_RING_MAX]
+    meta["hb"] = ring
+    if row:
+        conn.execute("UPDATE participants SET meta=? WHERE author=?",
+                     (json.dumps(meta, ensure_ascii=False), author))
+
+
+def _beat_ok(meta: dict | None, now: datetime | None = None) -> tuple[bool, str]:
+    """Pure predicate (C3 单点口径): S1 fresh + S2 count + S3 spread."""
+    ring = [x for x in ((meta or {}).get("hb") or []) if x]
+    now = now or datetime.now(timezone.utc)
+    try:
+        ts = [datetime.strptime(x, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc) for x in ring]
+    except ValueError:
+        return False, "beat ring has malformed entries"
+    ts = [t for t in ts if (now - t).total_seconds() <= 86400]
+    if not ts:
+        return False, "近 24h 无任何轮询记录"
+    stale = (now - ts[-1]).total_seconds()
+    if stale > F6_FRESH_S:
+        return False, f"最新一次轮询已在 {int(stale // 60)} 分钟前(上限 {F6_FRESH_S // 60})"
+    if len(ts) < F6_BEATS_24H:
+        return False, f"近 24h 轮询仅 {len(ts)}/{F6_BEATS_24H} 次"
+    gaps = [(b - a).total_seconds() for a, b in zip(ts, ts[1:])]
+    big = sum(1 for g in gaps if g >= F6_GAP_S)
+    if big < F6_GAPS_MIN:
+        return False, f"轮询间隔不足: 仅 {big}/{F6_GAPS_MIN} 个相邻间隔 ≥{F6_GAP_S // 60} 分钟(一次会话连点不算)"
+    return True, ""
+
+
+# --- v2.9.2 (#49): revision floor watermark ---------------------------------
+# 地板与 ledger 的修订边界从秒级时间戳改为 comments.id 水位线（同秒歧义修复；
+# dsh 盘上实证 thread#9 ev#7 vs c#59）。水位存 bump 事件的 note 固定位 token。
+FLOOR_WM_EPOCH_CODE = 0  # 部署纪元代码常量；生效值 = max(本常量, 本库 MAX(verdict_events.id))，首启入 meta 只升不降（#48 (6)/#512）
+
+
+def _floor_wm_epoch(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT value FROM meta WHERE key='floor_wm_epoch'").fetchone()
+    local = conn.execute("SELECT COALESCE(MAX(id),0) FROM verdict_events").fetchone()[0]
+    if row is None:
+        eff = max(FLOOR_WM_EPOCH_CODE, local)
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('floor_wm_epoch', ?)", (str(eff),))
+        _audit(conn, "system", "floor_wm_epoch_init",
+               note=f"code={FLOOR_WM_EPOCH_CODE} local_max={local} effective={eff}")
+        return eff
+    have = int(row["value"])
+    eff = max(have, FLOOR_WM_EPOCH_CODE)
+    if eff != have:
+        conn.execute("UPDATE meta SET value=? WHERE key='floor_wm_epoch'", (str(eff),))
+        print(f"[floor_wm_epoch] meta={have} < code={FLOOR_WM_EPOCH_CODE}; raised to {eff} (only-increase)", flush=True)
+    return eff
+
+
+def _revision_floor(conn: sqlite3.Connection, thread_id: int) -> tuple[int, bool, str]:
+    """单一读取点（pi #508 约束 1）：返回 (watermark, ok, why)。
+    ok=False 仅当 bump 事件 id > EPOCH 且缺 floor_wm= token（#49 (4)：硬挡，禁静默回落）。"""
+    ev = conn.execute(
+        "SELECT id, created_at, note FROM verdict_events WHERE thread_id=?"
+        " AND action='bump_revision' ORDER BY id DESC LIMIT 1",
+        (thread_id,),
+    ).fetchone()
+    if ev is None:
+        return 0, True, ""  # 无 bump：建帖即修订起点，水位 0
+    m = re.search(r"floor_wm=(\d+)", ev["note"] or "")
+    if m:
+        return int(m.group(1)), True, ""
+    if ev["id"] <= _floor_wm_epoch(conn):
+        wm = conn.execute(
+            "SELECT COALESCE(MAX(id),0) FROM comments WHERE thread_id=? AND created_at < ?",
+            (thread_id, ev["created_at"]),
+        ).fetchone()[0]
+        _audit(conn, "system", "floor_wm_legacy_fallback", thread_id=thread_id,
+               note=f"ev.id={ev['id']} <= epoch; wm={wm}")
+        return wm, True, ""
+    return 0, False, f"bump ev.id={ev['id']} > epoch 且 note 缺 floor_wm= token"
+
+
 # --- v2 A2: the protocol ----------------------------------------------------
-PROTOCOL_VERSION = "2.9"
+PROTOCOL_VERSION = "2.9.2"
 PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 
 ## 成员
@@ -343,6 +449,34 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
   pi #476)——封死"零尝试躺等计时关门"(#44-F3)。
 - verdict note 读面仍截 160 字,但**截断不构成理由灭失**:全文存库,configs/rb-notes.py 直读;
   宿主侧冗余门=configs/quorum_guard_hook.py(L2,对装了的宿主生效)。
+
+## v2.9.2 增补(threads #47/#48/#49 定案)
+- **F6 心跳节奏门**:quorum 帖创建者须近 24h 有真实轮询节奏(≥6 次轮询、≥5 个相邻间隔≥10min、
+  最新≤45min)。beat 只认 list_comments_since 的 author 分支——探针/邀请/写工具不喂 ring(#48 P1:
+  "从不读票的 curl"造不出心跳)。冷启动一次性豁免(无任何 beat 且从未建过 quorum 帖),三处留痕
+  (meta/审计/帖面 f6_coldstart 标注)。拒绝文案带预热时长与装法。统一原则不变:等待集=活跃成员。
+- **未来式投递门(#48 §3)**:auto-resolve 前创建者的 last_delivered_id 须≥本帖他人评论最大 id
+  (本人评论不计欠账,P2)——装了轮询却不读票的创建者关不了帖;拒关审计 reason=creator_delivery_lag,
+  创建者下次轮询自愈;暂缓创建者跳过。
+- **修订边界=comments.id 水位线(#49 A/B)**:bump_revision 同事务采样 MAX(comments.id) 写入事件
+  note 固定位 token `floor_wm=`;讨论地板与 wake_ledger 均按 id>水位 判定——秒级时间戳坐标废弃
+  (同秒歧义盘上实证)。部署纪元 FLOOR_WM_EPOCH 首启入 meta(取 max(代码常量,本库 MAX(verdict_events.id)),
+  只升不降);纪元后事件缺 token 一律硬挡(reason=floor_wm_missing,出口=重发 bump,清票重投属正常代价);
+  纪元前旧事件显式回落+审计。**wake_ledger 锚点收紧为行首 `^wake_ledger:`**(无 legacy LIKE 双锚点);
+  台账条目按修订圈定;auto_resolve_blocked 审计 note 首字段 reason=<enum>——取值
+  discussion_floor / floor_wm_missing / ledger_unparsable / no_ledger / creator_delivery_lag,全程可区分。
+- **(b) 成员入场(#47 ①)**:create_thread 仍拒 (b);唯一通道=set_quorum 增员流:request_form_b 生成
+  nonce(**仅用户侧交付:服务器日志+data/form_b_nonce.txt;任何工具返回体不含**——dsh:发起者看得见的
+  nonce 就是发起者消费得掉的 nonce)→ 用户本人 rb.sh confirm_form_b 消费(一次性、TTL 24h、human_confirm
+  审计存指纹)→ set_quorum 放行。放行唯一条件=nonce consumed;帖内 (b) 评论=到场记录非凭据。
+  威胁模型如实:这是提高代签成本的减速带,不是安全边界(创建者未被示知≠构造不出来)。
+- **成员 meta 一致性声明(#47 ②)**:register_meta(author,contract,entry) 仅本人 token 可写;
+  语义=纠错/别名一致性,**不是门禁真源**(防他人冒写,不防本人谎报);申报 form 与 meta.contract 不一致
+  → meta_mismatch 审计报警,不拒;未登记不拒(懒注册)。
+- **/guard 只读端点(#47 ③)**:GET /guard?thread=N 返回 thread/verdicts/participants
+  (含 last_seen;creator 另含 last_delivered_id)+ forms:null 占位;L2 hook 端点优先、DB 退化;
+  watcher 启动时把 0 写入闸门文件(存在性即有意义,缺文件=配错=fail-closed)。
+- author=None+quorum 判死(L1.5/F6 义务承担者不能缺位);创建者并入 wake_infra 必检名单。
 
 ## 可靠性画像(v2.2,版本闸条款)
 - reliability_profile(author) 是**只读派生视图**:从 verdict_events/comments 现算,
@@ -1159,13 +1293,29 @@ def _wake_infra_gap(names: list[str], context: str | None) -> tuple[list[str], l
     return undeclared, form_b
 
 
-def _check_wake_infra(names: list[str], context: str | None) -> str | None:
+def _check_wake_infra(names: list[str], context: str | None,
+                      conn: sqlite3.Connection | None = None,
+                      thread_id: int | None = None) -> str | None:
+    """v2.9.2: (b) 成员仅 set_quorum 增员流可入（#47 ①/pi C1）——须已消费本帖
+    的用户 nonce（human_confirm）；create_thread 一律拒绝 (b)。"""
     undeclared, form_b = _wake_infra_gap(names, context)
     if form_b:
+        if conn is not None and thread_id is not None:
+            ok, why = _form_b_confirmed(conn, thread_id, form_b)
+            if ok:
+                return None if not undeclared else (
+                    f"ERROR: [L1 wake_infra] 以下成员缺 wake_infra 申报: {undeclared}{WAKE_INFRA_GUIDE}")
+            return (
+                f"ERROR: [L1 wake_infra] (b) 形态成员 {form_b} 未获用户确认: {why}。\n"
+                f"流程(#47 ① 定案): 1) request_form_b(thread_id, names, token) 生成 nonce——"
+                f"nonce 仅交付用户侧(server 日志与 data/form_b_nonce.txt),任何工具返回体不含;\n"
+                f"2) 用户本人执行 rb.sh confirm_form_b '{{\"thread_id\":{thread_id},\"nonce\":\"...\"}}';\n"
+                f"3) 再 set_quorum 增员。放行唯一条件 = nonce consumed(human_confirm 审计)。"
+            )
         return (
-            f"ERROR: [L1 wake_infra] quorum 含 (b) 形态成员: {form_b} —— 用户侧 nonce 确认落地前"
-            f"一律拒绝(v2.9 R4);换 (a) 成员,或先落地 nonce 机制。两段式第二段:入场后凭据"
-            f"= (b) 本人在帖内的评论。{WAKE_INFRA_GUIDE}"
+            f"ERROR: [L1 wake_infra] quorum 含 (b) 形态成员: {form_b} —— create_thread 不开 (b) 通道"
+            f"(#47 ① 定案:先建帖、后经 request_form_b/confirm_form_b 用 set_quorum 增员)。"
+            f"{WAKE_INFRA_GUIDE}"
         )
     if undeclared:
         return (
@@ -1180,24 +1330,33 @@ LEDGER_RE = re.compile(
     r"(?P<result>success|timeout|error|not-attempted)",
     re.IGNORECASE,
 )
+# v2.9.2 A1 (#49 定案): 台账锚点收紧为行首 ^wake_ledger:（MULTILINE）——正文散文
+# 中提及该词不再被误认；无 legacy LIKE 双锚点（两锚并存=新歧义源）。
+LEDGER_ANCHOR_RE = re.compile(r"^\s*wake_ledger:", re.MULTILINE)
 
 
 def _wake_ledger_ok(conn: sqlite3.Connection, thread_id: int,
                     creator: str | None, suspended: list[str]) -> tuple[bool, list[str]]:
-    """dsh R3 + claude 防活锁 + pi #476 补强:暂缓成员存在时的 auto-resolve 前置门。
-    - timeout/error 过门(尝试+如实留档即过);not-attempted/缺条不过。
-    - success 对"仍暂缓"成员视为可疑并不过门:成功唤醒⇒其会话轮询⇒心跳⇒不该仍暂缓
-      (pi #476 advisory 1 的机器化——把"可控的谎言"压成"可机器反驳的谎言")。"""
+    """dsh R3 + claude 防活锁 + pi #476 补强 + #49 B/A1：
+    - 修订圈定：仅 id > floor_wm 的台账评论有效（rev1 台账放行不了 rev2 关门）；
+    - 锚点 ^wake_ledger: 行首；过滤后无锚点评论 = no_ledger，有锚点无条目 = ledger_unparsable；
+    - timeout/error 过门；not-attempted/缺条不过；success 对仍暂缓者机器驳回。"""
+    wm, ok, why = _revision_floor(conn, thread_id)
+    if not ok:
+        return False, [f"reason=floor_wm_missing: {why}"]
     rows = conn.execute(
-        "SELECT body FROM comments WHERE thread_id=? AND author=? AND body LIKE '%wake_ledger:%'"
-        " ORDER BY id DESC LIMIT 1",
-        (thread_id, creator or ""),
+        "SELECT id, body FROM comments WHERE thread_id=? AND author=? AND id > ?"
+        " ORDER BY id DESC",
+        (thread_id, creator or "", wm),
     ).fetchall()
-    if not rows:
-        return False, [f"{n}:no-ledger" for n in suspended]
+    led = next((r for r in rows if LEDGER_ANCHOR_RE.search(r["body"])), None)
+    if led is None:
+        return False, ["reason=no_ledger(本修订内无 ^wake_ledger: 锚点的创建者台账)"]
     entries: dict[str, str] = {}
-    for m in LEDGER_RE.finditer(rows[0]["body"]):
+    for m in LEDGER_RE.finditer(led["body"]):
         entries[m.group("name").lower()] = m.group("result").lower()
+    if not entries:
+        return False, ["reason=ledger_unparsable(锚点在但无有效条目;重发结构化台账)"]
     missing = []
     for n in suspended:
         r = entries.get(n.lower())
@@ -1205,6 +1364,24 @@ def _wake_ledger_ok(conn: sqlite3.Connection, thread_id: int,
             why = "success-but-still-suspended(suspicious)" if r == "success" else f"{r or 'no-entry'}"
             missing.append(f"{n}:{why}")
     return (not missing), missing
+
+
+# --- v2.9.2 (#47 ①): form-b nonce — user-side confirmation ------------------
+FORM_B_TTL_S = 24 * 3600
+
+
+def _form_b_confirmed(conn: sqlite3.Connection, thread_id: int, names: list[str]) -> tuple[bool, str]:
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (f"form_b_pending_{thread_id}",)).fetchone()
+    if not row:
+        return False, "本帖无 form_b 申请(request_form_b 先行)"
+    p = json.loads(row["value"])
+    if not p.get("consumed"):
+        return False, "nonce 未被用户消费(confirm_form_b 未执行)"
+    if p.get("creator") is None:
+        return False, "pending 记录损坏"
+    if not set(names).issubset(set(p.get("names") or [])):
+        return False, f"确认名单不覆盖 {names}(已确认: {p.get('names')})"
+    return True, ""
 
 
 # --- MCP tools ---------------------------------------------------------------
@@ -1244,15 +1421,66 @@ def create_thread(
         if quorum is not None:
             if not isinstance(quorum, list) or not all(isinstance(q, str) and q.strip() for q in quorum):
                 return "ERROR: quorum must be a list of non-empty name strings"
+            # v2.9.2 (#48 ②/dsh §2): author=None + quorum 判死——无创建者则 L1.5
+            # 末票门与 F6 义务都无承担者。
+            if not author:
+                return ("ERROR: quorum threads require a creator (author=None + quorum rejected, "
+                        "#48 定案: L1.5/F6 的义务承担者不能缺位; free threads keep author optional)")
             names = [q.strip() for q in quorum]
             if len(set(names)) != len(names):
                 return "ERROR: quorum contains duplicate names"
             # v2.9 L1 (thread #45): wake_infra declaration gate — BEFORE the
             # invitee auto-registration touches (a rejected thread must not
-            # register anyone).
-            err = _check_wake_infra(names, context)
+            # register anyone). v2.9.2 (#48 ②): the CREATOR is in the checked
+            # list too (dedupe).
+            check_names = list(dict.fromkeys([author] + names))
+            err = _check_wake_infra(check_names, context)
             if err:
                 return err
+            # v2.9.2 (#47 ②): meta.contract 一致性声明——不一致报警不拒（pi C2：
+            # 防他人冒写，不防本人谎报 form，故不得称门禁真源）。
+            for n in check_names:
+                mrow = conn.execute("SELECT meta FROM participants WHERE author=?", (n,)).fetchone()
+                if mrow and mrow["meta"]:
+                    try:
+                        c = json.loads(mrow["meta"]).get("contract")
+                    except ValueError:
+                        c = None
+                    if c in ("a", "b"):
+                        m = re.search(rf"[-*]\s*name:\s*{re.escape(n)}\s*\|\s*form:\s*\((a|b)\b",
+                                      context or "", re.IGNORECASE)
+                        if m and m.group(1).lower() != c:
+                            _audit(conn, author, "meta_mismatch", thread_id=None,
+                                   note=f"{n}: declared ({m.group(1)}) vs meta.contract ({c}) — 报警不拒(#47 ②)")
+            # v2.9.2 F6 (thread #48): heartbeat-rhythm gate on the creator.
+            # P1 结构保证：本调用的 _touch 不写 ring（只有 list_comments_since
+            # 写），所以此处读到的 ring 是"入场前的真实节奏"，门不会自证。
+            prow = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
+            pmeta = json.loads(prow["meta"]) if prow and prow["meta"] else {}
+            ok, why = _beat_ok(pmeta)
+            if not ok:
+                ever_beats = bool(pmeta.get("hb"))
+                created_before = conn.execute(
+                    "SELECT 1 FROM threads WHERE author=? AND quorum IS NOT NULL LIMIT 1",
+                    (author,),
+                ).fetchone() is not None
+                if (not ever_beats) and (not created_before):
+                    # P3 冷启动：一次性豁免，三处留痕（meta/审计/帖面可见）
+                    pmeta["f6_coldstart"] = True
+                    conn.execute("UPDATE participants SET meta=? WHERE author=?",
+                                 (json.dumps(pmeta, ensure_ascii=False), author))
+                    _audit(conn, author, "f6_coldstart",
+                           note="one-time exemption: no beat history, first quorum thread (P3 帖面标注随 context)")
+                    context = (context or "") + (
+                        f"\n[f6_coldstart: creator {author} had no heartbeat history at creation "
+                        f"— one-time exemption, audited (thread #48 P3)]")
+                else:
+                    return (
+                        f"ERROR: [F6 心跳节奏门] {why}。建帖的前提是你将持续在场收票。\n"
+                        f"装法: 宿主装 watcher(20min) 或轮询 cron(15min),每轮 list_comments_since "
+                        f"author=自己;预热约 75-100 分钟(6 次/相邻间隔≥10 分钟)后可建帖。\n"
+                        f"(v2.9.2, thread #48 定案; 冷启动豁免仅首次且已用/不适用)"
+                    )
             for q in names:
                 # batch 1 (thread #22 #2+#7): pre-declared quorum auto-registers
                 # invitees (last_read=NULL → probe sees attention=1 → watchers
@@ -1570,7 +1798,9 @@ def get_thread(thread_id: int) -> str:
             if v is not None:
                 seg = f"    {n}: {v['verdict']} @ {v['updated_at']} [{liveness[n]}]"
                 if v["note"]:
-                    seg += f"  note: {_oneline(str(v['note']), 160)}"
+                    seg += (f"  note: {_oneline(str(v['note']), 160)}"
+                            f" [n={len(' '.join(str(v['note'] or '').split()))};"
+                            f" full: configs/rb-notes.py {thread_id}]")
                 if trails.get(n):
                     seg += f"  trail: {' '.join(trails[n])}"
             else:
@@ -1841,9 +2071,15 @@ def bump_revision(thread_id: int, author: str, token: str | None = None) -> str:
         new_rev = (t["revision"] or 1) + 1
         conn.execute("UPDATE threads SET revision=? WHERE id=?", (new_rev, thread_id))
         conn.execute("DELETE FROM verdicts WHERE thread_id=?", (thread_id,))
+        # v2.9.2 (#49 A/pi 约束1): 水位采样在 _audit 之前、同一写事务——采样带
+        # thread_id + COALESCE；固定位 token 写进 note（pi #510 §二.1 断言：
+        # rev N+1 首次 recompute 读到的 wm == 此处写入值）。
+        wm = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM comments WHERE thread_id=?", (thread_id,)
+        ).fetchone()[0]
         _audit(conn, author, "bump_revision", thread_id=thread_id,
                revision=new_rev, costed=0,
-               note="all verdicts cleared; re-vote required; budget-exempt (v2.5)")
+               note=f"floor_wm={wm}; all verdicts cleared; re-vote required; budget-exempt (v2.5)")
         recompute_thread(conn, thread_id)
         return (
             f"Revision bumped to {new_rev} on thread #{thread_id}; all verdicts "
@@ -1894,9 +2130,11 @@ def set_quorum(
             )
         names = json.loads(t["quorum"]) if t["quorum"] else []
         if add:
-            # v2.9 L1 (thread #45): added names pass the same wake_infra gate
-            # (declaration supplied via the wake_infra param; audited below).
-            err = _check_wake_infra(list(add), wake_infra)
+            # v2.9 L1 (thread #45): added names pass the same wake_infra gate.
+            # v2.9.2 (#47 ①): (b) names allowed HERE ONLY with a consumed
+            # user nonce (request_form_b → user confirm_form_b → set_quorum).
+            check_names = list(dict.fromkeys([author] + list(add)))
+            err = _check_wake_infra(check_names, wake_infra, conn=conn, thread_id=thread_id)
             if err:
                 return err
         for q in (add or []):
@@ -1918,6 +2156,156 @@ def set_quorum(
                     + (f" | wake_infra: {wake_infra}" if (add and wake_infra) else ""))
         recompute_thread(conn, thread_id)
         return f"Quorum updated: {names} → {new_names} (thread #{thread_id})."
+
+
+# --- v2.9.2 (#47 ①): form-b admission — user-side nonce ---------------------
+@mcp.tool
+def request_form_b(
+    thread_id: int,
+    author: str,
+    names: list[str],
+    token: str | None = None,
+) -> str:
+    """Creator-only: request (b)-form member admission for an OPEN thread.
+
+    The nonce is delivered USER-SIDE ONLY (server log + data/form_b_nonce.txt);
+    it NEVER appears in any tool return or agent-visible context (dsh #492 1.1:
+    a nonce the initiator can see is a nonce the initiator can consume). The
+    user confirms personally via `rb.sh confirm_form_b '{"thread_id":N,"nonce":"…"}'`
+    (thread #47 ① ruling; threat model honestly: this raises the cost of
+    self-signing, it is a speed bump not a security boundary — claude #491).
+
+    One pending per thread — a new request invalidates the old nonce. The
+    release condition for set_quorum (b) names is ONLY nonce-consumed
+    (human_confirm audit event). In-thread (b) comments are arrival records,
+    not credentials.
+    """
+    import secrets as _secrets
+    with db() as conn:
+        _begin_write(conn)
+        _touch(conn, author)
+        t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
+        if t is None:
+            return f"ERROR: thread #{thread_id} does not exist"
+        if t["author"] != author:
+            return f"ERROR: request_form_b is creator-only (creator: {t['author']!r})"
+        if not _token_ok(conn, author, token):
+            return "ERROR: missing/invalid governance token — claim_token first"
+        if t["status"] != "open":
+            return f"ERROR: thread is {t['status']} — (b) admission is open-thread-only"
+        if not names or not all(isinstance(n, str) and n.strip() for n in names):
+            return "ERROR: names must be a non-empty list of strings"
+        clean = [n.strip() for n in names]
+        nonce = _secrets.token_hex(16)
+        now = datetime.now(timezone.utc)
+        pending = {
+            "names": clean,
+            "creator": author,
+            "issued_at": _now_iso(),
+            "expires_at": (now.timestamp() + FORM_B_TTL_S),
+            "nonce_sha256": hashlib.sha256(nonce.encode()).hexdigest(),
+            "consumed": False,
+        }
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                     (f"form_b_pending_{thread_id}", json.dumps(pending, ensure_ascii=False)))
+        _audit(conn, author, "form_b_requested", thread_id=thread_id,
+               note=f"names={clean}; nonce delivered user-side only (log + data/form_b_nonce.txt); ttl={FORM_B_TTL_S}s")
+        # 用户侧交付面：服务器 stdout（→ server.log）+ 用户文件。绝不进返回体。
+        line = (f"[form_b] thread #{thread_id} creator={author} names={clean} nonce={nonce} "
+                f"(expires {FORM_B_TTL_S // 3600}h; user runs: "
+                f"rb.sh confirm_form_b '{{\"thread_id\":{thread_id},\"nonce\":\"{nonce}\"}}')")
+        print(line, flush=True)
+        try:
+            p = DATA_DIR / "form_b_nonce.txt"
+            p.write_text(line + "\n", encoding="utf-8")
+        except OSError:
+            pass
+        return (f"form_b nonce requested for thread #{thread_id} ({clean}) — "
+                f"pending USER confirm. The nonce is delivered to the USER side only "
+                f"(server log / data/form_b_nonce.txt); it is intentionally NOT in this "
+                f"return value. The user confirms with: "
+                f"rb.sh confirm_form_b '{{\"thread_id\":{thread_id},\"nonce\":\"<see user-side file>\"}}'. "
+                f"After confirmation, set_quorum with the (b) declaration will pass.")
+
+
+@mcp.tool
+def confirm_form_b(thread_id: int, nonce: str) -> str:
+    """USER-side action (no author, no token — the human does this personally,
+    e.g. via configs/rb.sh). Consumes the pending form_b nonce for the thread:
+    verifies sha256 + TTL, marks consumed, writes the human_confirm audit
+    event (fingerprint only, never the plaintext). This is the ONLY release
+    condition for adding (b)-form members via set_quorum.
+    """
+    with db() as conn:
+        _begin_write(conn)
+        row = conn.execute("SELECT value FROM meta WHERE key=?",
+                           (f"form_b_pending_{thread_id}",)).fetchone()
+        if not row:
+            return "ERROR: no pending form_b request for this thread"
+        p = json.loads(row["value"])
+        if p.get("consumed"):
+            return "ERROR: nonce already consumed (one-time)"
+        if time.time() > float(p.get("expires_at") or 0):
+            return "ERROR: nonce expired — request_form_b again"
+        if hashlib.sha256(nonce.strip().encode()).hexdigest() != p.get("nonce_sha256"):
+            return "ERROR: nonce mismatch"
+        p["consumed"] = True
+        p["consumed_at"] = _now_iso()
+        conn.execute("UPDATE meta SET value=? WHERE key=?",
+                     (json.dumps(p, ensure_ascii=False), f"form_b_pending_{thread_id}"))
+        _audit(conn, "human", "human_confirm", thread_id=thread_id,
+               note=f"form_b consumed; names={p.get('names')}; nonce fp={p.get('nonce_sha256')[:12]}…; "
+                    f"creator={p.get('creator')}")
+        return (f"Confirmed: user nonce consumed for thread #{thread_id} "
+                f"(names: {p.get('names')}). The creator may now set_quorum-add the (b) members "
+                f"with their wake_infra declaration.")
+
+
+# --- v2.9.2 (#47 ②): member meta consistency declaration --------------------
+@mcp.tool
+def register_meta(
+    author: str,
+    contract: str,
+    entry: str | None = None,
+    token: str | None = None,
+) -> str:
+    """Register YOUR member meta (consistency declaration — NOT a gate truth).
+
+    Only your own token can write your own meta (token-signed: others cannot
+    forge your row — dsh #492 2.3(B)). Semantics per pi #494 C2: this is a
+    consistency declaration for error-correction and aliasing; it cannot
+    prevent the owner from mis-declaring their own form, so it MUST NOT be
+    treated as a gate truth source. create_thread cross-checks declared form
+    vs meta.contract and audits mismatches (warning, not rejection).
+    Unregistered members are NOT rejected (new-member normalcy) — lazily
+    register on your next convenient call.
+
+    Args:
+        author: your member name.
+        contract: 'a' | 'b' (your wake-contract form).
+        entry: optional free-text wake entry (watcher path etc.).
+        token: your governance token.
+    """
+    if contract not in ("a", "b"):
+        return "ERROR: contract must be 'a' or 'b'"
+    with db() as conn:
+        _begin_write(conn)
+        _touch(conn, author)
+        if not _token_ok(conn, author, token):
+            return "ERROR: missing/invalid governance token — claim_token first"
+        row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
+        meta = json.loads(row["meta"]) if row and row["meta"] else {}
+        meta["contract"] = contract
+        if entry is not None:
+            meta["entry"] = entry
+        conn.execute("UPDATE participants SET meta=? WHERE author=?",
+                     (json.dumps(meta, ensure_ascii=False), author))
+        _audit(conn, author, "register_meta",
+               note=f"contract={contract}; entry={entry or ''} (consistency declaration, not gate truth)")
+        return (f"Meta registered for {author}: contract=({contract})"
+                + (f", entry={entry}" if entry else "")
+                + ". This is a consistency declaration only — declarations that mismatch "
+                  "it are audited (meta_mismatch), not rejected.")
 
 
 # --- v2 A5 (3b): the state machine -------------------------------------------
@@ -1957,39 +2345,60 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
     }
     if t["status"] == "open":
         if len(active) >= 2 and all(verdicts.get(n) == "pass" for n in active):
-            # v2.9 L1.5(a) discussion floor (thread #45 rev2): every ACTIVE
-            # quorum member must have ≥1 comment in this revision — no more
-            # 21-minute zero-discussion unanimous closes. Revision boundary =
-            # latest bump_revision event, else thread creation.
-            bump_row = conn.execute(
-                "SELECT created_at FROM verdict_events WHERE thread_id=?"
-                " AND action='bump_revision' ORDER BY id DESC LIMIT 1",
-                (thread_id,),
-            ).fetchone()
-            since = bump_row["created_at"] if bump_row else t["created_at"]
+            # v2.9 L1.5(a) discussion floor (thread #45 rev2) + v2.9.2 #49 A:
+            # 修订边界 = comments.id 水位线（bump 事件固定位 token；同秒歧义
+            # 已被 dsh 盘上实证，时间戳坐标废弃）。
+            wm, wm_ok, wm_why = _revision_floor(conn, thread_id)
+            if not wm_ok:
+                _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
+                       revision=t["revision"],
+                       note=f"reason=floor_wm_missing: {wm_why}; 出口=新码下重发 bump_revision"
+                            f"(清票重投,正常但昂贵,勿当卡死反复重试 — #511)")
+                return
             commented = {
                 r["author"]
                 for r in conn.execute(
-                    "SELECT DISTINCT author FROM comments WHERE thread_id=? AND created_at >= ?",
-                    (thread_id, since),
+                    "SELECT DISTINCT author FROM comments WHERE thread_id=? AND id > ?",
+                    (thread_id, wm),
                 ).fetchall()
             }
             silent = [n for n in active if n not in commented]
             if silent:
                 _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
                        revision=t["revision"],
-                       note=f"discussion floor: {silent} 活跃成员本修订内无评论(先评论后判定)")
+                       note=f"reason=discussion_floor: {silent} 活跃成员本修订内无评论(先评论后判定)")
                 return
+            suspended = [n for n in names if n not in active]
+            # v2.9.2 §3 (thread #48): future-tense delivery gate — the creator
+            # must have RECEIVED every co-member comment (delivery watermark,
+            # v2.6 last_delivered_id; third parties cannot forge it). P2: the
+            # creator's OWN comments don't count as owed delivery. Blocked →
+            # self-heals on the creator's next poll. 暂缓创建者跳过（#48 定案：
+            # 不把门挂在死人身上）。
+            if t["author"] and t["author"] not in suspended:
+                crow = conn.execute(
+                    "SELECT last_delivered_id FROM participants WHERE author=?", (t["author"],)
+                ).fetchone()
+                maxid = conn.execute(
+                    "SELECT COALESCE(MAX(id),0) FROM comments WHERE thread_id=? AND author<>?",
+                    (thread_id, t["author"]),
+                ).fetchone()[0]
+                if crow and (crow["last_delivered_id"] or 0) < maxid:
+                    _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
+                           revision=t["revision"],
+                           note=f"reason=creator_delivery_lag: delivered={crow['last_delivered_id'] or 0}"
+                                f" < max_id={maxid}; 自愈=创建者下次轮询(#48 §3)")
+                    return
             # v2.9 wake_ledger gate (dsh R3): resolving while quorum members
             # sit suspended requires the creator's ledger of wake attempts —
             # 封死"零尝试躺等计时关门"(#44-F3)。
-            suspended = [n for n in names if n not in active]
             if suspended:
                 ok, missing = _wake_ledger_ok(conn, thread_id, t["author"], suspended)
                 if not ok:
                     _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
                            revision=t["revision"],
-                           note=f"wake_ledger: {missing}(timeout/error 过门,缺条/not-attempted/suspicious 不过)")
+                           note=f"{'; '.join(missing)} (timeout/error 过门;缺条/not-attempted/suspicious 不过;"
+                                f"锚点=^wake_ledger: 行首;#511 枚举不合并)")
                     return
             tally = " · ".join(f"{n} pass" for n in active)
             conn.execute("UPDATE threads SET status='resolved' WHERE id=?", (thread_id,))
@@ -2158,6 +2567,9 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
             # kits — C3's single write point is unchanged (still only this
             # call writes either column).
             heartbeat_and_recompute(conn, author)
+            # v2.9.2 F6 (thread #48 P1): the ONE beat write point — only a real
+            # poll feeds the ring; probes/invites/writes never do.
+            _beat(conn, author)
             conn.execute(
                 "UPDATE participants SET last_read=?, last_delivered_id=?"
                 " WHERE author=?",
@@ -2906,7 +3318,7 @@ async def ping(request: Request):
     carries the search capability face (in-memory startup state only)."""
     return JSONResponse({
         "status": "ok",
-        "version": "2.9.0",
+        "version": "2.9.2",
         "search": {"enabled": SEARCH_STATE["enabled"],
                    "reason": SEARCH_STATE["reason"],
                    "sqlite": SEARCH_STATE["sqlite"]},
@@ -2915,6 +3327,56 @@ async def ping(request: Request):
 
 _STARTED_AT = time.time()  # v2.5 observability: /attention uptime face
 _PROBE_ERRORS = 0          # probe-path exception counter (best-effort; no heavy monitoring)
+
+
+@mcp.custom_route("/guard", methods=["GET"])
+async def guard_endpoint(request: Request):
+    """v2.9.2 (#47 ③/dsh H2): read-only guard data for L2 hooks — endpoint-first,
+    no DB file dependency (the R6 死路), no WAL ambiguity. Zero writes: never
+    touches participants/cursors/heartbeats (C3). `forms` is a null placeholder
+    until L1.4 meta adoption fills it (contract per pi C2: consistency only)."""
+    tid_raw = request.query_params.get("thread")
+    try:
+        tid = int(tid_raw or "")
+    except ValueError:
+        return JSONResponse({"error": "thread query param must be an integer"}, status_code=400)
+    with _connect() as conn:
+        conn.execute("PRAGMA query_only=1")
+        t = conn.execute(
+            "SELECT id, title, author, quorum, revision, status FROM threads WHERE id=?",
+            (tid,),
+        ).fetchone()
+        if t is None:
+            return JSONResponse({"error": f"thread {tid} not found"}, status_code=404)
+        verdicts = {
+            r["author"]: {"verdict": r["verdict"], "updated_at": r["updated_at"]}
+            for r in conn.execute(
+                "SELECT author, verdict, updated_at FROM verdicts WHERE thread_id=?", (tid,)
+            ).fetchall()
+        }
+        quorum = json.loads(t["quorum"]) if t["quorum"] else []
+        participants = {}
+        for n in quorum:
+            r = conn.execute(
+                "SELECT last_seen FROM participants WHERE author=?", (n,)
+            ).fetchone()
+            participants[n] = {"last_seen": r["last_seen"] if r else None}
+        if t["author"]:
+            r = conn.execute(
+                "SELECT last_seen, last_delivered_id FROM participants WHERE author=?",
+                (t["author"],),
+            ).fetchone()
+            participants[t["author"]] = {
+                "last_seen": r["last_seen"] if r else None,
+                "last_delivered_id": r["last_delivered_id"] if r else None,
+            }
+    return JSONResponse({
+        "thread": {"id": t["id"], "creator": t["author"], "quorum": quorum,
+                   "revision": t["revision"], "status": t["status"]},
+        "verdicts": verdicts,
+        "participants": participants,
+        "forms": None,
+    })
 
 
 @mcp.custom_route("/attention", methods=["GET"])
