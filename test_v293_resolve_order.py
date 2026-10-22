@@ -102,10 +102,18 @@ def main():
 
     # watermark moved (a new co-member comment) ⇒ new fact ⇒ a second row is
     # legitimate (rev2 判据 3: dedupe must not swallow `delivered/max_id` changes)
-    post_id(srv, t1, "cyr", "cyr follow-up (max_id advances)")
+    maxid = post_id(srv, t1, "cyr", "cyr follow-up (max_id advances)")
     lag = blocked_rows(db, t1, "creator_delivery_lag")
     check("#55③ rev2: a moving max_id produces a NEW lag row (not swallowed)",
           len(lag) == 2, f"rows={len(lag)}")
+
+    # 判据 2(b) (dsh #686 §3 ② / pi #680 §2): assert the TWO NUMBERS, not just
+    # exists/count — the pair is what a silent regression would corrupt
+    # (server.py:2477: delivered={crow last_delivered_id or 0} < max_id={maxid}).
+    m = re.match(r"reason=creator_delivery_lag: delivered=(\d+) < max_id=(\d+)", lag[-1] if lag else "")
+    check("#55②(b): the lag row names the exact pair (delivered=0, max_id=last floor id)",
+          bool(m) and m.group(1) == "0" and m.group(2) == str(maxid),
+          lag[-1] if lag else "no row")
 
     # exactly ONE poll: old order left this thread open (the poll itself blocked)
     srv.list_comments_since(since="1h", author="anna")
