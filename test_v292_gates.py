@@ -121,13 +121,25 @@ def main():
     check("delivery gate blocks (creator has not received others' comments)",
           note and note.startswith("reason=creator_delivery_lag") and st == "open",
           f"note={note} status={st}")
-    # anna 轮询(推水位+喂 beat) → 自愈需 ≤1 节奏:水位写在本事务 recompute 之后,
-    # 第二次轮询的 heartbeat recompute 才看到已更新的投递水位(dsh 预言的自愈节奏)
-    srv.list_comments_since(since="1h", author="anna")
+    # anna 轮询(推水位+喂 beat)。v2.9.3 (#55①, dsh #640)：游标先写、复算后跑 ⇒
+    # **这一次**轮询即自愈（旧序里 recompute 读到的是轮询前的旧游标，这一拍会先撞自己
+    # 一墙、须再等一拍）。第二次轮询只验幂等（不产生第二条 auto_resolve）。
     srv.list_comments_since(since="1h", author="anna")
     with _RO(db) as conn:
         st = conn.execute("SELECT status FROM threads WHERE id=?", (tid,)).fetchone()[0]
-    check("delivery self-heals on creator poll → auto-resolved", st == "resolved", f"status={st}")
+    check("delivery self-heals on the creator's NEXT poll (#55① cursor-before-recompute)",
+          st == "resolved", f"status={st}")
+    srv.list_comments_since(since="1h", author="anna")   # idempotence probe
+    with _RO(db) as conn:
+        n_auto = conn.execute(
+            "SELECT COUNT(*) FROM verdict_events WHERE thread_id=? AND action='auto_resolve'",
+            (tid,)).fetchone()[0]
+        lag_rows = conn.execute(
+            "SELECT COUNT(*) FROM verdict_events WHERE thread_id=?"
+            " AND action='auto_resolve_blocked' AND note LIKE 'reason=creator_delivery_lag%'",
+            (tid,)).fetchone()[0]
+    check("second poll is idempotent (1 auto_resolve, 1 lag row) — #55③",
+          n_auto == 1 and lag_rows == 1, f"auto={n_auto} lag_rows={lag_rows}")
 
     # ---------- 2. 跨修订 ledger 圈定 ----------
     # 三人帖，brin 拨老暂缓；活跃 anna+cyr 全评论，anna 轮询收齐后投 → rev1 ledger 放行

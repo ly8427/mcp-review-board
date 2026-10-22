@@ -202,7 +202,10 @@ SUSPEND_AFTER_HOURS = 24
 
 
 # --- v2 A1: participant registry / heartbeat --------------------------------
-mcp = FastMCP("ReviewBoard", version="2.9.2")  # align serverInfo with pyproject (was: fastmcp lib version)
+# Single source of truth for the served version (v2.9.3 #55: was duplicated in
+# three literals — FastMCP serverInfo, /ping, PROTOCOL header — and drifted).
+PROTOCOL_VERSION = "2.9.3"
+mcp = FastMCP("ReviewBoard", version=PROTOCOL_VERSION)  # align serverInfo with pyproject
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -406,7 +409,6 @@ def _revision_floor(conn: sqlite3.Connection, thread_id: int) -> tuple[int, bool
 
 
 # --- v2 A2: the protocol ----------------------------------------------------
-PROTOCOL_VERSION = "2.9.2"
 PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 
 ## 成员
@@ -490,14 +492,19 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
   (meta/审计/帖面 f6_coldstart 标注)。拒绝文案带预热时长与装法。统一原则不变:等待集=活跃成员。
 - **未来式投递门(#48 §3)**:auto-resolve 前创建者的 last_delivered_id 须≥本帖他人评论最大 id
   (本人评论不计欠账,P2)——装了轮询却不读票的创建者关不了帖;拒关审计 reason=creator_delivery_lag,
-  创建者下次轮询自愈;暂缓创建者跳过。
+  自愈=创建者**该次追平轮询**即自愈(v2.9.3 #55: 轮询内 `_touch`→游标写入→复算,故追平的那一次
+  就带新水位进复算;不是"再下一次");暂缓创建者跳过。
+- **拒关审计去重(v2.9.3 #55③,rev2 口径)**:同一(帖,修订,reason)在**状态未迁移、水位未推进**时
+  最多一条;`delivered`/`max_id` 变化 = 新事实 → **另留一条**;`auto_resolve`/`auto_reopen` 之后重置
+  (reopen 不改 revision,故不能用裸 revision 去重——dsh #667)。
 - **修订边界=comments.id 水位线(#49 A/B)**:bump_revision 同事务采样 MAX(comments.id) 写入事件
   note 固定位 token `floor_wm=`;讨论地板与 wake_ledger 均按 id>水位 判定——秒级时间戳坐标废弃
   (同秒歧义盘上实证)。部署纪元 FLOOR_WM_EPOCH 首启入 meta(取 max(代码常量,本库 MAX(verdict_events.id)),
   只升不降);纪元后事件缺 token 一律硬挡(reason=floor_wm_missing,出口=重发 bump,清票重投属正常代价);
   纪元前旧事件显式回落+审计。**wake_ledger 锚点收紧为行首 `^wake_ledger:`**(无 legacy LIKE 双锚点);
   台账条目按修订圈定;auto_resolve_blocked 审计 note 首字段 reason=<enum>——取值
-  discussion_floor / floor_wm_missing / ledger_unparsable / no_ledger / creator_delivery_lag,全程可区分。
+  discussion_floor / floor_wm_missing / ledger_unparsable / no_ledger / creator_delivery_lag /
+  ledger_entry_missing / ledger_entry_suspicious,全程可区分(去重口径见上一条)。
 - **(b) 成员入场(#47 ①)**:create_thread 仍拒 (b);唯一通道=set_quorum 增员流:request_form_b 生成
   nonce(**仅用户侧交付:服务器日志+data/form_b_nonce.txt;任何工具返回体不含**——dsh:发起者看得见的
   nonce 就是发起者消费得掉的 nonce)→ 用户本人 rb.sh confirm_form_b 消费(一次性、TTL 24h、human_confirm
@@ -1149,6 +1156,39 @@ def _audit(conn, author: str, action: str, thread_id: int | None = None,
     )
 
 
+def _audit_blocked_once(conn, thread_id: int, revision: int, reason: str,
+                        note: str) -> bool:
+    """v2.9.3 (thread #55 ③, rev2 口径 from dsh #667/#654): suppress only
+    *redundant* auto_resolve_blocked rows.
+
+    A row is redundant when the previous blocked row for this (thread, revision,
+    reason) is IDENTICAL and no state transition happened in between:
+      - identical note ⇒ no new fact (the old behaviour appended one per
+        heartbeat: thread #53 ev#468/470/472/474);
+      - `delivered=`/`max_id=` changing ⇒ the watermark moved ⇒ new fact ⇒ log;
+      - auto_resolve / auto_reopen in between ⇒ new episode ⇒ log again.
+        (reopen does NOT bump the revision, so deduping on revision alone would
+        swallow the post-reopen block — dsh #667 §3.)
+    Returns True when the row was suppressed.
+    """
+    prev = conn.execute(
+        "SELECT id, note FROM verdict_events WHERE thread_id=? AND revision=?"
+        " AND action='auto_resolve_blocked' AND note LIKE ? ORDER BY id DESC LIMIT 1",
+        (thread_id, revision, f"reason={reason}%"),
+    ).fetchone()
+    if prev is not None:
+        transitioned = conn.execute(
+            "SELECT 1 FROM verdict_events WHERE thread_id=? AND id > ?"
+            " AND action IN ('auto_resolve','auto_reopen') LIMIT 1",
+            (thread_id, prev["id"]),
+        ).fetchone()
+        if not transitioned and prev["note"] == note:
+            return True
+    _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
+           revision=revision, note=note)
+    return False
+
+
 @mcp.tool
 def claim_token(author: str) -> str:
     """Issue (or reissue) your governance token — two-phase (v2.1; v2.3 two-tier acks).
@@ -1600,6 +1640,12 @@ def post_comment(
         )
         cid = cur.lastrowid
         stale_note = _stale_receipt_note(conn, thread_id)
+        # v2.9.3 (thread #55 ②): comments are exactly what satisfies the
+        # discussion floor, yet this call site was missing from the recompute
+        # list — the last floor comment landed and the thread stayed open until
+        # somebody polled. recompute_thread is idempotent (state transitions fire
+        # inside this same txn), so the cost is one indexed pass.
+        recompute_thread(conn, thread_id)
     loc = ""
     if file:
         loc = f" at {file}" + (f":{line}" if line else "")
@@ -1658,6 +1704,9 @@ def reply_comment(comment_id: int, author: str, body: str) -> str:
         )
         cid = cur.lastrowid
         stale_note = _stale_receipt_note(conn, row["thread_id"])
+        # v2.9.3 (thread #55 ②): same invariant trigger as post_comment — a reply
+        # can be the last thing the discussion floor was waiting for.
+        recompute_thread(conn, row["thread_id"])
     return f"Posted reply #{cid} to comment #{comment_id} by {author}.{stale_note}"
 
 
@@ -2347,11 +2396,18 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
 
     resolved ⟺ ALL *active* quorum verdicts pass AND ≥2 active members.
     - open + (all active pass, ≥2)         → auto-resolve with tally
-    - resolved + standing object (incl. one
-      restored by an unfreeze, C')          → reopen, reason recorded
+    - resolved + standing object by an ACTIVE member (incl. one restored by an
+      unfreeze, C')                         → reopen, reason recorded
     - resolved + zero verdicts (revision
       bump cleared them)                    → reopen (needs re-vote)
     - wontfix                               → terminal, skipped
+
+    v2.9.3 (thread #55 follow-up): a FROZEN objector's object does NOT reopen —
+    the resolve stands while it is suspended, and reopens on its own return
+    (unfreeze ⇒ back in `active`). Before v2.9.3 the resolved-branch looked at
+    the full roster; that was harmless only because nothing recomputed between
+    the resolve and the objector's return. With comment-triggered recompute
+    (#55②) it made every heartbeat flap resolve↔reopen.
     """
     t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
     if t is None or not t["quorum"] or t["status"] == "wontfix":
@@ -2371,10 +2427,10 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
             # 已被 dsh 盘上实证，时间戳坐标废弃）。
             wm, wm_ok, wm_why = _revision_floor(conn, thread_id)
             if not wm_ok:
-                _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
-                       revision=t["revision"],
-                       note=f"reason=floor_wm_missing: {wm_why}; 出口=新码下重发 bump_revision"
-                            f"(清票重投,正常但昂贵,勿当卡死反复重试 — #511)")
+                _audit_blocked_once(
+                    conn, thread_id, t["revision"], "floor_wm_missing",
+                    f"reason=floor_wm_missing: {wm_why}; 出口=新码下重发 bump_revision"
+                    f"(清票重投,正常但昂贵,勿当卡死反复重试 — #511)")
                 return
             commented = {
                 r["author"]
@@ -2385,9 +2441,9 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
             }
             silent = [n for n in active if n not in commented]
             if silent:
-                _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
-                       revision=t["revision"],
-                       note=f"reason=discussion_floor: {silent} 活跃成员本修订内无评论(先评论后判定)")
+                _audit_blocked_once(
+                    conn, thread_id, t["revision"], "discussion_floor",
+                    f"reason=discussion_floor: {silent} 活跃成员本修订内无评论(先评论后判定)")
                 return
             suspended = [n for n in names if n not in active]
             # v2.9.2 §3 (thread #48): future-tense delivery gate — the creator
@@ -2414,10 +2470,13 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
                         (thread_id, t["author"],)
                     ).fetchone()[0]
                     if (crow["last_delivered_id"] or 0) < maxid:
-                        _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
-                               revision=t["revision"],
-                               note=f"reason=creator_delivery_lag: delivered={crow['last_delivered_id'] or 0}"
-                                    f" < max_id={maxid}; 自愈=创建者下次轮询(#48 §3)")
+                        # v2.9.3 (#55): "自愈=创建者下次轮询" is now literally
+                        # true — the cursor is written BEFORE this recompute, so
+                        # the creator's next poll lands a current watermark.
+                        _audit_blocked_once(
+                            conn, thread_id, t["revision"], "creator_delivery_lag",
+                            f"reason=creator_delivery_lag: delivered={crow['last_delivered_id'] or 0}"
+                            f" < max_id={maxid}; 自愈=创建者下次轮询(游标先写后复算, #55)")
                         return
             # v2.9 wake_ledger gate (dsh R3): resolving while quorum members
             # sit suspended requires the creator's ledger of wake attempts —
@@ -2425,27 +2484,32 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
             if suspended:
                 ok, missing = _wake_ledger_ok(conn, thread_id, t["author"], suspended)
                 if not ok:
-                    _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
-                           revision=t["revision"],
-                           note=f"{'; '.join(missing)} (timeout/error 过门;缺条/not-attempted/suspicious 不过;"
-                                f"锚点=^wake_ledger: 行首;#511 枚举不合并)")
+                    _note = (f"{'; '.join(missing)} (timeout/error 过门;"
+                             f"缺条/not-attempted/suspicious 不过;"
+                             f"锚点=^wake_ledger: 行首;#511 枚举不合并)")
+                    # Dedupe key = the reason enum the note already carries
+                    # (no_ledger / ledger_unparsable / floor_wm_missing), or the
+                    # per-member split ledger_entry_missing / _suspicious.
+                    _key = "ledger_entry_suspicious" if "suspicious" in _note \
+                        else "ledger_entry_missing"
+                    if _note.startswith("reason="):
+                        _key = _note[7:].split(":", 1)[0].split("(", 1)[0].strip()
+                    _audit_blocked_once(conn, thread_id, t["revision"], _key, _note)
                     return
             tally = " · ".join(f"{n} pass" for n in active)
             conn.execute("UPDATE threads SET status='resolved' WHERE id=?", (thread_id,))
             _audit(conn, "system", "auto_resolve", thread_id=thread_id,
                    revision=t["revision"], note=f"active quorum unanimous: {tally}")
     elif t["status"] == "resolved":
-        standing = [n for n in names if verdicts.get(n) == "object"]
+        # Only an ACTIVE objector can reopen (v2.9.3 #55): a suspended member's
+        # object stays frozen until that member returns.
+        standing = [n for n in active if verdicts.get(n) == "object"]
         if standing:
-            reason = (
-                "frozen object re-stood after suspension lift (C', unbilled)"
-                if any(n not in active for n in standing) or len(active) < len(names)
-                else "object recorded"
-            )
             conn.execute("UPDATE threads SET status='open' WHERE id=?", (thread_id,))
             _audit(conn, "system", "auto_reopen", thread_id=thread_id,
                    revision=t["revision"],
-                   note=f"standing object by {standing} ({reason})")
+                   note=f"standing object by {standing} (active objector; "
+                        f"frozen-at-resolve objects reopen only on unfreeze, C')")
         elif not verdicts:
             conn.execute("UPDATE threads SET status='open' WHERE id=?", (thread_id,))
             _audit(conn, "system", "auto_reopen", thread_id=thread_id,
@@ -2466,7 +2530,8 @@ def heartbeat_and_recompute(conn: sqlite3.Connection, author: str) -> None:
     ).fetchall()
     for r in rows:
         # 创建者的帖也在列（dsh #516② 同根：out-of-quorum 创建者是本板常态
-        # (#51 形态)——门的出口"自愈=创建者下次轮询"要求创建者的轮询能够
+        # (#51 形态)——门的出口"自愈=创建者下次轮询"(v2.9.3 #55 起字面成立)
+        # 要求创建者的轮询能够
         # 触达自己创建的帖，否则该出口对 #51 形态根本不存在。
         if author in json.loads(r["quorum"]) or r["author"] == author:
             recompute_thread(conn, r["id"])
@@ -2595,19 +2660,29 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
             # over truncated timestamps; the old "no swallow race" note
             # assumed sub-second precision the format never had).
             # C1.1 shared heartbeat path (+ C' unfreeze recompute inside this
-            # txn), cursor advance last; the fetch above already fixed delivery.
-            # last_read keeps its legacy wall-clock semantics for old watcher
-            # kits — C3's single write point is unchanged (still only this
-            # call writes either column).
-            heartbeat_and_recompute(conn, author)
-            # v2.9.2 F6 (thread #48 P1): the ONE beat write point — only a real
-            # poll feeds the ring; probes/invites/writes never do.
-            _beat(conn, author)
+            # txn). last_read keeps its legacy wall-clock semantics for old
+            # watcher kits — C3's single write point is unchanged (still only
+            # this call writes either column).
+            #
+            # v2.9.3 (thread #55 ①, dsh #640: ordering defect) — CURSOR FIRST,
+            # RECOMPUTE SECOND. recompute_thread's future-tense delivery gate
+            # reads participants.last_delivered_id; with the old order (recompute
+            # first, cursor last) every catch-up poll evaluated the gate against
+            # the PREVIOUS cursor and therefore blocked itself
+            # (reason=creator_delivery_lag: delivered=old < max_id). Same txn,
+            # so the reorder is atomic; the fetch above already fixed delivery.
+            # _touch must stay in front: the UPDATE below is a no-op for a
+            # never-registered author (regression caught by test_v2_stage8/9).
+            _touch(conn, author)
             conn.execute(
                 "UPDATE participants SET last_read=?, last_delivered_id=?"
                 " WHERE author=?",
                 (snapshot, watermark, author),
             )
+            heartbeat_and_recompute(conn, author)
+            # v2.9.2 F6 (thread #48 P1): the ONE beat write point — only a real
+            # poll feeds the ring; probes/invites/writes never do.
+            _beat(conn, author)
     mentions = []
     if author:
         mentions = [
@@ -3351,7 +3426,7 @@ async def ping(request: Request):
     carries the search capability face (in-memory startup state only)."""
     return JSONResponse({
         "status": "ok",
-        "version": "2.9.2",
+        "version": PROTOCOL_VERSION,
         "search": {"enabled": SEARCH_STATE["enabled"],
                    "reason": SEARCH_STATE["reason"],
                    "sqlite": SEARCH_STATE["sqlite"]},
