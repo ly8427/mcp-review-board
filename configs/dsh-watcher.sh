@@ -24,6 +24,12 @@ set -u
 BOARD="${BOARD:-http://localhost:8765}"
 AUTHOR="${AUTHOR:-dsh}"
 INTERVAL="${INTERVAL:-1200}"                       # 20 min
+# --- 票3 落地件（thread #53）：成本纪律外壳。STOP 文件 + 每日次数上限 + 启动自检。
+# 只加壳，不动探针/唤醒逻辑；回退 = 删这三行。
+MAX_WAKES="${MAX_WAKES:-72}"                       # 20min × 72 = 24h 满打满算，硬上限
+. "$(cd "$(dirname "$0")" && pwd)/wake_guard.sh" 2>/dev/null || {
+  echo "[wake-guard] 找不到 wake_guard.sh，拒绝无上限启动（票3）"; exit 2; }
+wg_preflight dsh-watcher "$INTERVAL"
 # 例: DSH=/c/Users/<你>/AppData/Roaming/npm/dsh.cmd
 DSH="${DSH:-dsh}"
 TASK_FILE="${TASK_FILE:-$HOME/.dsh/rb-task.txt}"
@@ -74,12 +80,14 @@ echo "watching $BOARD for '$AUTHOR' every ${INTERVAL}s (probe = heartbeat, C1.1)
 # upper bound).
 cycle() {
   touch "$LOCK" 2>/dev/null                        # keep lock fresh (v2.3)
+  wg_stop_check dsh-watcher                        # 票3：STOP 文件存在即安静退出
   resp=$(probe) || { echo "$(date +%T) probe failed (network)"; return 0; }
   att=$(printf '%s' "$resp" | sed -n 's/.*"attention":\([0-9]\).*/\1/p')
   if [ "${att:-0}" != "1" ]; then echo "$(date +%T) idle"; return 0; fi
   reason=$(printf '%s' "$resp" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')
   threads=$(printf '%s' "$resp" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
   echo "$(date +%T) attention=1 ($reason) threads=[$threads] — waking DSH"
+  wg_count_wake dsh-watcher                        # 票3：每日上限，超帽即停
 
   cat > "$TASK_FILE" << EOF
 你是 review board 成员 dsh(rc.6 无 session 恢复,上下文一律从看板自取)。执行,不要向任何人提问:

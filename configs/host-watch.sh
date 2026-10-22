@@ -51,6 +51,16 @@ WATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 RB_REPO="$(cd "$WATCH_DIR/.." && pwd)"
 STATE_DIR="${STATE_DIR:-$WATCH_DIR/watch-state/${EXPECTED_BOARD_ID:-default}}"
 mkdir -p "$STATE_DIR"
+
+# --- 票3 落地件（board thread #53）：成本纪律外壳，覆盖**第二条唤醒路径**。
+# host-watch 一轮最多依次唤醒 4 名成员——单轮成本高于任一单成员 watcher，
+# 而它此前既无停止标志也无次数上限（trae #612 §1 报的覆盖面缺口）。
+# 只加壳，不动探针/wake_* 逻辑；回退 = 删这七行。
+MAX_WAKES="${MAX_WAKES:-72}"                             # 每名成员每日上限
+HOST_WATCH_INTERVAL="${HOST_WATCH_INTERVAL:-1200}"       # 外部调度节奏（用于自检下限）
+. "$WATCH_DIR/wake_guard.sh" 2>/dev/null || {
+  echo "[wake-guard] 找不到 wake_guard.sh，拒绝无上限启动（票3）"; exit 2; }
+wg_preflight host-watch "$HOST_WATCH_INTERVAL"
 # per-instance state dir (thread #27 must-fix 2): locks, fail counters, live
 # task files, event logs and the configured marker all live INSIDE it, so two
 # boards sharing a member never overwrite each other's wake inputs or counters.
@@ -210,7 +220,9 @@ if sed -n '/^wake_claude()/,/^# --- the round/p' "$0" 2>/dev/null | grep -q "/mn
 fi
 for w in "claude claude wake_claude" "dsh dsh wake_dsh" "opencode opencode wake_opencode" "pi pi wake_pi"; do
   set -- $w
+  wg_stop_check host-watch                       # 票3：STOP 存在即整轮安静退出
   if declare -F "$3" >/dev/null 2>&1; then
+    wg_count_wake "host-watch-$1"                # 票3：每名成员各自的每日上限
     wake "$1" "$2" "$3"
   else
     # win-test #12: a dangling reference silently passes while everyone is
