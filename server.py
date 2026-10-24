@@ -284,6 +284,38 @@ F6_BEATS_24H = 6            # 近 24h ≥6 次读交付轮询（或 ≥6 次探�
 F6_GAPS_MIN = 5             # 其中 ≥5 个相邻间隔…
 F6_GAP_S = 600              # …每个 ≥10 分钟
 F6_FRESH_S = 45 * 60        # 最新一条 ≤45 分钟（与 L2 打卡门同一数字）
+# v2.9.3 #64 (thread #64, pi #715 §4 self-reported hole + dsh #716/#718 复核):
+# the legacy `hb` fallback in `_read_ts` was an unbounded "migration amnesty" —
+# a member who never made a read-delivering poll kept feeding S2/S3 from `hb`
+# (appended on EVERY poll, idle included), so the G-2 idle-spin hole could be
+# deferred arbitrarily long and then cashed in on the first real read.
+# Fix = a deployment epoch: only hb entries OLDER than the epoch get amnesty.
+#   F6_READ_EPOCH_KEY   global deploy epoch (meta table, epoch seconds,
+#                       only-increase — same shape as floor_wm_epoch) AND a
+#                       per-member COPY inside participants.meta (never authored
+#                       by the member, never "whoever migrates writes now").
+#   HB_READ_MIGRATED_KEY  per-member marker: the one-time migration already ran.
+#                       Deliberately a marker, not the truthiness of hb_read:
+#                       after epoch truncation an empty hb_read is the NORMAL
+#                       state, so `if not meta.get("hb_read")` would re-run the
+#                       migration on every read poll and re-import post-epoch
+#                       idle beats (dsh #718 §3 / C').
+F6_READ_EPOCH_KEY = "f6_read_epoch"
+HB_READ_MIGRATED_KEY = "hb_read_migrated"
+F6_READ_EPOCH_CODE = 1_792_800_000   # = 2026-10-24T00:00:00Z，首次部署日（不写 0：0 等于
+                           # "没有下界"，日后误配置会静默失效）。生效值 = max(常量, 首启 now)，
+                           # 写入 meta 的是首启时刻本身，此后**冻结**（不随后续启动推进）。
+                           # 口径更正（pi #739 / 回 dsh #735 §3-②，我原注释写反了）：
+                           # 纪元是"恩赦上界"——只有 ts < 纪元 的 hb 条目算迁移恩赦，
+                           # 所以**抬高纪元 = 放宽恩赦**（把 (旧纪元, 新纪元) 之间那些
+                           # 未经验证的轮询重新算成 pre-epoch），最多放宽到 24h 环的容量。
+                           # ⇒ 不要用"抬高纪元"去作废恩赦窗：恩赦窗的唯一出口是部署后
+                           # 24h 自然过期（_ring_ts 只留 24h），本就不需要任何人工动作。
+                           # 常量只在首次部署时给下界；日后抬常量会把所有"从未真读过"
+                           # 的成员的恩赦窗重新打开（G-2 空转刷法复活）——测试
+                           # test_v292_gates ⑦ 把这条钉死（成员副本更旧 = 更严，不是洞）。
+                           # 只升不降保留：仅用于 meta 损坏时的下界（have < 常量 ⇒ 取常量），
+                           # 不能反向把上界降到比首次部署更早。
 
 
 def _ring_append(conn: sqlite3.Connection, author: str | None, key: str) -> bool:
@@ -317,6 +349,46 @@ def _ring_append(conn: sqlite3.Connection, author: str | None, key: str) -> bool
     return True
 
 
+def _ts_epoch(x: str) -> int | None:
+    """'%Y-%m-%d %H:%M:%S' (UTC) → epoch seconds; None if malformed."""
+    try:
+        return int(datetime.strptime(x, "%Y-%m-%d %H:%M:%S")
+                   .replace(tzinfo=timezone.utc).timestamp())
+    except (ValueError, TypeError):
+        return None
+
+
+def _read_epoch(conn: sqlite3.Connection) -> int:
+    """Global F6 read-epoch, only-increase (mirrors `_floor_wm_epoch`).
+
+    First start after deploy writes NOW (never 0 / never a member's migration
+    moment) — otherwise "the later you migrate, the longer your amnesty" and
+    the hole scales with each member's laziness (dsh #716 ①).
+    """
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (F6_READ_EPOCH_KEY,)).fetchone()
+    now_s = int(time.time())
+    if row is None:
+        eff = max(F6_READ_EPOCH_CODE, now_s)
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)",
+                     (F6_READ_EPOCH_KEY, str(eff)))
+        # NOTE: the note deliberately carries NO wall-clock/ephemeral numbers
+        # (stage6 part B requires byte-identical audit rows across runs); the
+        # effective value lives in meta.f6_read_epoch, the timing in created_at.
+        _audit(conn, "system", "f6_read_epoch_init",
+               note=f"code={F6_READ_EPOCH_CODE} effective_from=meta")
+        return eff
+    try:
+        have = int(row[0])
+    except (TypeError, ValueError):
+        have = 0
+    eff = max(have, F6_READ_EPOCH_CODE)
+    if eff != have:
+        conn.execute("UPDATE meta SET value=? WHERE key=?", (str(eff), F6_READ_EPOCH_KEY))
+        print(f"[f6_read_epoch] meta={have} < code={F6_READ_EPOCH_CODE}; "
+              f"raised to {eff} (only-increase)", flush=True)
+    return eff
+
+
 def _beat(conn: sqlite3.Connection, author: str | None, delivered: int = 0) -> None:
     """One poll by the author.
 
@@ -324,23 +396,62 @@ def _beat(conn: sqlite3.Connection, author: str | None, delivered: int = 0) -> N
     `hb_read` = S2/S3 only: appended when this poll actually delivered unread
     content from OTHER authors. Probes/invites/writes never call this.
 
-    Upgrade path (票3, one-time): the first read-delivering poll after deploy
-    seeds hb_read from the legacy hb ring, so the old rhythm is not
-    retroactively punished (old code recorded all polls). Afterwards only real
-    read deliveries feed hb_read — the G-2 idle-spin hole stays closed.
+    Upgrade path (票3 + v2.9.3 #64 epoch): the first read-delivering poll after
+    deploy seeds hb_read from the legacy hb ring — but ONLY the part older than
+    the deployment epoch, so old rhythm is not retroactively punished while
+    post-epoch idle beats never enter hb_read. The current poll's own timestamp
+    is appended explicitly: it is >= epoch by construction, so truncation would
+    otherwise drop it (dsh #718 §0-3: that append is a NECESSARY part of the
+    truncation, not a fix for a bug the old code had). The migration is marked
+    (`hb_read_migrated`) so it runs exactly once even when the kept set is empty.
     """
     if not author:
         return
+    epoch = _read_epoch(conn)
+    row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
+    meta = json.loads(row["meta"]) if row and row["meta"] else {}
+    if meta.get(F6_READ_EPOCH_KEY) is None and row:
+        # member-side COPY only, written ONCE and then frozen. Deliberate: the
+        # epoch is an amnesty UPPER bound (only ts < epoch is grandfathered), so
+        # a member copy that is older than a later global value is STRICTER, not
+        # a hole. dsh #735 §3-② proposed `max(copy, global)` here; rejected in
+        # pi #739 — with the bound raised to the new global, an un-migrated
+        # member's whole 24h idle `hb` ring becomes "pre-epoch" again and 6 idle
+        # polls would pass S2/S3 the moment the constant is bumped at a later
+        # deploy (test_v292_gates ⑦ pins the strict behaviour).
+        meta[F6_READ_EPOCH_KEY] = epoch
+        conn.execute("UPDATE participants SET meta=? WHERE author=?",
+                     (json.dumps(meta, ensure_ascii=False), author))
     _ring_append(conn, author, "hb")
     if not delivered:
         return
     row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
     meta = json.loads(row["meta"]) if row and row["meta"] else {}
-    if not meta.get(BEAT_READ_KEY):
+    if not meta.get(HB_READ_MIGRATED_KEY):
+        try:
+            epoch = int(meta.get(F6_READ_EPOCH_KEY) or epoch)
+        except (TypeError, ValueError):
+            pass
         legacy = [x for x in (meta.get("hb") or []) if x]
-        meta[BEAT_READ_KEY] = legacy[-BEAT_RING_MAX:]
+        # `is not None` (dsh #735 §3-③, accepted): a malformed timestamp is not
+        # "ancient" — `(_ts_epoch(x) or 0)` mapped it to 0 and kept it, so junk
+        # strings entered hb_read (invisible to _ring_ts, but they pushed real
+        # beats out of BEAT_RING_MAX). Dropped here instead.
+        kept = [x for x in legacy
+                if _ts_epoch(x) is not None and _ts_epoch(x) < epoch]
+        now_iso = _now_iso()
+        kept.append(now_iso)
+        meta[BEAT_READ_KEY] = kept[-BEAT_RING_MAX:]
+        meta[HB_READ_MIGRATED_KEY] = True
+        meta[F6_READ_EPOCH_KEY] = epoch
         conn.execute("UPDATE participants SET meta=? WHERE author=?",
                      (json.dumps(meta, ensure_ascii=False), author))
+        # Same constraint: no timestamps / epoch value in the note (deterministic
+        # across runs ⇒ stage6 part B invariance holds). 何时 = event created_at.
+        _audit(conn, author, "hb_read_migrate",
+               note=(f"kept_pre_epoch={len(kept) - 1} "
+                     f"dropped_post_epoch={len(legacy) - (len(kept) - 1)} "
+                     f"ring={len(meta[BEAT_READ_KEY])}"))
         return
     _ring_append(conn, author, BEAT_READ_KEY)
 
@@ -373,11 +484,27 @@ def _presence_ts(meta: dict | None, now: datetime) -> list[datetime]:
 
 
 def _read_ts(meta: dict | None, now: datetime) -> list[datetime]:
-    """S2/S3 face. Legacy fallback: pre-v2.9.3 rings only have `hb` (all polls),
-    kept until the first read-delivering poll seeds `hb_read`."""
-    if (meta or {}).get(BEAT_READ_KEY):
+    """S2/S3 face.
+
+    Switched by the migration MARKER (and by the mere presence of the `hb_read`
+    key, so hand-written/legacy metas keep working) — not by its truthiness:
+    post-epoch an empty hb_read is normal and must NOT fall back to `hb`.
+    Un-migrated member = legacy `hb` fallback, **bounded by the deployment
+    epoch**: only hb entries strictly older than the epoch count, so the amnesty
+    expires with the 24h window instead of lasting "until the first real read".
+    """
+    meta = meta or {}
+    if meta.get(HB_READ_MIGRATED_KEY) or BEAT_READ_KEY in meta:
         return _ring_ts(meta, BEAT_READ_KEY, now)
-    return _ring_ts(meta, "hb", now)
+    hb = _ring_ts(meta, "hb", now)
+    epoch = meta.get(F6_READ_EPOCH_KEY)
+    if epoch is None:
+        return hb                       # pre-v2.9.3 #64 metas (tests/legacy rows)
+    try:
+        e = int(epoch)
+    except (TypeError, ValueError):
+        return hb
+    return [t for t in hb if int(t.timestamp()) < e]
 
 
 def _beat_ok(meta: dict | None, now: datetime | None = None) -> tuple[bool, str]:

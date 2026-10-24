@@ -293,6 +293,122 @@ def main():
     check("票3 冷启动: thread face carries f6_coldstart annotation",
           "f6_coldstart" in (cctx or ""))
 
+    # ---------- 5c. v2.9.3 #64 迁移恩赦的部署纪元（pi #715 §4 / dsh #716-#718）----------
+    # 缺口: `_read_ts` 的 legacy 回落没有时间上限 —— 只在"无人发帖时轮询"的成员
+    # 可让 G-2 空转刷法复活，窗口长度不是 24h，而是"直到第一次真读"。
+    # 修法: 全局部署纪元 + 成员只复制 + 成员迁移标记(`hb_read_migrated`)。
+    import time as _time
+    ep = int(_time.time())
+    with_rw(db, lambda c: c.execute(
+        "INSERT OR REPLACE INTO meta(key,value) VALUES('f6_read_epoch',?)", (str(ep),)))
+
+    def _now():
+        return datetime.now(timezone.utc)
+
+    RING_KEYS = ("hb", "hb_read", "probe")
+
+    def _shift_ring(author, minutes):
+        """Time travel for one member: push every ring ts back N minutes
+        (real polls are ≥10min apart; the 120s write-dedup would swallow
+        back-to-back polls in a test that runs in one second)."""
+        def fn(c):
+            m = json.loads((c.execute("SELECT meta FROM participants WHERE author=?",
+                                      (author,)).fetchone()[0]) or "{}")
+            for k in RING_KEYS:
+                if isinstance(m.get(k), list):
+                    m[k] = [(datetime.strptime(x, fx.FMT) - timedelta(minutes=minutes))
+                            .strftime(fx.FMT) for x in m[k] if x]
+            srv._set_meta(c, author, m)
+        with_rw(db, fn)
+
+    pre_epoch = [(_now() - timedelta(minutes=m)).strftime(fx.FMT) for m in (400, 380)]
+    with srv.db() as conn:
+        srv._begin_write(conn)
+        srv._touch(conn, "grace")
+        conn.commit()
+    # 老成员: 纪元前的 2 条 hb（真实节奏不足），成员侧纪元 = 全局纪元
+    with_rw(db, lambda c: srv._set_meta(
+        c, "grace", {"hb": pre_epoch, "f6_read_epoch": ep}))
+    for _ in range(6):
+        with_rw(db, lambda c: srv._beat(c, "grace", 0))          # 纪元后 6 次空转
+    n1 = len(srv._read_ts(meta_of(db, "grace"), _now()))
+    ok, why = srv._beat_ok(meta_of(db, "grace"))
+    check("v2.9.3 #64 ①: post-epoch idle polls never count (amnesty bounded by epoch)",
+          n1 == 2, f"n={n1} meta={meta_of(db, 'grace').get('hb_read')}")
+    check("v2.9.3 #64 ①b: gate still says 2/6, not 6/6",
+          (not ok) and "2/6" in why, why)
+
+    # ②③: 首次真读 = 迁移当次；pre-epoch 整环保留 + 本次 1 条不丢
+    with_rw(db, lambda c: srv._beat(c, "grace", 1))
+    m = meta_of(db, "grace")
+    check("v2.9.3 #64 ③: migration keeps pre-epoch ring AND this poll (no lost vote)",
+          len(m.get("hb_read") or []) == 3, f"hb_read={m.get('hb_read')}")
+    check("v2.9.3 #64 ②: first real read cuts the fallback immediately",
+          m.get("hb_read_migrated") is True
+          and len(srv._read_ts(m, _now())) == 3
+          and set(pre_epoch) <= set(m.get("hb_read") or []),
+          f"meta={m}")
+
+    # ④: 纪元后才注册（无 pre-epoch 环）⇒ 不得回落进纪元后的空转 hb
+    with srv.db() as conn:
+        srv._begin_write(conn)
+        srv._touch(conn, "newbie")
+        conn.commit()
+    for _ in range(3):
+        with_rw(db, lambda c: srv._beat(c, "newbie", 0))
+    m2 = meta_of(db, "newbie")
+    check("v2.9.3 #64 ④: empty pre-epoch ring ⇒ _read_ts()==[] (no post-epoch fallback)",
+          m2.get("f6_read_epoch") == ep and srv._read_ts(m2, _now()) == [], f"meta={m2}")
+
+    # ⑤⑥: 迁移只跑一次；空转永不二次导入；C'(标记位)为红-绿点
+    with_rw(db, lambda c: srv._beat(c, "newbie", 1))
+    n3 = len(srv._read_ts(meta_of(db, "newbie"), _now()))
+    for _ in range(6):
+        with_rw(db, lambda c: srv._beat(c, "newbie", 0))
+    n4 = len(srv._read_ts(meta_of(db, "newbie"), _now()))
+    _shift_ring("newbie", 11)
+    with_rw(db, lambda c: srv._beat(c, "newbie", 1))
+    n5 = len(srv._read_ts(meta_of(db, "newbie"), _now()))
+    with _RO(db) as conn:
+        mig = conn.execute(
+            "SELECT COUNT(*) FROM verdict_events WHERE author='newbie'"
+            " AND action='hb_read_migrate'").fetchone()[0]
+    check("v2.9.3 #64 ⑤: one migration, idle re-import impossible (1 → 1 → 2)",
+          (n3, n4, n5) == (1, 1, 2), f"{n3}/{n4}/{n5}")
+    check("v2.9.3 #64 ⑥: migration audited exactly once (hb_read_migrate)",
+          mig == 1, f"rows={mig}")
+
+    # ⑦ (pi #739 / 回 dsh #735 §3-②③): 成员副本的纪元比全局更旧时必须保持**更严**。
+    # 场景 = "日后抬高了常量/全局纪元，而这个成员早已冻结了一份更旧的副本"。
+    # 被否掉的做法: 每次 `_beat` 把副本抬到 max(副本, 全局)。那样迁移上界变成新的
+    # 全局纪元，该成员 24h 内的**空转** hb 全部重新变成 pre-epoch ⇒ 6 次空转即可过
+    # S2/S3（G-2 空转刷法随每次部署复活）。正确行为: 副本一次性冻结，上界取更旧值。
+    frozen_ep = ep - 3600
+    gap_hb = [datetime.fromtimestamp(ep - 1800, timezone.utc).strftime(fx.FMT),
+              datetime.fromtimestamp(ep - 900, timezone.utc).strftime(fx.FMT),
+              "not-a-timestamp"]          # ③ 畸形条目: 必须被丢弃, 不得当 pre-epoch
+    with srv.db() as conn:
+        srv._begin_write(conn)
+        srv._touch(conn, "frozen")
+        conn.commit()
+    with_rw(db, lambda c: srv._set_meta(
+        c, "frozen", {"hb": gap_hb, "f6_read_epoch": frozen_ep}))
+    with_rw(db, lambda c: srv._beat(c, "frozen", 0))       # 空转: 不得抬高副本
+    m3 = meta_of(db, "frozen")
+    check("v2.9.3 #64 ⑦a: older member epoch copy stays frozen (no max() uplift)",
+          m3.get("f6_read_epoch") == frozen_ep, f"epoch={m3.get('f6_read_epoch')}")
+    check("v2.9.3 #64 ⑦b: frozen copy ⇒ post-copy idle beats still don't count",
+          srv._read_ts(m3, _now()) == [], f"read_ts={srv._read_ts(m3, _now())}")
+    with_rw(db, lambda c: srv._beat(c, "frozen", 1))       # 首次真读 ⇒ 迁移
+    m4 = meta_of(db, "frozen")
+    check("v2.9.3 #64 ⑦c: migration bound = the OLDER copy; gap-era hb not imported",
+          len(m4.get("hb_read") or []) == 1
+          and not (set(gap_hb[:2]) & set(m4.get("hb_read") or [])),
+          f"hb_read={m4.get('hb_read')}")
+    check("v2.9.3 #64 ⑦d: malformed hb entry dropped by migration (not kept as pre-epoch)",
+          "not-a-timestamp" not in (m4.get("hb_read") or []),
+          f"hb_read={m4.get('hb_read')}")
+
     # ---------- 8. nonce 流 ----------
     tid3 = mk_thread(srv, "anna", ["anna", "brin"], ctx, tok)
     out = srv.request_form_b(thread_id=tid3, author="anna", names=["trae"], token=tok["anna"])
