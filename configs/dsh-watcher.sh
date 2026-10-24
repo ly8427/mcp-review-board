@@ -67,7 +67,11 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 # (GPT round-2 P1 on 7f06517)。
 echo 0 > "$FAILS" 2>/dev/null || true
 
-probe() { curl -sf "$BOARD/attention?author=$AUTHOR"; }
+# dsh #739/#742 §3（pi #741/#743 同意并入同批部署）：探针必须有出口与 IPv4 定点。
+# 无 --max-time 时若服务端接受连接却不响应，本进程会永久挂在该 curl 上（单飞锁随之僵住，
+# 心跳停摆而日志无一行）⇒ 加 --max-time 10；-4 直连 127.0.0.1，绕开本机 localhost→::1
+# 先解析带来的 ~21s 回落（curl Happy Eyeballs 下只是变慢，不致命，但没必要付）。
+probe() { curl -sf -4 --max-time 10 "$BOARD/attention?author=$AUTHOR"; }
 
 echo "watching $BOARD for '$AUTHOR' every ${INTERVAL}s (probe = heartbeat, C1.1)..."
 # thread #15 rev3 (R6): probe FIRST at startup — no blind 20-min window
