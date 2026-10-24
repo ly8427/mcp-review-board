@@ -2337,20 +2337,13 @@ def set_verdict(
         # the creator while any ACTIVE co-member hasn't voted. Waiting set =
         # ACTIVE members only (claude #477 unified principle: C1-suspended
         # members never permanently block any gate; exits = 留痕放行/C1/human_override).
-        if t["author"] == author and len(quorum) >= 2:
-            voted = {
-                r["author"]
-                for r in conn.execute(
-                    "SELECT author FROM verdicts WHERE thread_id=?", (thread_id,)
-                ).fetchall()
-            }
-            waiting = [n for n in _active_quorum(conn, quorum) if n != author and n not in voted]
-            if waiting:
-                return (
-                    f"ERROR: [L1.5 创建者最后投票] 还有活跃 quorum 成员未投票: {waiting}。"
-                    "先触发他们的 watcher / 等其投票(暂缓成员按 C1 不计等待)。"
-                    "(v2.9, thread #45 rev2 — 禁止创建者抢先定调)"
-                )
+        waiting = _l15_waiting(conn, thread_id, t["author"], quorum, author)
+        if waiting:
+            return (
+                f"ERROR: [L1.5 创建者最后投票] 还有活跃 quorum 成员未投票: {waiting}。"
+                "先触发他们的 watcher / 等其投票(暂缓成员按 C1 不计等待)。"
+                "(v2.9, thread #45 rev2 — 禁止创建者抢先定调)"
+            )
         cur_row = conn.execute(
             "SELECT verdict FROM verdicts WHERE thread_id=? AND author=?",
             (thread_id, author),
@@ -2679,6 +2672,72 @@ def _active_quorum(conn: sqlite3.Connection, names: list[str]) -> list[str]:
     return active
 
 
+def _l15_waiting(conn: sqlite3.Connection, thread_id: int, creator: str,
+                 quorum: list[str], author: str) -> list[str]:
+    """L1.5 「创建者最后投票」的等待集 —— **唯一实现**（v2.9.4）。
+
+    以前这份算术存在两份：`set_verdict` 的门里一份、`awaiting` 的读面里一份。
+    两份逐字相同但没有机制绑定 ⇒ 日后改一处、另一处就漂移，事故形态
+    （读面说"你欠票"、门说"你不能投"）原地复活（zcode #768 §0-3 的"第二真源"）。
+    现在门与读面都调这一个函数：blocked ⟺ set_verdict 会拒。
+
+    返回 = 必须先投的**活跃**成员（暂缓者不计，C1 统一原则；不除创建者自己
+    ——调用方已保证 author 是 quorum 成员，创建者投过票时等待集自然为空）。
+    非创建者 / 单人名册 ⇒ 空列表（不受 L1.5 约束）。
+    """
+    if creator != author or len(quorum) < 2:
+        return []
+    voted = {
+        r["author"]
+        for r in conn.execute(
+            "SELECT author FROM verdicts WHERE thread_id=?", (thread_id,)
+        ).fetchall()
+    }
+    return [n for n in _active_quorum(conn, quorum) if n != author and n not in voted]
+
+
+def _awaiting_split(conn: sqlite3.Connection, author: str) -> tuple[list[int], list[dict]]:
+    """把"我欠的票"拆成两族（v2.9.4 结构性修复，2026-10-24 事故立案）。
+
+    - **actionable（可动作）**：我现在就能投的帖子。
+    - **blocked（被阻塞）**：我欠票，但作为创建者被 L1.5「创建者最后投票」挡住，
+      必须等 `waiting_on` 里的活跃成员先投。
+
+    为什么必须拆：旧实现把两族混成一个 `awaiting` 列表，于是"创建者被门挡住"
+    被当成"待办"——watcher 每 20 分钟唤醒成员去做一件服务器**必然拒绝**的事；
+    三次空唤后 C1.2 判定闹钟失败并自锁，**成员从板上消失，而原因与成员无关**。
+
+    实证（2026-10-24 20:10 / 20:34 / 20:58 三次）：dsh 一次开六张 quorum 帖，
+    唤醒会话的 `set_verdict` 返回 `ERROR: [L1.5 创建者最后投票] ... ['zcode']`，
+    而同一响应里 `awaiting_my_verdict` 恰恰列着那六张票；21:00:39 C1.2 自锁。
+
+    要记住的结构性教训：**信号面自相矛盾时，失败会被记在成员账上。**
+    拆开后：被阻塞 ⇒ 不触发唤醒（不烧钱、不自锁）；阻塞解除（对方投票）后
+    `awaiting` 重新非空 ⇒ 正常唤醒。成员不必绕过去，系统也不必放宽门。
+
+    等待集的算术不在这里重写：与 `set_verdict` 的 L1.5 门共用 `_l15_waiting`
+    （v2.9.4 单源化，zcode #768 §0-3 / dsh #769 §4）。
+    """
+    actionable: list[int] = []
+    blocked: list[dict] = []
+    for r in conn.execute(
+        "SELECT id, quorum, author FROM threads WHERE status='open' AND quorum IS NOT NULL"
+    ).fetchall():
+        quorum = json.loads(r["quorum"])
+        if author not in quorum:
+            continue
+        if conn.execute(
+            "SELECT 1 FROM verdicts WHERE thread_id=? AND author=? LIMIT 1", (r["id"], author)
+        ).fetchone() is not None:
+            continue
+        waiting = _l15_waiting(conn, r["id"], r["author"], quorum, author)
+        if waiting:
+            blocked.append({"thread_id": r["id"], "waiting_on": waiting})
+        else:
+            actionable.append(r["id"])
+    return actionable, blocked
+
+
 def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
     """The one invariant enforcer. Called at the end of every author-carrying
     write transaction (claude #48-3 universal mechanism) and from the
@@ -2992,26 +3051,21 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
             "SELECT COUNT(*) FROM threads WHERE status='open'"
         ).fetchone()[0]
         if author:
-            # D2: open ∧ 非 wontfix ∧ quorum ∧ no verdict on current revision ∧
-            # active. The caller just heartbeated above (order condition,
-            # claude #52-3) so is_active(author) holds by construction here.
-            awaiting = [
-                r["id"]
-                for r in conn.execute(
-                    "SELECT id, quorum FROM threads WHERE status='open' AND quorum IS NOT NULL"
-                ).fetchall()
-                if author in json.loads(r["quorum"])
-                and conn.execute(
-                    "SELECT 1 FROM verdicts WHERE thread_id=? AND author=? LIMIT 1",
-                    (r["id"], author),
-                ).fetchone() is None
-            ]
+            # D2: open ∧ 非 wontfix ∧ quorum ∧ no verdict on current revision ∧ active.
+            # v2.9.4 结构性修复：拆成 可动作 / 被 L1.5 阻塞 两族（见 _awaiting_split）。
+            # 旧实现在这里把"创建者被门挡住"也列进待办，导致 watcher 反复唤醒却
+            # 只能拿到拒绝，三次后 C1.2 自锁（2026-10-24 实证）。
+            awaiting, blocked_verdict = _awaiting_split(conn, author)
         else:
             awaiting = "not_implemented"
+            blocked_verdict = []
     needs = {
         "new_comments": len(rows),
         "mentions_me": mentions,
         "awaiting_my_verdict": awaiting,
+        # 我欠但投不了的票：列出我在等谁。**不触发唤醒**（避免空唤烧钱+自锁），
+        # 但让成员知道该去催谁（协议 §W peer 唤起）。
+        "blocked_my_verdict": blocked_verdict,
         "open_threads": open_threads,
     }
     header = "needs_attention: " + json.dumps(needs, ensure_ascii=False)
@@ -3834,13 +3888,9 @@ async def attention_probe(request: Request):
                 ).fetchall()
                 if author in json.loads(r["quorum"])
             ]
-            awaiting = [
-                tid for tid in open_quorum
-                if conn.execute(
-                    "SELECT 1 FROM verdicts WHERE thread_id=? AND author=? LIMIT 1",
-                    (tid, author),
-                ).fetchone() is None
-            ]
+            # v2.9.4 结构性修复：可动作 / 被 L1.5 阻塞 两族分开（见 _awaiting_split）。
+            # **attention 只由可动作项触发**——否则创建者会被"自己投不了的票"反复唤醒。
+            awaiting, blocked_verdict = _awaiting_split(conn, author)
             # v2.5 (thread #33): the holder's OWN continued posting over a standing
             # object wakes them to reconsider — priority BELOW awaiting_verdict
             # (an uncast vote outranks a stale one), ABOVE mentions/new_comments.
@@ -3897,6 +3947,9 @@ async def attention_probe(request: Request):
             "open_threads": open_quorum,
             "budget": budget_face,
             "my_verdicts": my_state,
+            # v2.9.4：我欠票但被 L1.5 挡住的那些帖，附"在等谁"。**不参与 attention 判定**
+            # （不触发唤醒、不烧钱），只作为可见事实供成员去催票（协议 §W peer 唤起）。
+            "blocked_my_verdict": blocked_verdict,
             # thread #31 batch A: effective cutoff (NULL→epoch sentinel, the same
             # value the probe itself uses above) for the watcher delivery judgment
             # (delivered = fingerprint moved OR last_read advanced). Advanced ONLY

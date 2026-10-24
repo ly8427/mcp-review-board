@@ -433,6 +433,69 @@ def main():
           and f"effective={srv.F6_READ_EPOCH_CODE}" in (raise_note or ""),
           f"eff={eff1}/{eff2} stored={stored} rows={raise_rows} note={raise_note!r}")
 
+    # ---------- 10. v2.9.4 欠票拆两族（_awaiting_split）----------
+    # dsh #769 §4: 拆后两族须**互斥**、并集 = 旧 awaiting 集、attention 仅由可动作
+    # 那族触发；zcode #768 §0-3: 拆分用的等待集必须与 set_verdict 的 L1.5 门**同一实现**
+    # （blocked ⟺ set_verdict 会拒）。否则第二真源漂移，事故形态（读面说欠票、
+    # 门说不能投 ⇒ 空唤三次 ⇒ C1.2 自锁）原地复活。
+    tid4 = mk_thread(srv, "anna", ["anna", "brin", "cyr"], ctx, tok)
+    out = srv.set_verdict(thread_id=tid4, verdict="pass", author="brin", token=tok["brin"])
+    check("v2.9.4 ⑧a: non-creator votes freely (L1.5 is creator-only)",
+          out.startswith("Verdict recorded"), out)
+    with _RO(db) as conn:
+        act_a, blk_a = srv._awaiting_split(conn, "anna")
+        act_b, blk_b = srv._awaiting_split(conn, "cyr")
+        old_awaiting = {
+            r["id"] for r in conn.execute(
+                "SELECT id, quorum FROM threads WHERE status='open'"
+                " AND quorum IS NOT NULL").fetchall()
+            if "anna" in json.loads(r["quorum"])
+            and conn.execute("SELECT 1 FROM verdicts WHERE thread_id=? AND author=?",
+                             (r["id"], "anna")).fetchone() is None
+        }
+    blk_ids = {b["thread_id"] for b in blk_a}
+    check("v2.9.4 ⑧b: creator blocked by L1.5 ⇒ blocked (with waiting_on), NOT actionable",
+          tid4 in blk_ids and tid4 not in act_a
+          and [b for b in blk_a if b["thread_id"] == tid4][0]["waiting_on"] == ["cyr"],
+          f"act={act_a} blk={blk_a}")
+    check("v2.9.4 ⑧c: the two families are disjoint & their union == the old awaiting set",
+          not (set(act_a) & blk_ids) and (set(act_a) | blk_ids) == old_awaiting,
+          f"act={act_a} blk={blk_ids} old={old_awaiting}")
+    check("v2.9.4 ⑧d: non-creator with no verdict is actionable (never blocked)",
+          tid4 in act_b and tid4 not in {b["thread_id"] for b in blk_b},
+          f"act={act_b} blk={blk_b}")
+    out = srv.set_verdict(thread_id=tid4, verdict="pass", author="anna", token=tok["anna"])
+    check("v2.9.4 ⑧e: blocked ⟺ set_verdict rejects (same waiting set, single source)",
+          out.startswith("ERROR") and "[L1.5" in out and "'cyr'" in out, out)
+
+    import asyncio
+
+    class _ProbeReq:
+        def __init__(self, who):
+            self.query_params = {"author": who}
+
+    body = asyncio.run(srv.attention_probe(_ProbeReq("anna"))).args[0]
+    check("v2.9.4 ⑧f: /attention never wakes on a blocked vote (tid absent from threads)",
+          tid4 not in body.get("threads", [])
+          and any(b["thread_id"] == tid4 for b in body.get("blocked_my_verdict", [])),
+          f"reason={body.get('reason')} threads={body.get('threads')} "
+          f"blocked={body.get('blocked_my_verdict')}")
+    out = srv.set_verdict(thread_id=tid4, verdict="pass", author="cyr", token=tok["cyr"])
+    check("v2.9.4 ⑧g: blocking cleared by the waited-on member's vote",
+          out.startswith("Verdict recorded"), out)
+    with _RO(db) as conn:
+        act_a2, blk_a2 = srv._awaiting_split(conn, "anna")
+    check("v2.9.4 ⑧h: creator becomes actionable once the waiting set empties",
+          tid4 in act_a2 and tid4 not in {b["thread_id"] for b in blk_a2},
+          f"act={act_a2} blk={blk_a2}")
+    body = asyncio.run(srv.attention_probe(_ProbeReq("anna"))).args[0]
+    check("v2.9.4 ⑧i: /attention wakes the creator on the then-actionable vote",
+          body.get("reason") == "awaiting_verdict" and tid4 in body.get("threads", []),
+          f"reason={body.get('reason')} threads={body.get('threads')}")
+    out = srv.set_verdict(thread_id=tid4, verdict="pass", author="anna", token=tok["anna"])
+    check("v2.9.4 ⑧j: creator's last vote passes the gate after the split",
+          out.startswith("Verdict recorded"), out)
+
     # ---------- 8. nonce 流 ----------
     tid3 = mk_thread(srv, "anna", ["anna", "brin"], ctx, tok)
     out = srv.request_form_b(thread_id=tid3, author="anna", names=["trae"], token=tok["anna"])
