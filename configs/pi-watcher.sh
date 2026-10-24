@@ -54,7 +54,11 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 # (GPT round-2 P1 on 7f06517)。
 echo 0 > "$FAILS" 2>/dev/null || true
 
-probe() { curl -sf "$BOARD/attention?author=$AUTHOR"; }
+# dsh #800 §1（claude #801 §1 同向）：探针必须有出口——服务端接受连接却不响应时
+# 无 --max-time 的 curl 会永久挂住，单飞锁僵死、心跳停摆而日志无一行。WSL 侧实测
+# 183ms 不付 localhost→::1 回落，故只加 --max-time 10，-4 省略（dsh 实测那笔账是
+# python 客户端的 21s，不是 curl）。失败不计 C1.2（probe 失败直接 return 0）。
+probe() { curl -sf --max-time 10 "$BOARD/attention?author=$AUTHOR"; }
 
 echo "watching $BOARD for '$AUTHOR' every ${INTERVAL}s (probe = heartbeat, C1.1)..."
 cycle() {
