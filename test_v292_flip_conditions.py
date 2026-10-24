@@ -64,10 +64,16 @@ def audits(db, action, tid=None):
 
 
 def aged_ring(hours):
-    """整环拨旧（ever_beats=True 但全部过期 → _beat_ok 的 S1 fresh 必拒）"""
+    """整环拨旧（全部过期；v2.9.3 #53 起 → 近24h无心跳 = 可恢复冷启动豁免）"""
     now = datetime.now(timezone.utc) - timedelta(hours=hours)
     return [(now - timedelta(minutes=11 * (6 - i))).strftime("%Y-%m-%d %H:%M:%S")
             for i in range(6)]
+
+
+def insufficient_ring():
+    """新鲜但节奏不足（6 次×1 分钟）——旧三判据与新 S1/S2/S3 都必拒，
+    用于验证门仍在（而不是被冷启动豁免放行）。"""
+    return fx.make_ring(n=6, gap_minutes=1)
 
 
 def set_ring(db, author, ring):
@@ -158,14 +164,14 @@ def main():
             srv._touch(conn, n)
         conn.commit()
     fx.prime_beats(db, ["v1", "v2", "fresh"])
-    set_ring(db, "stale", aged_ring(72))   # ever_beats=True，全部过期
+    set_ring(db, "stale", insufficient_ring())   # 新鲜但节奏不足（非冷启动）
     tok_fresh, tok_stale, tok_cold = token("fresh"), token("stale"), token("cold")
 
-    # 2a. 陈旧 ring 创建者经 set_quorum 造 quorum 帖 → 拒（原缺陷场景）
+    # 2a. 节奏不足的创建者经 set_quorum 造 quorum 帖 → 拒（原缺陷场景）
     t_stale = mk_free(db, srv, "stale")
     out = srv.set_quorum(thread_id=t_stale, author="stale", token=tok_stale,
                          add=["v1", "v2"], wake_infra=fx.wi("stale", "v1", "v2"))
-    check("2a: stale-ring creator blocked on free→quorum transition",
+    check("2a: insufficient-rhythm creator blocked on free→quorum transition",
           out.startswith("ERROR") and "F6" in out, out[:120])
     with _RO(db) as conn:
         q = conn.execute("SELECT quorum FROM threads WHERE id=?", (t_stale,)).fetchone()[0]
@@ -189,12 +195,24 @@ def main():
     check("2c: cold-start exemption audited",
           len(cold_audits) >= 1, f"audits={len(cold_audits)}")
 
-    # 2d. 既有门保持：直接 create_thread 带 quorum 的陈旧 ring 仍拒
-    set_ring(db, "stale", aged_ring(72))
+    # 2d. 既有门保持：直接 create_thread 带 quorum 的节奏不足 ring 仍拒
+    set_ring(db, "stale", insufficient_ring())
     out = srv.create_thread(title="direct quorum", author="stale",
                             quorum=["v1", "v2"], context=fx.wi("stale", "v1", "v2"))
     check("2d: direct create_thread quorum still F6-gated",
           out.startswith("ERROR") and "F6" in out, out[:120])
+
+    # 2e. v2.9.3 #53: 有历史 beat 但近 24h 无心跳 → 可恢复冷启动豁免（旧 2a 场景）
+    set_ring(db, "stale", aged_ring(72))
+    out = srv.create_thread(title="recovered cold start", author="stale",
+                            quorum=["v1", "v2"], context=fx.wi("stale", "v1", "v2"))
+    check("2e: >24h-silent creator passes via recoverable cold-start (#53)",
+          out.startswith("Created thread #"), out[:120])
+    with _RO(db) as conn:
+        r = conn.execute("SELECT context FROM threads WHERE author='stale'"
+                         " ORDER BY id DESC LIMIT 1").fetchone()
+    check("2e: cold-start exemption annotated on thread face",
+          "f6_coldstart" in ((r[0] if r else "") or ""))
 
     print("=" * 60)
     print(f"flip-condition fixes: {len(PASS)} passed, {len(FAIL)} failed")

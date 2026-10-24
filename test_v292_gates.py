@@ -13,6 +13,7 @@ pi #499 pattern). Covers, with CONSTRUCTED timestamps and ids:
   4.  #49 (4)/(6): EPOCH 后缺 floor_wm= 的事件硬挡(floor_wm_missing)；
       EPOCH 首启取 max(常量, 本库 MAX)，meta 只升不降。
   5.  #48 F6: _beat_ok 三条件（次数/间隔/新鲜）；探针与邀请不喂 ring
+      + v2.9.3 票3 (#53): S1 探针、S2/S3 只认交付轮询、通道二、可恢复冷启动。
       （P1 结构：/attention 路径不动 meta.hb）。
   6.  #48 §3/P2: 投递门——创建者欠收他人评论时拒关(reason=creator_delivery_lag)，
       本人评论不计欠账，轮询后自愈。
@@ -218,6 +219,80 @@ def main():
     with_rw(db, lambda c: srv.heartbeat_and_recompute(c, "cyr"))
     check("probe path does NOT feed the ring (P1)", ring_of(db, "cyr") == before)
 
+    # ---------- 5b. 票3 (#53): 判据拆开 + 通道二 + 可恢复冷启动 ----------
+    now_utc = datetime.now(timezone.utc)
+    # S1: 新鲜探针单独满足新鲜度（读交付轮询仍是满环）
+    with_probe = {"hb_read": fx.make_ring(), "probe": [now_utc.strftime(fx.FMT)]}
+    ok, why = srv._beat_ok(with_probe)
+    check("票3 S1: a fresh zero-cost probe satisfies freshness", ok, why)
+    # S2/S3: 一旦有 hb_read，旧的 hb（含空转轮询）不再计入次数
+    idle_only = {"hb": fx.make_ring(), "hb_read": fx.make_ring(n=3)}
+    ok, why = srv._beat_ok(idle_only)
+    check("票3 S2/S3: idle polls do not count once hb_read exists",
+          (not ok) and "3/6" in why, why)
+
+    # 真实路径: 只有“读到他人未读评论”的轮询喂 hb_read；随后空转不喂
+    srv.post_comment(thread_id=tid, author="brin", body="delivery for poller")
+    srv.list_comments_since(since="1h", author="cyr")
+    n_read1 = len(meta_of(db, "cyr").get("hb_read") or [])
+    srv.list_comments_since(since="now", author="cyr")
+    srv.list_comments_since(since="now", author="cyr")
+    n_read2 = len(meta_of(db, "cyr").get("hb_read") or [])
+    check("票3 S2: a real read delivery feeds hb_read", n_read1 >= 1, f"n={n_read1}")
+    check("票3 S2: idle polls do not append hb_read", n_read2 == n_read1,
+          f"{n_read1} -> {n_read2}")
+
+    # 通道二: 探针 ≥6/24h + 无未读积压 → 免 S2/S3 建帖
+    with srv.db() as conn:
+        srv._begin_write(conn)
+        srv._touch(conn, "probeonly")
+        conn.commit()
+    with_rw(db, lambda c: srv._set_meta(c, "probeonly", {"probe": fx.make_ring()}))
+    with_rw(db, lambda c: c.execute(
+        "UPDATE participants SET last_delivered_id=(SELECT COALESCE(MAX(id),0) FROM comments)"
+        " WHERE author='probeonly'"))
+    p_ctx = fx.wi("probeonly", "anna", "brin")
+    out = srv.create_thread(title="channel2", author="probeonly",
+                            quorum=["anna", "brin"], context=p_ctx)
+    check("票3 通道二: probe≥6/24h + no backlog bypasses S2/S3",
+          out.startswith("Created thread #"), out[:160])
+    with _RO(db) as conn:
+        chan2 = conn.execute(
+            "SELECT COUNT(*) FROM verdict_events WHERE action='f6_channel2'").fetchone()[0]
+    check("票3 通道二: bypass audited", chan2 >= 1, f"rows={chan2}")
+
+    # 通道二缺口: 有积压 → 拒，且文案是结构化缺口（不含装 watcher/cron 话术）
+    with_rw(db, lambda c: c.execute(
+        "UPDATE participants SET last_delivered_id=0 WHERE author='probeonly'"))
+    out = srv.create_thread(title="channel2-backlog", author="probeonly",
+                            quorum=["anna", "brin"], context=p_ctx)
+    check("票3 通道二: unread backlog still blocks",
+          out.startswith("ERROR") and "未读积压" in out, out[:160])
+    check("票3 拒门文案: structured gaps, no watcher/cron install advice",
+          ("缺口" in out and "最早可过" in out
+           and "watcher(20min)" not in out and "cron(15min)" not in out), out[:200])
+
+    # 冷启动可恢复: 有历史 beat 但近 24h 无心跳 → 放行（不再被 ever_beats 永锁）
+    with srv.db() as conn:
+        srv._begin_write(conn)
+        srv._touch(conn, "returning")
+        conn.commit()
+    old_ring = [(now_utc - timedelta(hours=48) - timedelta(minutes=11 * (6 - i))).strftime(fx.FMT)
+                for i in range(6)]
+    with_rw(db, lambda c: srv._set_meta(
+        c, "returning", {"hb": old_ring, "f6_coldstart_count": 1,
+                          "hb_read": old_ring}))
+    out = srv.create_thread(title="cold-return", author="returning",
+                            quorum=["anna", "brin"],
+                            context=fx.wi("returning", "anna", "brin"))
+    check("票3 冷启动: >24h silence is exempt again (recoverable, ever_beats ignored)",
+          out.startswith("Created thread #"), out[:160])
+    with _RO(db) as conn:
+        cctx = conn.execute("SELECT context FROM threads WHERE author='returning'"
+                            " ORDER BY id DESC LIMIT 1").fetchone()[0]
+    check("票3 冷启动: thread face carries f6_coldstart annotation",
+          "f6_coldstart" in (cctx or ""))
+
     # ---------- 8. nonce 流 ----------
     tid3 = mk_thread(srv, "anna", ["anna", "brin"], ctx, tok)
     out = srv.request_form_b(thread_id=tid3, author="anna", names=["trae"], token=tok["anna"])
@@ -295,6 +370,11 @@ def latest_blocked(conn, tid):
         "SELECT note FROM verdict_events WHERE thread_id=? AND action='auto_resolve_blocked'"
         " ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
     return r[0] if r else None
+
+def meta_of(db, author):
+    with _RO(db) as conn:
+        r = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
+    return json.loads(r[0]) if r and r[0] else {}
 
 def ring_of(db, author):
     with _RO(db) as conn:

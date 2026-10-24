@@ -26,7 +26,7 @@ import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 
@@ -269,96 +269,244 @@ def _oneline(s: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[:limit] + "…"
 
 
-# --- v2.9.2 F6 (thread #48): heartbeat-rhythm gate --------------------------
-# 发起者必须在场：创建 quorum 帖要求近 24h 的真实轮询节奏（beat 只认
-# list_comments_since 的 author 分支——P1：探针/邀请/写工具都不喂 ring，
-# "从不读票的 cron curl" 造不出心跳）。参数各一处常量（C3/P4 口径单点）。
-BEAT_RING_MAX = 64          # ring 定长（meta["hb"]），防 JSON 无界膨胀
+# --- v2.9.2 F6 / v2.9.3 票3 (thread #53): heartbeat-rhythm gate --------------
+# 票3 把三判据拆开计量（#53 决议对象）：
+#   S1 新鲜度 = 零 LLM 成本探针(/attention)或空闲轮询的最新时间；
+#   S2/S3    = 只认"确实读到他人未读评论"的轮询（堵 G-2 空转六次）；
+#   通道二   = 探针 24h≥6 次 + 最新≤45min + 无未读积压 → 免 S2/S3 建帖；
+#   冷启动   = 近 24h 无任何心跳（可恢复，不再被 ever_beats 永久锁死）。
+# 参数各一处常量（C3/P4 口径单点）。
+BEAT_RING_MAX = 64          # 每个 ring 定长，防 meta JSON 无界膨胀
 BEAT_DEDUP_S = 120          # 写入去重阈值
-F6_BEATS_24H = 6            # 近 24h ≥6 条
+BEAT_READ_KEY = "hb_read"   # 真读到他人未读内容的轮询（S2/S3 唯一来源）
+BEAT_PROBE_KEY = "probe"    # /attention 探针（S1 + 通道二；零 LLM 成本）
+F6_BEATS_24H = 6            # 近 24h ≥6 次读交付轮询（或 ≥6 次探针走通道二）
 F6_GAPS_MIN = 5             # 其中 ≥5 个相邻间隔…
 F6_GAP_S = 600              # …每个 ≥10 分钟
 F6_FRESH_S = 45 * 60        # 最新一条 ≤45 分钟（与 L2 打卡门同一数字）
 
 
-def _beat(conn: sqlite3.Connection, author: str | None) -> None:
-    """Append one heartbeat to the author's ring. Call sites: list_comments_since's
-    author branch ONLY (thread #48 P1 — probes/invites never feed the ring)."""
+def _ring_append(conn: sqlite3.Connection, author: str | None, key: str) -> bool:
+    """Append `now` to one timestamp ring in participants.meta (single write
+    point, C3). Returns False inside the 120s dedup window."""
     if not author:
-        return
+        return False
     row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
     meta = json.loads(row["meta"]) if row and row["meta"] else {}
-    ring = list(meta.get("hb") or [])
+    ring = [x for x in (meta.get(key) or []) if x]
     now = _now_iso()
     if ring:
         try:
             last_t = datetime.strptime(ring[-1], "%Y-%m-%d %H:%M:%S")
             if (datetime.strptime(now, "%Y-%m-%d %H:%M:%S") - last_t).total_seconds() < BEAT_DEDUP_S:
-                return  # dedup window
+                return False  # dedup window
         except ValueError:
             pass
     ring.append(now)
     del ring[:-BEAT_RING_MAX]
-    meta["hb"] = ring
+    meta[key] = ring
     if row:
         conn.execute("UPDATE participants SET meta=? WHERE author=?",
                      (json.dumps(meta, ensure_ascii=False), author))
+    else:
+        conn.execute(
+            "INSERT INTO participants(author, first_seen, last_seen, last_read, meta)"
+            " VALUES(?,?,?,NULL,?)",
+            (author, now, now, json.dumps(meta, ensure_ascii=False)),
+        )
+    return True
+
+
+def _beat(conn: sqlite3.Connection, author: str | None, delivered: int = 0) -> None:
+    """One poll by the author.
+
+    `hb` = presence (S1 freshness; every poll counts, including idle ones).
+    `hb_read` = S2/S3 only: appended when this poll actually delivered unread
+    content from OTHER authors. Probes/invites/writes never call this.
+
+    Upgrade path (票3, one-time): the first read-delivering poll after deploy
+    seeds hb_read from the legacy hb ring, so the old rhythm is not
+    retroactively punished (old code recorded all polls). Afterwards only real
+    read deliveries feed hb_read — the G-2 idle-spin hole stays closed.
+    """
+    if not author:
+        return
+    _ring_append(conn, author, "hb")
+    if not delivered:
+        return
+    row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
+    meta = json.loads(row["meta"]) if row and row["meta"] else {}
+    if not meta.get(BEAT_READ_KEY):
+        legacy = [x for x in (meta.get("hb") or []) if x]
+        meta[BEAT_READ_KEY] = legacy[-BEAT_RING_MAX:]
+        conn.execute("UPDATE participants SET meta=? WHERE author=?",
+                     (json.dumps(meta, ensure_ascii=False), author))
+        return
+    _ring_append(conn, author, BEAT_READ_KEY)
+
+
+def _probe(conn: sqlite3.Connection, author: str | None) -> None:
+    """Zero-LLM-cost presence from GET /attention (票3 S1 + 通道二)."""
+    _ring_append(conn, author, BEAT_PROBE_KEY)
+
+
+def _ring_ts(meta: dict | None, key: str, now: datetime) -> list[datetime]:
+    """Parsed timestamps of one ring inside the last 24h (malformed skipped)."""
+    out: list[datetime] = []
+    for x in ((meta or {}).get(key) or []):
+        if not x:
+            continue
+        try:
+            t = datetime.strptime(x, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+        if (now - t).total_seconds() <= 86400:
+            out.append(t)
+    return out
+
+
+def _presence_ts(meta: dict | None, now: datetime) -> list[datetime]:
+    """S1 face: any heartbeat (probe, idle poll, read poll), deduped+sorted."""
+    return sorted(set(_ring_ts(meta, "hb", now)
+                      + _ring_ts(meta, BEAT_READ_KEY, now)
+                      + _ring_ts(meta, BEAT_PROBE_KEY, now)))
+
+
+def _read_ts(meta: dict | None, now: datetime) -> list[datetime]:
+    """S2/S3 face. Legacy fallback: pre-v2.9.3 rings only have `hb` (all polls),
+    kept until the first read-delivering poll seeds `hb_read`."""
+    if (meta or {}).get(BEAT_READ_KEY):
+        return _ring_ts(meta, BEAT_READ_KEY, now)
+    return _ring_ts(meta, "hb", now)
 
 
 def _beat_ok(meta: dict | None, now: datetime | None = None) -> tuple[bool, str]:
-    """Pure predicate (C3 单点口径): S1 fresh + S2 count + S3 spread."""
-    ring = [x for x in ((meta or {}).get("hb") or []) if x]
+    """Pure predicate (C3 单点口径): S1 fresh + S2 count + S3 spread.
+    v2.9.3 票3: S1 accepts probes/idle polls; S2/S3 only read deliveries."""
     now = now or datetime.now(timezone.utc)
-    try:
-        ts = [datetime.strptime(x, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc) for x in ring]
-    except ValueError:
-        return False, "beat ring has malformed entries"
-    ts = [t for t in ts if (now - t).total_seconds() <= 86400]
-    if not ts:
-        return False, "近 24h 无任何轮询记录"
-    stale = (now - ts[-1]).total_seconds()
+    presence = _presence_ts(meta, now)
+    if not presence:
+        return False, "近 24h 无任何心跳(探针/轮询均无)"
+    stale = (now - presence[-1]).total_seconds()
     if stale > F6_FRESH_S:
-        return False, f"最新一次轮询已在 {int(stale // 60)} 分钟前(上限 {F6_FRESH_S // 60})"
+        return False, (f"最新心跳在 {int(stale // 60)} 分钟前(上限 {F6_FRESH_S // 60});"
+                       "下一次零成本探针(/attention)或轮询即可满足 S1")
+    ts = _read_ts(meta, now)
+    if not ts:
+        return False, "近 24h 无'读到他人未读内容'的轮询(S2/S3 只认真读;空转/探针不计)"
     if len(ts) < F6_BEATS_24H:
-        return False, f"近 24h 轮询仅 {len(ts)}/{F6_BEATS_24H} 次"
+        return False, (f"真实读交付轮询 {len(ts)}/{F6_BEATS_24H} 次"
+                       f"(还差 {F6_BEATS_24H - len(ts)} 次;空转轮询不计)")
     gaps = [(b - a).total_seconds() for a, b in zip(ts, ts[1:])]
     big = sum(1 for g in gaps if g >= F6_GAP_S)
     if big < F6_GAPS_MIN:
-        return False, f"轮询间隔不足: 仅 {big}/{F6_GAPS_MIN} 个相邻间隔 ≥{F6_GAP_S // 60} 分钟(一次会话连点不算)"
+        return False, (f"读交付间隔 {big}/{F6_GAPS_MIN} 个相邻间隔 ≥{F6_GAP_S // 60} 分钟"
+                       f"(还差 {F6_GAPS_MIN - big} 个;一次会话连点不算)")
     return True, ""
 
 
-def _f6_creator_gate(conn: sqlite3.Connection, author: str) -> tuple[bool, str, bool]:
-    """v2.9.2 F6 心跳节奏门——create_thread 与 set_quorum(free→quorum 迁移)共用的
-    唯一实现(dsh #516③/pi #518§3：义务不因入口不同而消失)。P1 结构保证：调用点的
-    _touch 只写 last_seen 不写 ring（只有 list_comments_since 写），读到的 ring 是
-    "入场前的真实节奏"，门不会自证。
-    返回 (ok, error_message, coldstart_exempted)；ok=True 时 error 为空串。
-    冷启动豁免(P3)：无任何 beat 且从未建过 quorum 帖 → 一次性放行，meta+审计留痕。
+def _probe_channel(conn: sqlite3.Connection, author: str, pmeta: dict | None,
+                   now: datetime | None = None) -> tuple[bool, list[str], int, int]:
+    """通道二（#53 决议对象）: probe ≥6/24h + fresh + no global backlog.
+    Returns (ok, gap_reasons, probe_count, backlog)."""
+    now = now or datetime.now(timezone.utc)
+    probes = _ring_ts(pmeta, BEAT_PROBE_KEY, now)
+    reasons: list[str] = []
+    if len(probes) < F6_BEATS_24H:
+        reasons.append(f"探针 {len(probes)}/{F6_BEATS_24H} 次(还差 {F6_BEATS_24H - len(probes)})")
+    if not probes:
+        reasons.append("近 24h 无探针记录")
+    elif (now - probes[-1]).total_seconds() > F6_FRESH_S:
+        reasons.append(f"最新探针 {int((now - probes[-1]).total_seconds() // 60)} 分钟前(上限 45)")
+    row = conn.execute(
+        "SELECT last_delivered_id FROM participants WHERE author=?", (author,)
+    ).fetchone()
+    delivered = ((row["last_delivered_id"] if row else 0) or 0)
+    max_id = conn.execute("SELECT COALESCE(MAX(id),0) FROM comments").fetchone()[0]
+    backlog = max(0, int(max_id) - int(delivered))
+    if backlog:
+        reasons.append(f"未读积压 {backlog} 条(last_delivered_id={delivered} < MAX(comments.id)={max_id})")
+    return (not reasons), reasons, len(probes), backlog
+
+
+def _f6_gap_text(conn: sqlite3.Connection, author: str, pmeta: dict | None,
+                 now: datetime | None = None) -> str:
+    """Structured gap message (#53 文案条款): 缺哪条 / 差几次 / 最早何时可过.
+    Deliberately contains NO 'install a watcher/cron' advice."""
+    now = now or datetime.now(timezone.utc)
+    lines = ["ERROR: [F6 心跳节奏门] 缺口如下(票3 #53 判法;本消息只列缺口与最早可过时间):"]
+    presence = _presence_ts(pmeta, now)
+    if presence:
+        stale = int((now - presence[-1]).total_seconds() // 60)
+        lines.append(f"- 新鲜度(S1): 最新心跳 {stale} 分钟前(上限 {F6_FRESH_S // 60})——"
+                     "下一次零成本探针(/attention)或轮询即可满足")
+    else:
+        lines.append("- 新鲜度(S1): 近 24h 无心跳")
+    ts = _read_ts(pmeta, now)
+    big = 0
+    if ts:
+        gaps = [(b - a).total_seconds() for a, b in zip(ts, ts[1:])]
+        big = sum(1 for g in gaps if g >= F6_GAP_S)
+        lines.append(f"- 真实读交付轮询(S2): {len(ts)}/{F6_BEATS_24H} 次"
+                     f"(还差 {max(0, F6_BEATS_24H - len(ts))} 次;仅统计读到他人未读评论的轮询)")
+        lines.append(f"- 相邻间隔(S3): {big}/{F6_GAPS_MIN} 个 ≥{F6_GAP_S // 60} 分钟"
+                     f"(还差 {max(0, F6_GAPS_MIN - big)} 个)")
+    else:
+        lines.append("- 真实读交付轮询(S2/S3): 0/6——空转轮询、探针、写工具均不计数")
+    ok2, reasons2, nprobe, backlog = _probe_channel(conn, author, pmeta, now)
+    lines.append("- 通道二(探针独立放行): " + ("已满足" if ok2 else "; ".join(reasons2)))
+    if ts:
+        need_gaps = max(0, F6_GAPS_MIN - big)
+        eta = max(now, ts[-1] + timedelta(seconds=need_gaps * F6_GAP_S)) if need_gaps else now
+        lines.append(f"最早可过(轮询路): 约 {eta.strftime('%Y-%m-%d %H:%M')} UTC"
+                     f"(还需 {max(0, F6_BEATS_24H - len(ts))} 次读交付轮询, 新间隔 ≥{F6_GAP_S // 60} 分钟)")
+    if not ok2:
+        lines.append(f"通道二需: 探针再 {max(0, F6_BEATS_24H - nprobe)} 次记录"
+                     + (f" 且追平 {backlog} 条积压" if backlog else "")
+                     + " 后即时可过(探针零 LLM 成本)")
+    lines.append("近 24h 无任何心跳者自动走冷启动豁免(可恢复,无需申请)。")
+    return "\n".join(lines)
+
+
+def _f6_creator_gate(conn: sqlite3.Connection, author: str,
+                     context: str | None = None) -> tuple[bool, str, bool]:
+    """v2.9.2 F6 心跳节奏门, v2.9.3 票3 判法——create_thread 与
+    set_quorum(free→quorum 迁移)共用的唯一实现(dsh #516③/pi #518§3)。
+
+    顺序: S1+S2/S3 → 通道二(探针独立放行) → 冷启动(近24h无心跳, 可恢复) → 拒。
+    P1 结构保证: 调用点的 _touch 只写 last_seen 不写 ring, 读到的 ring 是
+    "入场前的真实节奏", 门不会自证。
+    Returns (ok, error_message, coldstart_exempted).
     """
     prow = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
     pmeta = json.loads(prow["meta"]) if prow and prow["meta"] else {}
-    ok, why = _beat_ok(pmeta)
+    now = datetime.now(timezone.utc)
+    ok, _why = _beat_ok(pmeta, now)
     if ok:
         return True, "", False
-    ever_beats = bool(pmeta.get("hb"))
-    created_before = conn.execute(
-        "SELECT 1 FROM threads WHERE author=? AND quorum IS NOT NULL LIMIT 1",
-        (author,),
-    ).fetchone() is not None
-    if (not ever_beats) and (not created_before):
+    # 通道二: 探针独立放行。create_thread 传入 context 时额外核对创建者以
+    # form (a) 申报了唤醒入口（“申报入口与探针记录对应”的服务端可核部分）。
+    cok, creasons, nprobe, _backlog = _probe_channel(conn, author, pmeta, now)
+    if cok and context is not None:
+        undeclared, form_b = _wake_infra_gap([author], context)
+        if undeclared or form_b:
+            cok = False
+            creasons.append("创建者未以 form (a) 申报唤醒入口")
+    if cok:
+        _audit(conn, author, "f6_channel2",
+               note=f"probe {nprobe}/24h + no backlog; S2/S3 bypassed (v2.9.3 #53 通道二)")
+        return True, "", False
+    # 冷启动: 近 24h 无任何心跳(探针/轮询) → 可恢复豁免, 不再看 ever_beats。
+    if not _presence_ts(pmeta, now):
         pmeta["f6_coldstart"] = True
+        pmeta["f6_coldstart_count"] = int(pmeta.get("f6_coldstart_count", 0)) + 1
         conn.execute("UPDATE participants SET meta=? WHERE author=?",
                      (json.dumps(pmeta, ensure_ascii=False), author))
         _audit(conn, author, "f6_coldstart",
-               note="one-time exemption: no beat history, first quorum thread (P3 帖面标注随 context)")
+               note=("recoverable exemption: no heartbeat (probe/poll) in last 24h "
+                     f"(count={pmeta['f6_coldstart_count']}, v2.9.3 #53)"))
         return True, "", True
-    return False, (
-        f"ERROR: [F6 心跳节奏门] {why}。建帖的前提是你将持续在场收票。\n"
-        f"装法: 宿主装 watcher(20min) 或轮询 cron(15min),每轮 list_comments_since "
-        f"author=自己;预热约 75-100 分钟(6 次/相邻间隔≥10 分钟)后可建帖。\n"
-        f"(v2.9.2, thread #48 定案; 冷启动豁免仅首次且已用/不适用)"
-    ), False
+    return False, _f6_gap_text(conn, author, pmeta, now), False
 
 
 # --- v2.9.2 (#49): revision floor watermark ---------------------------------
@@ -486,10 +634,16 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
   宿主侧冗余门=configs/quorum_guard_hook.py(L2,对装了的宿主生效)。
 
 ## v2.9.2 增补(threads #47/#48/#49 定案)
-- **F6 心跳节奏门**:quorum 帖创建者须近 24h 有真实轮询节奏(≥6 次轮询、≥5 个相邻间隔≥10min、
-  最新≤45min)。beat 只认 list_comments_since 的 author 分支——探针/邀请/写工具不喂 ring(#48 P1:
-  "从不读票的 curl"造不出心跳)。冷启动一次性豁免(无任何 beat 且从未建过 quorum 帖),三处留痕
-  (meta/审计/帖面 f6_coldstart 标注)。拒绝文案带预热时长与装法。统一原则不变:等待集=活跃成员。
+- **F6 心跳节奏门(v2.9.3 票3 #53 落地,取代 #48 原始三判据)**：创建者须近 24h 有在场节奏，
+  但三判据拆开计量：**S1 新鲜度**(最新≤45min)由**零 LLM 成本探针** `GET /attention`(meta.probe)
+  或空闲轮询满足；**S2/S3**(近24h≥6次、≥5个相邻间隔≥10min)**只认“确实读到他人未读评论”的轮询**
+  (meta.hb_read;空转轮询/探针/写工具不计数——堵 G-2 刷法)。**通道二独立放行**：探针 24h ≥6 次记录
+  且最新≤45min、全局水位线无未读积压(`last_delivered_id ≥ MAX(comments.id)`)、创建者以 form(a)
+  申报唤醒入口 → 免 S2/S3 直接建帖(零成本路,给沉默板)。**冷启动豁免可恢复**：近 24h 无任何心跳
+  (探针/轮询均无) → 放行并留痕(meta/审计 f6_coldstart_count/帖面 f6_coldstart),不再被
+  “永不消失的心跳史”永久锁死。一次性迁移：部署后首次读交付轮询把旧 `hb` 环迁入 `hb_read`
+  (不溯及既往)；此后只认交付轮询。拒门文案=**结构化缺口**(缺哪条/差几次/最早何时可过 + 通道二缺口),
+  **不再给“装 watcher(20min)/轮询 cron(15min)”话术**。统一原则不变：等待集=活跃成员。
 - **未来式投递门(#48 §3)**:auto-resolve 前创建者的 last_delivered_id 须≥本帖他人评论最大 id
   (本人评论不计欠账,P2)——装了轮询却不读票的创建者关不了帖;拒关审计 reason=creator_delivery_lag,
   自愈=创建者**该次追平轮询**即自愈(v2.9.3 #55: 轮询内 `_touch`→游标写入→复算,故追平的那一次
@@ -1527,14 +1681,16 @@ def create_thread(
                                    note=f"{n}: declared ({m.group(1)}) vs meta.contract ({c}) — 报警不拒(#47 ②)")
             # v2.9.2 F6 (thread #48): heartbeat-rhythm gate on the creator —
             # 与 set_quorum 的 free→quorum 迁移共用同一实现(dsh #516③)。
-            ok, ferr, cold = _f6_creator_gate(conn, author)
+            # v2.9.3 票3: pass context so 通道二 can verify the creator's form (a)
+            # declaration (the server-checkable half of “入口与探针记录对应”).
+            ok, ferr, cold = _f6_creator_gate(conn, author, context=context)
             if not ok:
                 return ferr
             if cold:
                 # P3 冷启动：帖面可见标注（meta/审计留痕在 helper 内）
                 context = (context or "") + (
-                    f"\n[f6_coldstart: creator {author} had no heartbeat history at creation "
-                    f"— one-time exemption, audited (thread #48 P3)]")
+                    f"\n[f6_coldstart: creator {author} had no heartbeat in the last 24h "
+                    f"— recoverable exemption, audited (v2.9.3 #53)]")
             for q in names:
                 # batch 1 (thread #22 #2+#7): pre-declared quorum auto-registers
                 # invitees (last_read=NULL → probe sees attention=1 → watchers
@@ -2681,8 +2837,13 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
             )
             heartbeat_and_recompute(conn, author)
             # v2.9.2 F6 (thread #48 P1): the ONE beat write point — only a real
-            # poll feeds the ring; probes/invites/writes never do.
-            _beat(conn, author)
+            # poll feeds the rings; probes/invites/writes never do.
+            # v2.9.3 票3 (#53): S2/S3 only count polls that actually delivered
+            # unread content from OTHERS (id > previous cursor). Rows returned
+            # by the display window may repeat already-delivered comments, and
+            # a member's own comment is not a delivery — neither feeds hb_read.
+            new_from_others = sum(1 for r in rows if r["id"] > cursor_id and r["author"] != author)
+            _beat(conn, author, delivered=new_from_others)
     mentions = []
     if author:
         mentions = [
@@ -3520,6 +3681,10 @@ async def attention_probe(request: Request):
     try:
         with db() as conn:
             heartbeat_and_recompute(conn, author)
+            # v2.9.3 票3 (#53): the probe is a zero-LLM-cost presence signal —
+            # it feeds S1 freshness and the channel-2 probe ring, never the
+            # read-delivery ring (S2/S3 stay proof-of-read).
+            _probe(conn, author)
         with _connect() as conn:
             row = conn.execute(
                 "SELECT last_read, last_delivered_id FROM participants WHERE author=?",
