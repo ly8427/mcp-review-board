@@ -2278,7 +2278,25 @@ def set_status(
                     f"terminal state only the human can revert. Use "
                     f"human_override=True when a human explicitly instructs it."
                 )
+            # v2.9.4（2026-10-24 事故）：手动 resolved **也必须过讨论地板**。
+            # 此前手动路只校验"全量名册的票"，不看"每人是否留过话"；于是自动路
+            # 刚拦下的帖子，换个入口就能关掉，且不留痕（thread #76 实证）。
+            # 出口：让缺评论的成员各留一条（正常路径），或用户显式 human_override（有审计）。
+            if status == "resolved" and t["quorum"]:
+                silent, _why = _floor_missing(conn, thread_id)
+                if silent:
+                    return (
+                        f"ERROR: thread #{thread_id} discussion floor not met — "
+                        f"active members with no comment in this revision: {silent}. "
+                        "Ask each of them for one line (any comment), or use "
+                        "human_override=True when a human explicitly instructs the close."
+                    )
+            prev = t["status"]
             conn.execute("UPDATE threads SET status=? WHERE id=?", (status, thread_id))
+            # v2.9.4：状态变更一律留痕（此前成功路径一条审计都不写 ⇒ "谁关的"无从追）
+            _audit(conn, author, "status_change", thread_id=thread_id,
+                   from_v=prev, to_v=status,
+                   note=f"manual set_status by {author}; human_override={bool(human_override)}")
             return f"Thread #{thread_id} set to '{status}' by {author}."
         else:
             cur = conn.execute("UPDATE comments SET status=? WHERE id=?", (status, comment_id))
@@ -2696,6 +2714,38 @@ def _l15_waiting(conn: sqlite3.Connection, thread_id: int, creator: str,
     return [n for n in _active_quorum(conn, quorum) if n != author and n not in voted]
 
 
+def _floor_missing(conn: sqlite3.Connection, thread_id: int) -> tuple[list[str] | None, str | None]:
+    """讨论地板「本修订内活跃成员是否都留过评论」的**唯一实现**（v2.9.4）。
+
+    抽出来的原因（2026-10-24 事故，thread #76）：这条规矩此前只长在自动关帖路径
+    （`recompute_thread`）里，**手动 `set_status('resolved')` 完全不检查**。
+    于是同一件事两个入口、两套标准，且松的那个还不留痕：
+
+      · 15:27:29 自动路正确拦下 `reason=discussion_floor: ['claude','pi','zcode']`；
+      · 随后某个会话走手动路 `set_status('resolved')`——它只校验全量名册的票、
+        不看评论，直接放行；
+      · 而 `set_status` 当时一条审计都不写 ⇒ 事后无人能回答"谁关的、何时关的"。
+
+    返回 (silent, why)：
+      silent 非空 ⇒ 地板未满足（这些活跃成员本修订内无评论）；
+      silent == [] ⇒ 满足；silent is None ⇒ 无法判定（floor_wm 缺失，why 为原因）。
+    """
+    wm, wm_ok, wm_why = _revision_floor(conn, thread_id)
+    if not wm_ok:
+        return None, wm_why
+    row = conn.execute("SELECT quorum FROM threads WHERE id=?", (thread_id,)).fetchone()
+    names = json.loads(row["quorum"]) if row and row["quorum"] else []
+    active = _active_quorum(conn, names)
+    commented = {
+        r["author"]
+        for r in conn.execute(
+            "SELECT DISTINCT author FROM comments WHERE thread_id=? AND id > ?",
+            (thread_id, wm),
+        ).fetchall()
+    }
+    return [n for n in active if n not in commented], None
+
+
 def _awaiting_split(conn: sqlite3.Connection, author: str) -> tuple[list[int], list[dict]]:
     """把"我欠的票"拆成两族（v2.9.4 结构性修复，2026-10-24 事故立案）。
 
@@ -2775,21 +2825,14 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
             # v2.9 L1.5(a) discussion floor (thread #45 rev2) + v2.9.2 #49 A:
             # 修订边界 = comments.id 水位线（bump 事件固定位 token；同秒歧义
             # 已被 dsh 盘上实证，时间戳坐标废弃）。
-            wm, wm_ok, wm_why = _revision_floor(conn, thread_id)
-            if not wm_ok:
+            # v2.9.4: 判据抽成 _floor_missing（与手动关帖共用同一实现）
+            silent, wm_why = _floor_missing(conn, thread_id)
+            if silent is None:
                 _audit_blocked_once(
                     conn, thread_id, t["revision"], "floor_wm_missing",
                     f"reason=floor_wm_missing: {wm_why}; 出口=新码下重发 bump_revision"
                     f"(清票重投,正常但昂贵,勿当卡死反复重试 — #511)")
                 return
-            commented = {
-                r["author"]
-                for r in conn.execute(
-                    "SELECT DISTINCT author FROM comments WHERE thread_id=? AND id > ?",
-                    (thread_id, wm),
-                ).fetchall()
-            }
-            silent = [n for n in active if n not in commented]
             if silent:
                 _audit_blocked_once(
                     conn, thread_id, t["revision"], "discussion_floor",
