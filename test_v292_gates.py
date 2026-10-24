@@ -409,6 +409,30 @@ def main():
           "not-a-timestamp" not in (m4.get("hb_read") or []),
           f"hb_read={m4.get('hb_read')}")
 
+    # ⑦e (dsh #740 §2: 抬升支此前没有断言——⑦a-d 都用 INSERT OR REPLACE 写入
+    # ≈now 的值,只走"值不变"那支)。抬升支是治理相关事件(抬高纪元会把尚未冻结
+    # 副本的成员的恩赦上界抬高)⇒ 必须可审计,且只留一条。
+    with_rw(db, lambda c: c.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)",
+        (srv.F6_READ_EPOCH_KEY, "1700000000")))
+    eff1 = with_rw(db, lambda c: srv._read_epoch(c))
+    eff2 = with_rw(db, lambda c: srv._read_epoch(c))   # 第二次: 不得再留一行
+    with _RO(db) as conn:
+        stored = int(conn.execute("SELECT value FROM meta WHERE key=?",
+                                  (srv.F6_READ_EPOCH_KEY,)).fetchone()[0])
+        raise_rows = conn.execute(
+            "SELECT COUNT(*) FROM verdict_events"
+            " WHERE action='f6_read_epoch_raise'").fetchone()[0]
+        raise_note = conn.execute(
+            "SELECT note FROM verdict_events WHERE action='f6_read_epoch_raise'"
+            " ORDER BY id LIMIT 1").fetchone()[0]
+    check("v2.9.3 #64 ⑦e: only-increase branch raises meta, audits once (dsh #740 §2)",
+          (eff1, eff2, stored) == ((srv.F6_READ_EPOCH_CODE,) * 3)
+          and raise_rows == 1
+          and f"have=1700000000" in (raise_note or "")
+          and f"effective={srv.F6_READ_EPOCH_CODE}" in (raise_note or ""),
+          f"eff={eff1}/{eff2} stored={stored} rows={raise_rows} note={raise_note!r}")
+
     # ---------- 8. nonce 流 ----------
     tid3 = mk_thread(srv, "anna", ["anna", "brin"], ctx, tok)
     out = srv.request_form_b(thread_id=tid3, author="anna", names=["trae"], token=tok["anna"])

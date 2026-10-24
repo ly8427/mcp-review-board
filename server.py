@@ -384,6 +384,14 @@ def _read_epoch(conn: sqlite3.Connection) -> int:
     eff = max(have, F6_READ_EPOCH_CODE)
     if eff != have:
         conn.execute("UPDATE meta SET value=? WHERE key=?", (str(eff), F6_READ_EPOCH_KEY))
+        # dsh #740 §2: the only-increase branch is not cosmetic — a raised
+        # epoch widens the amnesty UPPER bound for every member that has not
+        # frozen a copy yet, so "who raised it to what" must be in the audit
+        # table, not stdout only. The note carries DB/compile-time values and
+        # no wall clock, so the row stays byte-identical across runs (stage6
+        # part B). Idempotent: after the UPDATE `eff == have`, so no 2nd row.
+        _audit(conn, "system", "f6_read_epoch_raise",
+               note=f"have={have} code={F6_READ_EPOCH_CODE} effective={eff}")
         print(f"[f6_read_epoch] meta={have} < code={F6_READ_EPOCH_CODE}; "
               f"raised to {eff} (only-increase)", flush=True)
     return eff
