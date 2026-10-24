@@ -62,7 +62,7 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 # (GPT round-2 P1 on 7f06517)。
 echo 0 > "$FAILS" 2>/dev/null || true
 
-probe() { curl -sf "$BOARD/attention?author=$AUTHOR"; }
+probe() { curl -sf -4 --max-time 10 "$BOARD/attention?author=$AUTHOR"; }
 
 echo "watching $BOARD for '$AUTHOR' every ${INTERVAL}s (probe = heartbeat, C1.1)..."
 # thread #15 rev3 (R6): probe FIRST at startup — no blind 20-min window
