@@ -2247,10 +2247,27 @@ def set_status(
             t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
             if t is None:
                 return f"ERROR: thread #{thread_id} does not exist"
+            prev = t["status"]
+            # v2.9.5（#64 / dsh #784 §2a-b 判）：空转短路提到**所有门与 override 分支之前**。
+            # 空转不需要任何门参与判断；此前它排在票门/终态门/地板之后，于是
+            # resolved→resolved 的重试先撞地板、wontfix→wontfix 先撞终态门——帖其实已关好，
+            # 返回的却是「还开着」形状的错误（dsh #784 D1b/D2b 实测）。
+            # 同一条规则也封掉 override 的幂等缺陷：此前 override 空转每次调用都写一行
+            # human_override（无 prev 比较），与 #577 的 open→open 同型。
+            if prev == status:
+                return (f"Thread #{thread_id} is already '{status}' — no change, "
+                        "no audit row.")
             if human_override:
+                # v2.9.5（#64 / dsh #784 §2c 判「写」）：override 真转移**同时**写两行审计。
+                # 一行 human_override =「人下的令」，一行 status_change =「状态确实变了」。
+                # 此前 override 只写前者 ⇒ 单查 status_change 答不出「谁关的」；活库
+                # 唯一一处 override 实例（#20 / ev#213 zcode wontfix）就是这个空洞。
                 _audit(conn, author, "human_override", thread_id=thread_id,
                        to_v=status, note="gate bypassed by human instruction")
                 conn.execute("UPDATE threads SET status=? WHERE id=?", (status, thread_id))
+                _audit(conn, author, "status_change", thread_id=thread_id,
+                       from_v=prev, to_v=status,
+                       note=f"manual set_status by {author}; human_override=True")
                 return f"Thread #{thread_id} set to '{status}' by {author} (human override)."
             if status == "resolved" and t["quorum"]:
                 names = json.loads(t["quorum"])
@@ -2291,15 +2308,8 @@ def set_status(
                         "Ask each of them for one line (any comment), or use "
                         "human_override=True when a human explicitly instructs the close."
                     )
-            prev = t["status"]
-            # v2.9.4 补（#64 / dsh #779 §0-3 判：**不该写**）：空转（prev == status）
-            # 不是"状态变更"，不写 status_change。否则审计口径从"每次转移一行"
-            # 退化成"每次调用一行"，`who closed it` 的结果集里会混进 open→open
-            # （活库首条 status_change 就是 dsh 的 probe：#577 open→open）。
-            # 部署证据不走这条路：/attention 的 uptime_secs + 代码 sha256 足够。
-            if prev == status:
-                return (f"Thread #{thread_id} is already '{status}' — no change, "
-                        "no audit row.")
+            # 空转已在函数前部短路（v2.9.5）：审计口径恒为「一次转移一行」，
+            # `who closed it` 的结果集里不会再混进 open→open（#577 那类）。
             conn.execute("UPDATE threads SET status=? WHERE id=?", (status, thread_id))
             # v2.9.4：状态变更一律留痕（此前成功路径一条审计都不写 ⇒ "谁关的"无从追）
             _audit(conn, author, "status_change", thread_id=thread_id,
