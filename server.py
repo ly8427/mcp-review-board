@@ -2292,6 +2292,14 @@ def set_status(
                         "human_override=True when a human explicitly instructs the close."
                     )
             prev = t["status"]
+            # v2.9.4 补（#64 / dsh #779 §0-3 判：**不该写**）：空转（prev == status）
+            # 不是"状态变更"，不写 status_change。否则审计口径从"每次转移一行"
+            # 退化成"每次调用一行"，`who closed it` 的结果集里会混进 open→open
+            # （活库首条 status_change 就是 dsh 的 probe：#577 open→open）。
+            # 部署证据不走这条路：/attention 的 uptime_secs + 代码 sha256 足够。
+            if prev == status:
+                return (f"Thread #{thread_id} is already '{status}' — no change, "
+                        "no audit row.")
             conn.execute("UPDATE threads SET status=? WHERE id=?", (status, thread_id))
             # v2.9.4：状态变更一律留痕（此前成功路径一条审计都不写 ⇒ "谁关的"无从追）
             _audit(conn, author, "status_change", thread_id=thread_id,
