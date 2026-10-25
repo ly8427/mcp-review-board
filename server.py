@@ -204,7 +204,7 @@ SUSPEND_AFTER_HOURS = 24
 # --- v2 A1: participant registry / heartbeat --------------------------------
 # Single source of truth for the served version (v2.9.3 #55: was duplicated in
 # three literals — FastMCP serverInfo, /ping, PROTOCOL header — and drifted).
-PROTOCOL_VERSION = "2.9.3"
+PROTOCOL_VERSION = "2.10.0"
 mcp = FastMCP("ReviewBoard", version=PROTOCOL_VERSION)  # align serverInfo with pyproject
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -814,6 +814,36 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
   quorum 列表/排序键/治理工具返回体一律不含画像;判断画像的真值是内生的,仅供参考。
 - pull-only:画像变化不推送、不进 attention 经济;不可删除/重置(永久行为记录的派生)。
 - **本条款即版本闸**:任何修改都要求 bump 本协议版本——一次公开的审计事件。
+
+## v2.10 增补(threads #77/#79 定案,2026-10-25;attention 信号面两族合并过一次闸——trae #791 增量1)
+- **#79 my_comment_due(评论欠账读面,纯读 C3)**:`/attention` 与轮询 header 均新增
+  `my_comment_due: [{{thread_id, blocking}}]`。判据=复用 `_floor_missing` 的静默集
+  (dsh 绑定①:禁另写判据):open quorum 帖 ∧ 我是活跃成员 ∧ 本修订(id>floor_wm)内无我评论。
+  **blocking=true 仅当"其余活跃成员票已全 pass"**(=关门正等我这一行,pi 绑定①)——
+  只有该子集触发 `reason=awaiting_floor_comment` 唤醒;非阻塞项保留在字段里标
+  `blocking=false`,**不触发唤醒**(A5 防骚扰,#53 成本纪律)。优先级:
+  token_invalid > awaiting_verdict > verdict_stale > awaiting_floor_comment >
+  mentioned > new_comments(pi 绑定②;文案禁投递态断言——服务端算不出)。
+  C1 暂缓成员永不进该集(A3b/claude #477 统一原则);bump 后水位重置,全员(减暂缓)
+  重新欠评论(A3)。审计 `auto_resolve_blocked` 的去重键**含静默名单**(pi #794 §1):
+  名单收缩=新事实=另留一行。
+- **#77 档A token_invalid(可自修唤醒,优先级最高,threads 允许为空)**:成员 meta 无
+  `token_hash` ∧ 是某 open quorum 帖活跃名册成员 ⇒ `attention=1, reason="token_invalid"`
+  (threads=其中本修订未投票且未被 L1.5 挡者)。唤醒动作=成员自己做 claim→落盘→回读→
+  ack 四步(服务端无 hash ⇒ 必可领,即自愈)。**三族互斥**(#77 ③):tokenless 成员的
+  待投票帖从 `awaiting_my_verdict`(actionable 族)carve 进 `token_invalid` 族;
+  `blocked_my_verdict`(L1.5)语义不动;并集=旧 awaiting 集。
+- **#77 档B token_blocked(只读 latch,不唤醒)**:成员 meta 有 `token_hash` ∧
+  最近一次治理调用(set_verdict/bump_revision/set_quorum)因 token 被拒 ⇒ 两读面出现
+  `token_blocked: {{<tid>: {{tier:"manual", since, exit}}}}`;**attention 不因它变 1**,
+  不计唤醒失败。审计 `token_blocked_latched`,note 首字段 `reason=token_unusable`,
+  按(作者,帖,修订)去重(#55③ 口径)。出口=`reset_token(human_override=True)`(同时清
+  latch)或重签窗口到期;**任一次 token 正确的治理调用即清 latch**(正确出示=持有证明,
+  其后即便被 L1.5 拒也与 token 无关)。
+- **版本闸**:本节即 attention 返回契约变更的闸——init_db 每版本写一行
+  `attention_contract` 审计(note 含 reason 全表与 header 键全表),幂等;watcher 文案
+  分支随本批同落:**先评论(my_comment_due 含本帖)再投票**(trae #791 增量2,一次唤醒
+  同时消解两族),脚本内禁止 claim_token 调用(#775 改判 F)。
 """
 
 
@@ -1021,6 +1051,24 @@ def init_db() -> None:
                 "INSERT INTO meta(key, value) VALUES('board_instance_id', ?)", bid
             )
         BOARD_INSTANCE_ID = bid[0]
+        # v2.10 (#77/#79, trae #791 增量1): the attention return contract is
+        # version-gated — ONE audit row per protocol version carrying the
+        # FULL merged enum table (both tickets share one gate; per-ticket
+        # rows would make the second deploy read as drift off the first).
+        acv = conn.execute(
+            "SELECT value FROM meta WHERE key='attention_contract_ver'"
+        ).fetchone()
+        if acv is None or acv[0] != PROTOCOL_VERSION:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('attention_contract_ver', ?)",
+                (PROTOCOL_VERSION,),
+            )
+            _audit(conn, "system", "attention_contract", note=(
+                f"version={PROTOCOL_VERSION}"
+                " reasons=token_invalid|awaiting_verdict|verdict_stale"
+                "|awaiting_floor_comment|mentioned|new_comments|idle"
+                " keys=my_comment_due|token_invalid|token_blocked"
+                "|awaiting_my_verdict|blocked_my_verdict"))
 
 
 # --- v2.8 (threads #39/#40): cross-thread full-text search read face ---------
@@ -1605,6 +1653,7 @@ def reset_token(author: str, human_override: bool = False) -> str:
         meta.pop("token_acked", None)
         meta.pop("token_acked_at", None)
         meta.pop("token_issued_at", None)
+        meta.pop("token_blocked", None)  # v2.10 #77: a reset dissolves the latch
         _set_meta(conn, author, meta)
         _audit(conn, author, "token_reset_human", note="human_override reset; next claim issues fresh")
         return (f"Token cleared for '{author}' ({'had one' if had else 'had none'}). "
@@ -2367,8 +2416,9 @@ def set_verdict(
         quorum = json.loads(t["quorum"])
         if author not in quorum:
             return f"ERROR: set_verdict is quorum-only; '{author}' is not in {quorum}"
-        if not _token_ok(conn, author, token):
-            return "ERROR: missing/invalid governance token — claim_token first"
+        _tok_err = _token_gate(conn, author, token, thread_id)
+        if _tok_err:
+            return _tok_err
         # v2.9 L1.5(b) (thread #45 rev2): creator votes LAST — no verdict from
         # the creator while any ACTIVE co-member hasn't voted. Waiting set =
         # ACTIVE members only (claude #477 unified principle: C1-suspended
@@ -2449,8 +2499,9 @@ def bump_revision(thread_id: int, author: str, token: str | None = None) -> str:
             return f"ERROR: thread #{thread_id} does not exist"
         if t["author"] != author:
             return f"ERROR: bump_revision is creator-only (creator: {t['author']!r})"
-        if not _token_ok(conn, author, token):
-            return "ERROR: missing/invalid governance token — claim_token first"
+        _tok_err = _token_gate(conn, author, token, thread_id)
+        if _tok_err:
+            return _tok_err
         new_rev = (t["revision"] or 1) + 1
         conn.execute("UPDATE threads SET revision=? WHERE id=?", (new_rev, thread_id))
         conn.execute("DELETE FROM verdicts WHERE thread_id=?", (thread_id,))
@@ -2504,8 +2555,9 @@ def set_quorum(
             return f"ERROR: thread #{thread_id} does not exist"
         if t["author"] != author:
             return f"ERROR: set_quorum is creator-only (creator: {t['author']!r})"
-        if not _token_ok(conn, author, token):
-            return "ERROR: missing/invalid governance token — claim_token first"
+        _tok_err = _token_gate(conn, author, token, thread_id)
+        if _tok_err:
+            return _tok_err
         if t["status"] != "open":
             return (
                 f"ERROR: quorum changes are open-thread-only (current: {t['status']}); "
@@ -2764,6 +2816,147 @@ def _floor_missing(conn: sqlite3.Connection, thread_id: int) -> tuple[list[str] 
     return [n for n in active if n not in commented], None
 
 
+# --- v2.10 (threads #77/#79): attention signal faces -------------------------
+
+def _token_invalid_tids(conn: sqlite3.Connection, author: str) -> list[int]:
+    """档A (#77 ①): threads that WOULD be actionable but the member holds NO
+    token — carved out of _awaiting_split's actionable family so a wake lands
+    on claim→落盘→回读→ack (doable immediately; the server has no hash, so a
+    fresh claim always succeeds) instead of set_verdict (guaranteed rejection
+    BEFORE L1.5 — the signal-vs-action mismatch this ticket kills). Mirrors
+    _awaiting_split's actionable predicate exactly (roster ∧ no verdict ∧ not
+    L1.5-blocked); L1.5-blocked threads stay in the blocked family (pi #775
+    绑定③: blocked semantics unchanged), keeping the three families mutually
+    exclusive with union = the old awaiting set (#77 ③)."""
+    meta = _get_meta(conn, author)
+    if meta and meta.get("token_hash"):
+        return []
+    out: list[int] = []
+    for r in conn.execute(
+        "SELECT id, quorum, author AS creator FROM threads WHERE status='open'"
+        " AND quorum IS NOT NULL"
+    ).fetchall():
+        names = json.loads(r["quorum"])
+        if author not in names:
+            continue
+        if conn.execute(
+            "SELECT 1 FROM verdicts WHERE thread_id=? AND author=? LIMIT 1",
+            (r["id"], author),
+        ).fetchone() is not None:
+            continue
+        if _l15_waiting(conn, r["id"], r["creator"], names, author):
+            continue
+        out.append(r["id"])
+    return out
+
+
+def _active_roster_tids(conn: sqlite3.Connection, author: str) -> list[int]:
+    """Open quorum threads where `author` is on the roster AND currently
+    active (C1) — the membership precondition of the token_invalid wake
+    (#77 ① allows threads=[] while attention still fires: the owed action,
+    claiming a token, is not thread-specific)."""
+    out: list[int] = []
+    for r in conn.execute(
+        "SELECT id, quorum FROM threads WHERE status='open' AND quorum IS NOT NULL"
+    ).fetchall():
+        names = json.loads(r["quorum"])
+        if author in names and author in _active_quorum(conn, names):
+            out.append(r["id"])
+    return out
+
+
+def _comment_due_face(conn: sqlite3.Connection, author: str) -> list[dict]:
+    """#79 A 案: MY floor-comment debt per open quorum thread. The due
+    predicate is `_floor_missing`'s silent list itself (dsh 绑定① — no
+    second arithmetic to drift); the blocking flag adds only pi's subset:
+    closing is waiting on MY line ⇔ every OTHER active member's verdict is
+    pass. Non-blocking entries stay listed with blocking=false and NEVER
+    raise attention (A5 anti-nag, #53 cost discipline). Pure read (C3)."""
+    out: list[dict] = []
+    for r in conn.execute(
+        "SELECT id, quorum FROM threads WHERE status='open' AND quorum IS NOT NULL"
+    ).fetchall():
+        names = json.loads(r["quorum"])
+        if author not in names:
+            continue
+        active = _active_quorum(conn, names)
+        if author not in active:
+            continue  # C1 (A3b/claude #477): suspended members are never nagged
+        silent, _why = _floor_missing(conn, r["id"])
+        if silent is None or author not in silent:
+            continue  # satisfied for me, or floor watermark undeterminable
+        verdicts = {
+            v["author"]: v["verdict"]
+            for v in conn.execute(
+                "SELECT author, verdict FROM verdicts WHERE thread_id=?", (r["id"],)
+            ).fetchall()
+        }
+        others = [n for n in active if n != author]
+        blocking = bool(others) and all(verdicts.get(n) == "pass" for n in others)
+        out.append({"thread_id": r["id"], "blocking": blocking})
+    return out
+
+
+def _token_gate(conn: sqlite3.Connection, author: str, token: str | None,
+                thread_id: int | None = None) -> str | None:
+    """v2.10 (#77): the governance token check WITH both signal faces.
+    Returns None when the token is fine — and clears any standing
+    token_blocked latch (a correct presentation IS proof of possession,
+    even if L1.5 then rejects the call for unrelated reasons). Returns the
+    (textually unchanged) ERROR string otherwise, latching 档B first: a
+    member WITH a hash whose presentation mismatches. 档A (no hash at all)
+    is the token_invalid wake's business, never a latch. Audit
+    token_blocked_latched is deduped per (author, thread, revision) — a
+    repeated rejection on the same revision adds no row (#55③ 口径)."""
+    if _token_ok(conn, author, token):
+        meta = _get_meta(conn, author)
+        if meta.get("token_blocked"):
+            meta.pop("token_blocked", None)
+            _set_meta(conn, author, meta)
+        return None
+    meta = _get_meta(conn, author)
+    if meta and meta.get("token_hash") and thread_id is not None:
+        rev = conn.execute(
+            "SELECT revision FROM threads WHERE id=?", (thread_id,)
+        ).fetchone()
+        rev_n = rev["revision"] if rev else None
+        latch = dict(meta.get("token_blocked") or {})
+        key = str(thread_id)
+        entry = latch.get(key)
+        if not (entry and entry.get("revision") == rev_n):
+            latch[key] = {"since": _now_iso(), "revision": rev_n}
+            meta["token_blocked"] = latch
+            _set_meta(conn, author, meta)
+            _audit(conn, author, "token_blocked_latched", thread_id=thread_id,
+                   revision=rev_n,
+                   note=("reason=token_unusable: meta 有 hash 而出示失配; "
+                         "出口=reset_token(human_override=True) | 正确 token 一次治理调用"))
+    return "ERROR: missing/invalid governance token — claim_token first"
+
+
+def _token_blocked_face(conn: sqlite3.Connection, author: str) -> dict:
+    """档B (#77 ②): READ-ONLY latch face — never raises attention, never
+    counts as a wake failure. Carries the manual-tier exit path: human reset,
+    or the reissue window end (auto-ack 1h / explicit 24h from ack)."""
+    meta = _get_meta(conn, author)
+    latch = (meta or {}).get("token_blocked") or {}
+    window = ""
+    if meta and meta.get("token_acked") and meta.get("token_acked_at"):
+        hours = (AUTO_ACK_REISSUE_HOURS if meta.get("token_acked_via") == "auto"
+                 else REISSUE_AFTER_HOURS)
+        try:
+            ends = datetime.strptime(meta["token_acked_at"], "%Y-%m-%d %H:%M:%S") \
+                + timedelta(hours=hours)
+            window = f" | window_ends_at={ends.strftime('%Y-%m-%d %H:%M:%S')}"
+        except ValueError:
+            pass
+    return {
+        tid: {"tier": "manual", "since": e.get("since"),
+              "exit": f"reset_token(human_override=True){window}"}
+        for tid, e in latch.items()
+    }
+
+
 def _awaiting_split(conn: sqlite3.Connection, author: str) -> tuple[list[int], list[dict]]:
     """把"我欠的票"拆成两族（v2.9.4 结构性修复，2026-10-24 事故立案）。
 
@@ -2803,6 +2996,16 @@ def _awaiting_split(conn: sqlite3.Connection, author: str) -> tuple[list[int], l
             blocked.append({"thread_id": r["id"], "waiting_on": waiting})
         else:
             actionable.append(r["id"])
+    # v2.10 (#77 ③): tokenless carve — keep the wake families mutually
+    # exclusive. A member with NO token cannot cast the owed vote anyway
+    # (set_verdict rejects on token BEFORE L1.5); waking them on it is the
+    # very signal-vs-action mismatch this ticket kills. The carved tids
+    # surface as reason=token_invalid (wake = claim 四步, doable now);
+    # blocked (L1.5) semantics are UNCHANGED (pi #775 绑定③).
+    meta = _get_meta(conn, author)
+    if not (meta and meta.get("token_hash")):
+        ti = set(_token_invalid_tids(conn, author))
+        actionable = [t for t in actionable if t not in ti]
     return actionable, blocked
 
 
@@ -3117,9 +3320,14 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
             # 旧实现在这里把"创建者被门挡住"也列进待办，导致 watcher 反复唤醒却
             # 只能拿到拒绝，三次后 C1.2 自锁（2026-10-24 实证）。
             awaiting, blocked_verdict = _awaiting_split(conn, author)
+            # v2.10 (#77/#79)：与 /attention 同源的三张读面（纯读，C3）。
+            ti_tids = _token_invalid_tids(conn, author)
+            due_face = _comment_due_face(conn, author)
+            tb_face = _token_blocked_face(conn, author)
         else:
             awaiting = "not_implemented"
             blocked_verdict = []
+            ti_tids, due_face, tb_face = [], [], {}
     needs = {
         "new_comments": len(rows),
         "mentions_me": mentions,
@@ -3128,6 +3336,12 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
         # 但让成员知道该去催谁（协议 §W peer 唤起）。
         "blocked_my_verdict": blocked_verdict,
         "open_threads": open_threads,
+        # v2.10 #79：我欠的评论（含 blocking 标记；非阻塞项不触发唤醒，A5 防骚扰）。
+        "my_comment_due": due_face,
+        # v2.10 #77 档A：无 token 时被 carve 出 awaiting 的待投票帖（唤醒动作=claim 四步）。
+        "token_invalid": ti_tids,
+        # v2.10 #77 档B：只读 latch，不触发唤醒。
+        "token_blocked": tb_face,
     }
     header = "needs_attention: " + json.dumps(needs, ensure_ascii=False)
     if not rows:
@@ -3952,6 +4166,14 @@ async def attention_probe(request: Request):
             # v2.9.4 结构性修复：可动作 / 被 L1.5 阻塞 两族分开（见 _awaiting_split）。
             # **attention 只由可动作项触发**——否则创建者会被"自己投不了的票"反复唤醒。
             awaiting, blocked_verdict = _awaiting_split(conn, author)
+            # v2.10 (#77/#79): the two new read-only faces + the carve source.
+            ti_tids = _token_invalid_tids(conn, author)
+            due_face = _comment_due_face(conn, author)
+            floor_blocking = [e["thread_id"] for e in due_face if e["blocking"]]
+            tb_face = _token_blocked_face(conn, author)
+            _mrow = _get_meta(conn, author)
+            token_fire = (not (_mrow and _mrow.get("token_hash"))
+                          and (bool(ti_tids) or bool(_active_roster_tids(conn, author))))
             # v2.5 (thread #33): the holder's OWN continued posting over a standing
             # object wakes them to reconsider — priority BELOW awaiting_verdict
             # (an uncast vote outranks a stale one), ABOVE mentions/new_comments.
@@ -3991,10 +4213,14 @@ async def attention_probe(request: Request):
             mention_threads = sorted(
                 {r["thread_id"] for r in undelivered if _mentioned(r["body"], author)}
             )
-        if awaiting:
+        if token_fire:
+            reason, threads = "token_invalid", ti_tids
+        elif awaiting:
             reason, threads = "awaiting_verdict", awaiting
         elif stale_self:
             reason, threads = "verdict_stale", stale_self
+        elif floor_blocking:
+            reason, threads = "awaiting_floor_comment", floor_blocking
         elif mention_threads:
             reason, threads = "mentioned", mention_threads
         elif undelivered:
@@ -4011,6 +4237,15 @@ async def attention_probe(request: Request):
             # v2.9.4：我欠票但被 L1.5 挡住的那些帖，附"在等谁"。**不参与 attention 判定**
             # （不触发唤醒、不烧钱），只作为可见事实供成员去催票（协议 §W peer 唤起）。
             "blocked_my_verdict": blocked_verdict,
+            # v2.10 #79：我欠的评论欠账（判据复用 _floor_missing，禁另写算术）。
+            # blocking=true ⇒ 关门正在等我这一行（其余活跃票已全 pass）——只有该
+            # 子集触发 reason=awaiting_floor_comment；非阻塞项只列出不唤醒（A5）。
+            "my_comment_due": due_face,
+            # v2.10 #77 档A：无 token 时被 carve 出 awaiting 的待投票帖（threads 允许
+            # 为空——欠的动作是 claim 四步，不专属于某帖）。
+            "token_invalid": ti_tids,
+            # v2.10 #77 档B：只读 latch——**不因它置 attention=1**，不计唤醒失败。
+            "token_blocked": tb_face,
             # thread #31 batch A: effective cutoff (NULL→epoch sentinel, the same
             # value the probe itself uses above) for the watcher delivery judgment
             # (delivered = fingerprint moved OR last_read advanced). Advanced ONLY
