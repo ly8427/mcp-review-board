@@ -85,30 +85,51 @@ def classify(rc, stdout: bytes, stderr: bytes) -> tuple[str, str]:
 # 三份载体（pi 模板 / claude 轮询提示词 / dsh 内联任务文本）必须：
 #   ① 含 token_invalid 分支（档A 自修四步的文案在，唤醒才有可执行动作）；
 #   ② 含 my_comment_due 分支（#79 先评论后投票）；
-#   ③ 机制层（curl/POST/JSON-RPC）**不得**出现 claim_token 调用——claim 只能由
+#   ③ "blocking=true" 必须在位（dsh #820 §3 / pi #823）：漂回「含某帖」不收窄
+#      会复活 A5 要消灭的每轮骚扰；
+#   ④ claude 载体的优先级链必须与服务端 reason 全序**逐字一致且唯一**
+#      （GPT PR#6 review P2：含 verdict_stale 的完整链；旧链/重复链即红）；
+#   ⑤ 机制层（curl/POST/JSON-RPC）**不得**出现 claim_token 调用——claim 只能由
 #      被唤醒的成员自己发起（明文只显示一次，无人值守领取=把明文写进日志）；
 #      文本里对成员的指令（rb.sh claim_token / claim_token(author=…)）不算机制调用。
 WATCHERS = ("task-template-pi.txt", "claude-polling-prompt.txt", "dsh-watcher.sh")
 _INVOKER = re.compile(r"(curl|wget|Invoke-WebRequest|tools/call|/mcp)[^\n]{0,120}claim_token",
                       re.IGNORECASE)
+# 服务端 /attention 的 reason 全序（server.py v2.10 reason 链的载体侧镜像）；
+# 载体侧用 header 键名：awaiting_my_verdict/mentions_me。
+_PRIORITY_CHAIN = ("token_invalid > awaiting_my_verdict > verdict_stale"
+                   " > awaiting_floor_comment > mentions_me > new_comments")
+_PRIORITY_OLD = "优先级 awaiting_my_verdict > mentions_me"  # v2.9 旧链，禁再出现
 
 
-def check_watcher_texts() -> int:
+def check_watcher_texts(texts: dict | None = None) -> int:
+    """texts 非空时按给定文本判定（负向测试注入口），否则读载体文件。"""
     here = pathlib.Path(__file__).resolve().parent
     bad = 0
     for name in WATCHERS:
-        p = here / name
-        try:
-            text = p.read_text(encoding="utf-8")
-        except OSError as e:
-            print(f"[BAD] 载体不可读   {name} — {e}")
-            bad += 1
-            continue
-        # "blocking=true" 必须在位（dsh #820 §3 / pi #823）：#79 的 0.7 分支若漂回
-        # 「my_comment_due 含某帖」不收窄，唤醒文案会复活 A5 要消灭的每轮骚扰。
+        if texts is not None:
+            text = texts.get(name)
+            if text is None:
+                print(f"[BAD] 载体缺文本   {name}")
+                bad += 1
+                continue
+        else:
+            p = here / name
+            try:
+                text = p.read_text(encoding="utf-8")
+            except OSError as e:
+                print(f"[BAD] 载体不可读   {name} — {e}")
+                bad += 1
+                continue
         miss = [k for k in ("token_invalid", "my_comment_due", "blocking=true")
                 if k not in text]
         inv = _INVOKER.search(text)
+        if name == "claude-polling-prompt.txt":
+            # ④ 优先级链：完整且唯一（GPT PR#6 P2）
+            n_chain = text.count(_PRIORITY_CHAIN)
+            if n_chain != 1 or _PRIORITY_OLD in text:
+                miss.append(f"优先级链(期望唯一含 verdict_stale 全序, 实际 {n_chain} 处)"
+                            if n_chain != 1 else "旧优先级链残留")
         if miss or inv:
             print(f"[BAD] 载体断言     {name} — 缺 {miss or ''} "
                   f"{'机制层出现 claim_token 调用: ' + inv.group(0)[:60] if inv else ''}")

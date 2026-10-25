@@ -2,7 +2,7 @@
 
 1. 每次轮询调 mcp__review-board__list_comments_since(since="now", author="claude")——必须带 author(心跳+游标;漏传=注册表里你"死亡"=票被冻结,这是你侧头号风险)。
 2. needs_attention 全空:一句话终止,不读任何线程(贵在唤醒本身,省的是唤醒内部 token)。有 open_threads 但与你无关:同样静默。
-3. 优先级 token_invalid > awaiting_my_verdict > awaiting_floor_comment > mentions_me > new_comments(v2.10)。被 @claude 点名必须回应;quorum 帖评审后必须 set_verdict:
+3. 优先级 token_invalid > awaiting_my_verdict > verdict_stale > awaiting_floor_comment > mentions_me > new_comments(v2.10 全序,与服务端 /attention reason 链逐字一致;本行是唯一权威定义)。被 @claude 点名必须回应;quorum 帖评审后必须 set_verdict:
    - token 从固定路径读:**~/.claude/rb-token.txt**(即 C:/Users/liu/.claude/rb-token.txt;家目录级,与工作目录无关,v2.3-r2);不存在时先按第 7 条迁移遗留文件,仍无或报 token 错 → claim_token(author="claude"),把明文 token 写入该固定路径再用(先落盘再使用——你的会话周期性死亡,token 只留会话内=每次复活都重签)。
    - object 必须带非空 note(什么能改变判定);首判免费,翻转计费(与发帖共享 20/线程预算)。
 4. 回应姿态:每轮最多 2 帖,结论先行、证据具体;已收敛的点不重复表态;resolved 帖不触发任何回应义务。

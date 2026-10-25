@@ -192,6 +192,27 @@ def main():
     check("#79 D: silent-list SHRINK is a new fact (second row, different list)",
           any(re.search(r"\['anna'\]", r) for r in rows), f"rows={rows}")
 
+    # ---------- #79 A6 (GPT PR#6): blocking flips when a pass flips to object ----------
+    # anna is the only floor debtor here (brin's kickoff + cyr's "+" counted);
+    # her debt IS blocking (brin+cyr both pass). cyr flips pass→object ⇒ closing
+    # no longer waits on anna's line ⇒ blocking must drop to false and the floor
+    # wake must disappear (attention back to 0, votes not unanimous).
+    deliver(srv, "anna")
+    body = probe(srv, "anna")
+    check("#79 A6 setup: anna's T1 debt IS blocking while others' votes are all pass",
+          due_tids(body.get("my_comment_due", [])).get(t1) is True,
+          f"due={body.get('my_comment_due')}")
+    out = srv.set_verdict(thread_id=t1, verdict="object", author="cyr",
+                          token=tok["cyr"], note="A6 probe: flip to object")
+    assert out.startswith("Verdict recorded"), out
+    body = probe(srv, "anna")
+    check("#79 A6: pass→object flip demotes the debt to non-blocking and kills the wake",
+          due_tids(body.get("my_comment_due", [])).get(t1) is False
+          and body.get("attention") == 0
+          and body.get("reason") != "awaiting_floor_comment",
+          f"att={body.get('attention')} reason={body.get('reason')} due={body.get('my_comment_due')}")
+    srv.set_verdict(thread_id=t1, verdict="pass", author="cyr", token=tok["cyr"])  # restore (convergence flip, free)
+
     # ---------- #79 A3: bump resets the floor ----------
     srv.bump_revision(thread_id=t1, author="anna", token=tok["anna"])
     h = header(srv, "brin")  # brin commented pre-bump — must owe AGAIN
@@ -222,6 +243,13 @@ def main():
     check("#77 D(可消解): correct token clears the latch (L1.5 may still reject — that is fine)",
           "governance token" not in out and probe(srv, "anna").get("token_blocked", {}) == {},
           f"out={out} tb={probe(srv, 'anna').get('token_blocked')}")
+    # GPT PR#6: the latch clear must NOT clobber other token state — possession
+    # proof clears only the latch; hash/ack survive for immediate reuse.
+    with srv._connect() as conn:
+        m = srv._get_meta(conn, "anna")
+    check("#77 D(副作用边界): latch clear preserves token_hash/acked",
+          bool(m.get("token_hash")) and bool(m.get("token_acked")),
+          f"meta-keys={sorted(m)}")
 
     # ---------- #79 A3b/A4 (deferred so dana stays active through 档B) ----------
     # Suspend dana NOW: age her heartbeat past 24h on the TEST db. A suspended
@@ -255,6 +283,39 @@ def main():
     srv.init_db()  # idempotence: re-init must not append
     check("契约: re-init does not append a second attention_contract row",
           len(audit_rows(db, "attention_contract")) == 1)
+
+    # ---------- GPT PR#6: negative mutations must trip the static assertions ----------
+    import importlib.util as _ilu
+    _root = os.path.dirname(os.path.abspath(__file__))
+    _spec = _ilu.spec_from_file_location("ch", os.path.join(_root, "configs", "check-hooks.py"))
+    ch = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(ch)
+    healthy = {n: open(os.path.join(_root, "configs", n), encoding="utf-8").read()
+               for n in ch.WATCHERS}
+    check("负向: healthy carrier texts pass the static assertions",
+          ch.check_watcher_texts(healthy) == 0)
+    claude = healthy["claude-polling-prompt.txt"]
+    mut = dict(healthy)
+    mut["claude-polling-prompt.txt"] = claude.replace("且该项 blocking=true", "且含该帖")
+    check("负向: dropping the blocking=true narrowing trips the assertion",
+          ch.check_watcher_texts(mut) > 0)
+    mut = dict(healthy)
+    mut["claude-polling-prompt.txt"] = claude.replace(
+        ch._PRIORITY_CHAIN,
+        "token_invalid > awaiting_my_verdict > awaiting_floor_comment"
+        " > mentions_me > new_comments(v2.10)")  # GPT 找到的漏 verdict_stale 原状
+    check("负向: priority chain missing verdict_stale trips the assertion",
+          ch.check_watcher_texts(mut) > 0)
+    mut = dict(healthy)
+    mut["claude-polling-prompt.txt"] = claude.replace(ch._PRIORITY_CHAIN,
+                                                      ch._PRIORITY_CHAIN + "\n" + ch._PRIORITY_CHAIN)
+    check("负向: duplicated priority chain trips the assertion",
+          ch.check_watcher_texts(mut) > 0)
+    mut = dict(healthy)
+    mut["claude-polling-prompt.txt"] = claude.replace(
+        ch._PRIORITY_CHAIN, "优先级 awaiting_my_verdict > mentions_me > new_comments")
+    check("负向: old v2.9 priority line (pre-v2.10 form) trips the assertion",
+          ch.check_watcher_texts(mut) > 0)
 
     print(f"\n{'='*60}\nv2.10 attention signals: {len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
