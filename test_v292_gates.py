@@ -13,6 +13,7 @@ pi #499 pattern). Covers, with CONSTRUCTED timestamps and ids:
   4.  #49 (4)/(6): EPOCH 后缺 floor_wm= 的事件硬挡(floor_wm_missing)；
       EPOCH 首启取 max(常量, 本库 MAX)，meta 只升不降。
   5.  #48 F6: _beat_ok 三条件（次数/间隔/新鲜）；探针与邀请不喂 ring
+      + v2.9.3 票3 (#53): S1 探针、S2/S3 只认交付轮询、通道二、可恢复冷启动。
       （P1 结构：/attention 路径不动 meta.hb）。
   6.  #48 §3/P2: 投递门——创建者欠收他人评论时拒关(reason=creator_delivery_lag)，
       本人评论不计欠账，轮询后自愈。
@@ -121,13 +122,25 @@ def main():
     check("delivery gate blocks (creator has not received others' comments)",
           note and note.startswith("reason=creator_delivery_lag") and st == "open",
           f"note={note} status={st}")
-    # anna 轮询(推水位+喂 beat) → 自愈需 ≤1 节奏:水位写在本事务 recompute 之后,
-    # 第二次轮询的 heartbeat recompute 才看到已更新的投递水位(dsh 预言的自愈节奏)
-    srv.list_comments_since(since="1h", author="anna")
+    # anna 轮询(推水位+喂 beat)。v2.9.3 (#55①, dsh #640)：游标先写、复算后跑 ⇒
+    # **这一次**轮询即自愈（旧序里 recompute 读到的是轮询前的旧游标，这一拍会先撞自己
+    # 一墙、须再等一拍）。第二次轮询只验幂等（不产生第二条 auto_resolve）。
     srv.list_comments_since(since="1h", author="anna")
     with _RO(db) as conn:
         st = conn.execute("SELECT status FROM threads WHERE id=?", (tid,)).fetchone()[0]
-    check("delivery self-heals on creator poll → auto-resolved", st == "resolved", f"status={st}")
+    check("delivery self-heals on the creator's NEXT poll (#55① cursor-before-recompute)",
+          st == "resolved", f"status={st}")
+    srv.list_comments_since(since="1h", author="anna")   # idempotence probe
+    with _RO(db) as conn:
+        n_auto = conn.execute(
+            "SELECT COUNT(*) FROM verdict_events WHERE thread_id=? AND action='auto_resolve'",
+            (tid,)).fetchone()[0]
+        lag_rows = conn.execute(
+            "SELECT COUNT(*) FROM verdict_events WHERE thread_id=?"
+            " AND action='auto_resolve_blocked' AND note LIKE 'reason=creator_delivery_lag%'",
+            (tid,)).fetchone()[0]
+    check("second poll is idempotent (1 auto_resolve, 1 lag row) — #55③",
+          n_auto == 1 and lag_rows == 1, f"auto={n_auto} lag_rows={lag_rows}")
 
     # ---------- 2. 跨修订 ledger 圈定 ----------
     # 三人帖，brin 拨老暂缓；活跃 anna+cyr 全评论，anna 轮询收齐后投 → rev1 ledger 放行
@@ -206,6 +219,283 @@ def main():
     with_rw(db, lambda c: srv.heartbeat_and_recompute(c, "cyr"))
     check("probe path does NOT feed the ring (P1)", ring_of(db, "cyr") == before)
 
+    # ---------- 5b. 票3 (#53): 判据拆开 + 通道二 + 可恢复冷启动 ----------
+    now_utc = datetime.now(timezone.utc)
+    # S1: 新鲜探针单独满足新鲜度（读交付轮询仍是满环）
+    with_probe = {"hb_read": fx.make_ring(), "probe": [now_utc.strftime(fx.FMT)]}
+    ok, why = srv._beat_ok(with_probe)
+    check("票3 S1: a fresh zero-cost probe satisfies freshness", ok, why)
+    # S2/S3: 一旦有 hb_read，旧的 hb（含空转轮询）不再计入次数
+    idle_only = {"hb": fx.make_ring(), "hb_read": fx.make_ring(n=3)}
+    ok, why = srv._beat_ok(idle_only)
+    check("票3 S2/S3: idle polls do not count once hb_read exists",
+          (not ok) and "3/6" in why, why)
+
+    # 真实路径: 只有“读到他人未读评论”的轮询喂 hb_read；随后空转不喂
+    srv.post_comment(thread_id=tid, author="brin", body="delivery for poller")
+    srv.list_comments_since(since="1h", author="cyr")
+    n_read1 = len(meta_of(db, "cyr").get("hb_read") or [])
+    srv.list_comments_since(since="now", author="cyr")
+    srv.list_comments_since(since="now", author="cyr")
+    n_read2 = len(meta_of(db, "cyr").get("hb_read") or [])
+    check("票3 S2: a real read delivery feeds hb_read", n_read1 >= 1, f"n={n_read1}")
+    check("票3 S2: idle polls do not append hb_read", n_read2 == n_read1,
+          f"{n_read1} -> {n_read2}")
+
+    # 通道二: 探针 ≥6/24h + 无未读积压 → 免 S2/S3 建帖
+    with srv.db() as conn:
+        srv._begin_write(conn)
+        srv._touch(conn, "probeonly")
+        conn.commit()
+    with_rw(db, lambda c: srv._set_meta(c, "probeonly", {"probe": fx.make_ring()}))
+    with_rw(db, lambda c: c.execute(
+        "UPDATE participants SET last_delivered_id=(SELECT COALESCE(MAX(id),0) FROM comments)"
+        " WHERE author='probeonly'"))
+    p_ctx = fx.wi("probeonly", "anna", "brin")
+    out = srv.create_thread(title="channel2", author="probeonly",
+                            quorum=["anna", "brin"], context=p_ctx)
+    check("票3 通道二: probe≥6/24h + no backlog bypasses S2/S3",
+          out.startswith("Created thread #"), out[:160])
+    with _RO(db) as conn:
+        chan2 = conn.execute(
+            "SELECT COUNT(*) FROM verdict_events WHERE action='f6_channel2'").fetchone()[0]
+    check("票3 通道二: bypass audited", chan2 >= 1, f"rows={chan2}")
+
+    # 通道二缺口: 有积压 → 拒，且文案是结构化缺口（不含装 watcher/cron 话术）
+    with_rw(db, lambda c: c.execute(
+        "UPDATE participants SET last_delivered_id=0 WHERE author='probeonly'"))
+    out = srv.create_thread(title="channel2-backlog", author="probeonly",
+                            quorum=["anna", "brin"], context=p_ctx)
+    check("票3 通道二: unread backlog still blocks",
+          out.startswith("ERROR") and "未读积压" in out, out[:160])
+    check("票3 拒门文案: structured gaps, no watcher/cron install advice",
+          ("缺口" in out and "最早可过" in out
+           and "watcher(20min)" not in out and "cron(15min)" not in out), out[:200])
+
+    # 冷启动可恢复: 有历史 beat 但近 24h 无心跳 → 放行（不再被 ever_beats 永锁）
+    with srv.db() as conn:
+        srv._begin_write(conn)
+        srv._touch(conn, "returning")
+        conn.commit()
+    old_ring = [(now_utc - timedelta(hours=48) - timedelta(minutes=11 * (6 - i))).strftime(fx.FMT)
+                for i in range(6)]
+    with_rw(db, lambda c: srv._set_meta(
+        c, "returning", {"hb": old_ring, "f6_coldstart_count": 1,
+                          "hb_read": old_ring}))
+    out = srv.create_thread(title="cold-return", author="returning",
+                            quorum=["anna", "brin"],
+                            context=fx.wi("returning", "anna", "brin"))
+    check("票3 冷启动: >24h silence is exempt again (recoverable, ever_beats ignored)",
+          out.startswith("Created thread #"), out[:160])
+    with _RO(db) as conn:
+        cctx = conn.execute("SELECT context FROM threads WHERE author='returning'"
+                            " ORDER BY id DESC LIMIT 1").fetchone()[0]
+    check("票3 冷启动: thread face carries f6_coldstart annotation",
+          "f6_coldstart" in (cctx or ""))
+
+    # ---------- 5c. v2.9.3 #64 迁移恩赦的部署纪元（pi #715 §4 / dsh #716-#718）----------
+    # 缺口: `_read_ts` 的 legacy 回落没有时间上限 —— 只在"无人发帖时轮询"的成员
+    # 可让 G-2 空转刷法复活，窗口长度不是 24h，而是"直到第一次真读"。
+    # 修法: 全局部署纪元 + 成员只复制 + 成员迁移标记(`hb_read_migrated`)。
+    import time as _time
+    ep = int(_time.time())
+    with_rw(db, lambda c: c.execute(
+        "INSERT OR REPLACE INTO meta(key,value) VALUES('f6_read_epoch',?)", (str(ep),)))
+
+    def _now():
+        return datetime.now(timezone.utc)
+
+    RING_KEYS = ("hb", "hb_read", "probe")
+
+    def _shift_ring(author, minutes):
+        """Time travel for one member: push every ring ts back N minutes
+        (real polls are ≥10min apart; the 120s write-dedup would swallow
+        back-to-back polls in a test that runs in one second)."""
+        def fn(c):
+            m = json.loads((c.execute("SELECT meta FROM participants WHERE author=?",
+                                      (author,)).fetchone()[0]) or "{}")
+            for k in RING_KEYS:
+                if isinstance(m.get(k), list):
+                    m[k] = [(datetime.strptime(x, fx.FMT) - timedelta(minutes=minutes))
+                            .strftime(fx.FMT) for x in m[k] if x]
+            srv._set_meta(c, author, m)
+        with_rw(db, fn)
+
+    pre_epoch = [(_now() - timedelta(minutes=m)).strftime(fx.FMT) for m in (400, 380)]
+    with srv.db() as conn:
+        srv._begin_write(conn)
+        srv._touch(conn, "grace")
+        conn.commit()
+    # 老成员: 纪元前的 2 条 hb（真实节奏不足），成员侧纪元 = 全局纪元
+    with_rw(db, lambda c: srv._set_meta(
+        c, "grace", {"hb": pre_epoch, "f6_read_epoch": ep}))
+    for _ in range(6):
+        with_rw(db, lambda c: srv._beat(c, "grace", 0))          # 纪元后 6 次空转
+    n1 = len(srv._read_ts(meta_of(db, "grace"), _now()))
+    ok, why = srv._beat_ok(meta_of(db, "grace"))
+    check("v2.9.3 #64 ①: post-epoch idle polls never count (amnesty bounded by epoch)",
+          n1 == 2, f"n={n1} meta={meta_of(db, 'grace').get('hb_read')}")
+    check("v2.9.3 #64 ①b: gate still says 2/6, not 6/6",
+          (not ok) and "2/6" in why, why)
+
+    # ②③: 首次真读 = 迁移当次；pre-epoch 整环保留 + 本次 1 条不丢
+    with_rw(db, lambda c: srv._beat(c, "grace", 1))
+    m = meta_of(db, "grace")
+    check("v2.9.3 #64 ③: migration keeps pre-epoch ring AND this poll (no lost vote)",
+          len(m.get("hb_read") or []) == 3, f"hb_read={m.get('hb_read')}")
+    check("v2.9.3 #64 ②: first real read cuts the fallback immediately",
+          m.get("hb_read_migrated") is True
+          and len(srv._read_ts(m, _now())) == 3
+          and set(pre_epoch) <= set(m.get("hb_read") or []),
+          f"meta={m}")
+
+    # ④: 纪元后才注册（无 pre-epoch 环）⇒ 不得回落进纪元后的空转 hb
+    with srv.db() as conn:
+        srv._begin_write(conn)
+        srv._touch(conn, "newbie")
+        conn.commit()
+    for _ in range(3):
+        with_rw(db, lambda c: srv._beat(c, "newbie", 0))
+    m2 = meta_of(db, "newbie")
+    check("v2.9.3 #64 ④: empty pre-epoch ring ⇒ _read_ts()==[] (no post-epoch fallback)",
+          m2.get("f6_read_epoch") == ep and srv._read_ts(m2, _now()) == [], f"meta={m2}")
+
+    # ⑤⑥: 迁移只跑一次；空转永不二次导入；C'(标记位)为红-绿点
+    with_rw(db, lambda c: srv._beat(c, "newbie", 1))
+    n3 = len(srv._read_ts(meta_of(db, "newbie"), _now()))
+    for _ in range(6):
+        with_rw(db, lambda c: srv._beat(c, "newbie", 0))
+    n4 = len(srv._read_ts(meta_of(db, "newbie"), _now()))
+    _shift_ring("newbie", 11)
+    with_rw(db, lambda c: srv._beat(c, "newbie", 1))
+    n5 = len(srv._read_ts(meta_of(db, "newbie"), _now()))
+    with _RO(db) as conn:
+        mig = conn.execute(
+            "SELECT COUNT(*) FROM verdict_events WHERE author='newbie'"
+            " AND action='hb_read_migrate'").fetchone()[0]
+    check("v2.9.3 #64 ⑤: one migration, idle re-import impossible (1 → 1 → 2)",
+          (n3, n4, n5) == (1, 1, 2), f"{n3}/{n4}/{n5}")
+    check("v2.9.3 #64 ⑥: migration audited exactly once (hb_read_migrate)",
+          mig == 1, f"rows={mig}")
+
+    # ⑦ (pi #739 / 回 dsh #735 §3-②③): 成员副本的纪元比全局更旧时必须保持**更严**。
+    # 场景 = "日后抬高了常量/全局纪元，而这个成员早已冻结了一份更旧的副本"。
+    # 被否掉的做法: 每次 `_beat` 把副本抬到 max(副本, 全局)。那样迁移上界变成新的
+    # 全局纪元，该成员 24h 内的**空转** hb 全部重新变成 pre-epoch ⇒ 6 次空转即可过
+    # S2/S3（G-2 空转刷法随每次部署复活）。正确行为: 副本一次性冻结，上界取更旧值。
+    frozen_ep = ep - 3600
+    gap_hb = [datetime.fromtimestamp(ep - 1800, timezone.utc).strftime(fx.FMT),
+              datetime.fromtimestamp(ep - 900, timezone.utc).strftime(fx.FMT),
+              "not-a-timestamp"]          # ③ 畸形条目: 必须被丢弃, 不得当 pre-epoch
+    with srv.db() as conn:
+        srv._begin_write(conn)
+        srv._touch(conn, "frozen")
+        conn.commit()
+    with_rw(db, lambda c: srv._set_meta(
+        c, "frozen", {"hb": gap_hb, "f6_read_epoch": frozen_ep}))
+    with_rw(db, lambda c: srv._beat(c, "frozen", 0))       # 空转: 不得抬高副本
+    m3 = meta_of(db, "frozen")
+    check("v2.9.3 #64 ⑦a: older member epoch copy stays frozen (no max() uplift)",
+          m3.get("f6_read_epoch") == frozen_ep, f"epoch={m3.get('f6_read_epoch')}")
+    check("v2.9.3 #64 ⑦b: frozen copy ⇒ post-copy idle beats still don't count",
+          srv._read_ts(m3, _now()) == [], f"read_ts={srv._read_ts(m3, _now())}")
+    with_rw(db, lambda c: srv._beat(c, "frozen", 1))       # 首次真读 ⇒ 迁移
+    m4 = meta_of(db, "frozen")
+    check("v2.9.3 #64 ⑦c: migration bound = the OLDER copy; gap-era hb not imported",
+          len(m4.get("hb_read") or []) == 1
+          and not (set(gap_hb[:2]) & set(m4.get("hb_read") or [])),
+          f"hb_read={m4.get('hb_read')}")
+    check("v2.9.3 #64 ⑦d: malformed hb entry dropped by migration (not kept as pre-epoch)",
+          "not-a-timestamp" not in (m4.get("hb_read") or []),
+          f"hb_read={m4.get('hb_read')}")
+
+    # ⑦e (dsh #740 §2: 抬升支此前没有断言——⑦a-d 都用 INSERT OR REPLACE 写入
+    # ≈now 的值,只走"值不变"那支)。抬升支是治理相关事件(抬高纪元会把尚未冻结
+    # 副本的成员的恩赦上界抬高)⇒ 必须可审计,且只留一条。
+    with_rw(db, lambda c: c.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)",
+        (srv.F6_READ_EPOCH_KEY, "1700000000")))
+    eff1 = with_rw(db, lambda c: srv._read_epoch(c))
+    eff2 = with_rw(db, lambda c: srv._read_epoch(c))   # 第二次: 不得再留一行
+    with _RO(db) as conn:
+        stored = int(conn.execute("SELECT value FROM meta WHERE key=?",
+                                  (srv.F6_READ_EPOCH_KEY,)).fetchone()[0])
+        raise_rows = conn.execute(
+            "SELECT COUNT(*) FROM verdict_events"
+            " WHERE action='f6_read_epoch_raise'").fetchone()[0]
+        raise_note = conn.execute(
+            "SELECT note FROM verdict_events WHERE action='f6_read_epoch_raise'"
+            " ORDER BY id LIMIT 1").fetchone()[0]
+    check("v2.9.3 #64 ⑦e: only-increase branch raises meta, audits once (dsh #740 §2)",
+          (eff1, eff2, stored) == ((srv.F6_READ_EPOCH_CODE,) * 3)
+          and raise_rows == 1
+          and f"have=1700000000" in (raise_note or "")
+          and f"effective={srv.F6_READ_EPOCH_CODE}" in (raise_note or ""),
+          f"eff={eff1}/{eff2} stored={stored} rows={raise_rows} note={raise_note!r}")
+
+    # ---------- 10. v2.9.4 欠票拆两族（_awaiting_split）----------
+    # dsh #769 §4: 拆后两族须**互斥**、并集 = 旧 awaiting 集、attention 仅由可动作
+    # 那族触发；zcode #768 §0-3: 拆分用的等待集必须与 set_verdict 的 L1.5 门**同一实现**
+    # （blocked ⟺ set_verdict 会拒）。否则第二真源漂移，事故形态（读面说欠票、
+    # 门说不能投 ⇒ 空唤三次 ⇒ C1.2 自锁）原地复活。
+    tid4 = mk_thread(srv, "anna", ["anna", "brin", "cyr"], ctx, tok)
+    out = srv.set_verdict(thread_id=tid4, verdict="pass", author="brin", token=tok["brin"])
+    check("v2.9.4 ⑧a: non-creator votes freely (L1.5 is creator-only)",
+          out.startswith("Verdict recorded"), out)
+    with _RO(db) as conn:
+        act_a, blk_a = srv._awaiting_split(conn, "anna")
+        act_b, blk_b = srv._awaiting_split(conn, "cyr")
+        old_awaiting = {
+            r["id"] for r in conn.execute(
+                "SELECT id, quorum FROM threads WHERE status='open'"
+                " AND quorum IS NOT NULL").fetchall()
+            if "anna" in json.loads(r["quorum"])
+            and conn.execute("SELECT 1 FROM verdicts WHERE thread_id=? AND author=?",
+                             (r["id"], "anna")).fetchone() is None
+        }
+    blk_ids = {b["thread_id"] for b in blk_a}
+    check("v2.9.4 ⑧b: creator blocked by L1.5 ⇒ blocked (with waiting_on), NOT actionable",
+          tid4 in blk_ids and tid4 not in act_a
+          and [b for b in blk_a if b["thread_id"] == tid4][0]["waiting_on"] == ["cyr"],
+          f"act={act_a} blk={blk_a}")
+    check("v2.9.4 ⑧c: the two families are disjoint & their union == the old awaiting set",
+          not (set(act_a) & blk_ids) and (set(act_a) | blk_ids) == old_awaiting,
+          f"act={act_a} blk={blk_ids} old={old_awaiting}")
+    check("v2.9.4 ⑧d: non-creator with no verdict is actionable (never blocked)",
+          tid4 in act_b and tid4 not in {b["thread_id"] for b in blk_b},
+          f"act={act_b} blk={blk_b}")
+    out = srv.set_verdict(thread_id=tid4, verdict="pass", author="anna", token=tok["anna"])
+    check("v2.9.4 ⑧e: blocked ⟺ set_verdict rejects (same waiting set, single source)",
+          out.startswith("ERROR") and "[L1.5" in out and "'cyr'" in out, out)
+
+    import asyncio
+
+    class _ProbeReq:
+        def __init__(self, who):
+            self.query_params = {"author": who}
+
+    body = asyncio.run(srv.attention_probe(_ProbeReq("anna"))).args[0]
+    check("v2.9.4 ⑧f: /attention never wakes on a blocked vote (tid absent from threads)",
+          tid4 not in body.get("threads", [])
+          and any(b["thread_id"] == tid4 for b in body.get("blocked_my_verdict", [])),
+          f"reason={body.get('reason')} threads={body.get('threads')} "
+          f"blocked={body.get('blocked_my_verdict')}")
+    out = srv.set_verdict(thread_id=tid4, verdict="pass", author="cyr", token=tok["cyr"])
+    check("v2.9.4 ⑧g: blocking cleared by the waited-on member's vote",
+          out.startswith("Verdict recorded"), out)
+    with _RO(db) as conn:
+        act_a2, blk_a2 = srv._awaiting_split(conn, "anna")
+    check("v2.9.4 ⑧h: creator becomes actionable once the waiting set empties",
+          tid4 in act_a2 and tid4 not in {b["thread_id"] for b in blk_a2},
+          f"act={act_a2} blk={blk_a2}")
+    body = asyncio.run(srv.attention_probe(_ProbeReq("anna"))).args[0]
+    check("v2.9.4 ⑧i: /attention wakes the creator on the then-actionable vote",
+          body.get("reason") == "awaiting_verdict" and tid4 in body.get("threads", []),
+          f"reason={body.get('reason')} threads={body.get('threads')}")
+    out = srv.set_verdict(thread_id=tid4, verdict="pass", author="anna", token=tok["anna"])
+    check("v2.9.4 ⑧j: creator's last vote passes the gate after the split",
+          out.startswith("Verdict recorded"), out)
+
     # ---------- 8. nonce 流 ----------
     tid3 = mk_thread(srv, "anna", ["anna", "brin"], ctx, tok)
     out = srv.request_form_b(thread_id=tid3, author="anna", names=["trae"], token=tok["anna"])
@@ -283,6 +573,11 @@ def latest_blocked(conn, tid):
         "SELECT note FROM verdict_events WHERE thread_id=? AND action='auto_resolve_blocked'"
         " ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
     return r[0] if r else None
+
+def meta_of(db, author):
+    with _RO(db) as conn:
+        r = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
+    return json.loads(r[0]) if r and r[0] else {}
 
 def ring_of(db, author):
     with _RO(db) as conn:

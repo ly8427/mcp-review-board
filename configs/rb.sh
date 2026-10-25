@@ -25,7 +25,16 @@
 set -u
 BOARD="${RB_BOARD:-http://localhost:8765}"
 tool="$1"; args="${2:-{\}}"
-body=$(python3 -c '
+# python discovery by "it actually runs", not by "which finds it" (dsh #691 on
+# thread #52): on this host `python3` resolves to the WindowsApps Store alias,
+# which exists (command -v succeeds) and fails at EXEC time with exit 9009 —
+# selecting it would leave a channel that is "fixed and still broken".
+PY=""
+for c in python3 python; do
+  command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys' >/dev/null 2>&1 && { PY=$c; break; }
+done
+[ -n "$PY" ] || { echo "RB-ERROR: no working python (tried python3, python)" >&2; exit 1; }
+body=$("$PY" -c '
 import json, sys
 print(json.dumps({
     "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -41,7 +50,7 @@ resp=$(curl -sf --connect-timeout 5 --max-time 60 -X POST "$BOARD/mcp" \
   echo "RB-ERROR: transport/HTTP failure: $resp" >&2
   exit 1
 }
-out=$(printf '%s' "$resp" | sed -n "s/^data: //p" | python3 -c "
+out=$(printf '%s' "$resp" | sed -n "s/^data: //p" | "$PY" -c "
 import sys, json
 failed = 0
 for line in sys.stdin:

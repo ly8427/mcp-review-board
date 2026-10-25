@@ -26,7 +26,7 @@ import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 
@@ -202,7 +202,10 @@ SUSPEND_AFTER_HOURS = 24
 
 
 # --- v2 A1: participant registry / heartbeat --------------------------------
-mcp = FastMCP("ReviewBoard", version="2.9.2")  # align serverInfo with pyproject (was: fastmcp lib version)
+# Single source of truth for the served version (v2.9.3 #55: was duplicated in
+# three literals — FastMCP serverInfo, /ping, PROTOCOL header — and drifted).
+PROTOCOL_VERSION = "2.10.0"
+mcp = FastMCP("ReviewBoard", version=PROTOCOL_VERSION)  # align serverInfo with pyproject
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -266,96 +269,379 @@ def _oneline(s: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[:limit] + "…"
 
 
-# --- v2.9.2 F6 (thread #48): heartbeat-rhythm gate --------------------------
-# 发起者必须在场：创建 quorum 帖要求近 24h 的真实轮询节奏（beat 只认
-# list_comments_since 的 author 分支——P1：探针/邀请/写工具都不喂 ring，
-# "从不读票的 cron curl" 造不出心跳）。参数各一处常量（C3/P4 口径单点）。
-BEAT_RING_MAX = 64          # ring 定长（meta["hb"]），防 JSON 无界膨胀
+# --- v2.9.2 F6 / v2.9.3 票3 (thread #53): heartbeat-rhythm gate --------------
+# 票3 把三判据拆开计量（#53 决议对象）：
+#   S1 新鲜度 = 零 LLM 成本探针(/attention)或空闲轮询的最新时间；
+#   S2/S3    = 只认"确实读到他人未读评论"的轮询（堵 G-2 空转六次）；
+#   通道二   = 探针 24h≥6 次 + 最新≤45min + 无未读积压 → 免 S2/S3 建帖；
+#   冷启动   = 近 24h 无任何心跳（可恢复，不再被 ever_beats 永久锁死）。
+# 参数各一处常量（C3/P4 口径单点）。
+BEAT_RING_MAX = 64          # 每个 ring 定长，防 meta JSON 无界膨胀
 BEAT_DEDUP_S = 120          # 写入去重阈值
-F6_BEATS_24H = 6            # 近 24h ≥6 条
+BEAT_READ_KEY = "hb_read"   # 真读到他人未读内容的轮询（S2/S3 唯一来源）
+BEAT_PROBE_KEY = "probe"    # /attention 探针（S1 + 通道二；零 LLM 成本）
+F6_BEATS_24H = 6            # 近 24h ≥6 次读交付轮询（或 ≥6 次探针走通道二）
 F6_GAPS_MIN = 5             # 其中 ≥5 个相邻间隔…
 F6_GAP_S = 600              # …每个 ≥10 分钟
 F6_FRESH_S = 45 * 60        # 最新一条 ≤45 分钟（与 L2 打卡门同一数字）
+# v2.9.3 #64 (thread #64, pi #715 §4 self-reported hole + dsh #716/#718 复核):
+# the legacy `hb` fallback in `_read_ts` was an unbounded "migration amnesty" —
+# a member who never made a read-delivering poll kept feeding S2/S3 from `hb`
+# (appended on EVERY poll, idle included), so the G-2 idle-spin hole could be
+# deferred arbitrarily long and then cashed in on the first real read.
+# Fix = a deployment epoch: only hb entries OLDER than the epoch get amnesty.
+#   F6_READ_EPOCH_KEY   global deploy epoch (meta table, epoch seconds,
+#                       only-increase — same shape as floor_wm_epoch) AND a
+#                       per-member COPY inside participants.meta (never authored
+#                       by the member, never "whoever migrates writes now").
+#   HB_READ_MIGRATED_KEY  per-member marker: the one-time migration already ran.
+#                       Deliberately a marker, not the truthiness of hb_read:
+#                       after epoch truncation an empty hb_read is the NORMAL
+#                       state, so `if not meta.get("hb_read")` would re-run the
+#                       migration on every read poll and re-import post-epoch
+#                       idle beats (dsh #718 §3 / C').
+F6_READ_EPOCH_KEY = "f6_read_epoch"
+HB_READ_MIGRATED_KEY = "hb_read_migrated"
+F6_READ_EPOCH_CODE = 1_792_800_000   # = 2026-10-24T00:00:00Z，首次部署日（不写 0：0 等于
+                           # "没有下界"，日后误配置会静默失效）。生效值 = max(常量, 首启 now)，
+                           # 写入 meta 的是首启时刻本身，此后**冻结**（不随后续启动推进）。
+                           # 口径更正（pi #739 / 回 dsh #735 §3-②，我原注释写反了）：
+                           # 纪元是"恩赦上界"——只有 ts < 纪元 的 hb 条目算迁移恩赦，
+                           # 所以**抬高纪元 = 放宽恩赦**（把 (旧纪元, 新纪元) 之间那些
+                           # 未经验证的轮询重新算成 pre-epoch），最多放宽到 24h 环的容量。
+                           # ⇒ 不要用"抬高纪元"去作废恩赦窗：恩赦窗的唯一出口是部署后
+                           # 24h 自然过期（_ring_ts 只留 24h），本就不需要任何人工动作。
+                           # 常量只在首次部署时给下界；日后抬常量会把所有"从未真读过"
+                           # 的成员的恩赦窗重新打开（G-2 空转刷法复活）——测试
+                           # test_v292_gates ⑦ 把这条钉死（成员副本更旧 = 更严，不是洞）。
+                           # 只升不降保留：仅用于 meta 损坏时的下界（have < 常量 ⇒ 取常量），
+                           # 不能反向把上界降到比首次部署更早。
 
 
-def _beat(conn: sqlite3.Connection, author: str | None) -> None:
-    """Append one heartbeat to the author's ring. Call sites: list_comments_since's
-    author branch ONLY (thread #48 P1 — probes/invites never feed the ring)."""
+def _ring_append(conn: sqlite3.Connection, author: str | None, key: str) -> bool:
+    """Append `now` to one timestamp ring in participants.meta (single write
+    point, C3). Returns False inside the 120s dedup window."""
     if not author:
-        return
+        return False
     row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
     meta = json.loads(row["meta"]) if row and row["meta"] else {}
-    ring = list(meta.get("hb") or [])
+    ring = [x for x in (meta.get(key) or []) if x]
     now = _now_iso()
     if ring:
         try:
             last_t = datetime.strptime(ring[-1], "%Y-%m-%d %H:%M:%S")
             if (datetime.strptime(now, "%Y-%m-%d %H:%M:%S") - last_t).total_seconds() < BEAT_DEDUP_S:
-                return  # dedup window
+                return False  # dedup window
         except ValueError:
             pass
     ring.append(now)
     del ring[:-BEAT_RING_MAX]
-    meta["hb"] = ring
+    meta[key] = ring
     if row:
         conn.execute("UPDATE participants SET meta=? WHERE author=?",
                      (json.dumps(meta, ensure_ascii=False), author))
+    else:
+        conn.execute(
+            "INSERT INTO participants(author, first_seen, last_seen, last_read, meta)"
+            " VALUES(?,?,?,NULL,?)",
+            (author, now, now, json.dumps(meta, ensure_ascii=False)),
+        )
+    return True
+
+
+def _ts_epoch(x: str) -> int | None:
+    """'%Y-%m-%d %H:%M:%S' (UTC) → epoch seconds; None if malformed."""
+    try:
+        return int(datetime.strptime(x, "%Y-%m-%d %H:%M:%S")
+                   .replace(tzinfo=timezone.utc).timestamp())
+    except (ValueError, TypeError):
+        return None
+
+
+def _read_epoch(conn: sqlite3.Connection) -> int:
+    """Global F6 read-epoch, only-increase (mirrors `_floor_wm_epoch`).
+
+    First start after deploy writes NOW (never 0 / never a member's migration
+    moment) — otherwise "the later you migrate, the longer your amnesty" and
+    the hole scales with each member's laziness (dsh #716 ①).
+    """
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (F6_READ_EPOCH_KEY,)).fetchone()
+    now_s = int(time.time())
+    if row is None:
+        eff = max(F6_READ_EPOCH_CODE, now_s)
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)",
+                     (F6_READ_EPOCH_KEY, str(eff)))
+        # NOTE: the note deliberately carries NO wall-clock/ephemeral numbers
+        # (stage6 part B requires byte-identical audit rows across runs); the
+        # effective value lives in meta.f6_read_epoch, the timing in created_at.
+        _audit(conn, "system", "f6_read_epoch_init",
+               note=f"code={F6_READ_EPOCH_CODE} effective_from=meta")
+        return eff
+    try:
+        have = int(row[0])
+    except (TypeError, ValueError):
+        have = 0
+    eff = max(have, F6_READ_EPOCH_CODE)
+    if eff != have:
+        conn.execute("UPDATE meta SET value=? WHERE key=?", (str(eff), F6_READ_EPOCH_KEY))
+        # dsh #740 §2: the only-increase branch is not cosmetic — a raised
+        # epoch widens the amnesty UPPER bound for every member that has not
+        # frozen a copy yet, so "who raised it to what" must be in the audit
+        # table, not stdout only. The note carries DB/compile-time values and
+        # no wall clock, so the row stays byte-identical across runs (stage6
+        # part B). Idempotent: after the UPDATE `eff == have`, so no 2nd row.
+        _audit(conn, "system", "f6_read_epoch_raise",
+               note=f"have={have} code={F6_READ_EPOCH_CODE} effective={eff}")
+        print(f"[f6_read_epoch] meta={have} < code={F6_READ_EPOCH_CODE}; "
+              f"raised to {eff} (only-increase)", flush=True)
+    return eff
+
+
+def _beat(conn: sqlite3.Connection, author: str | None, delivered: int = 0) -> None:
+    """One poll by the author.
+
+    `hb` = presence (S1 freshness; every poll counts, including idle ones).
+    `hb_read` = S2/S3 only: appended when this poll actually delivered unread
+    content from OTHER authors. Probes/invites/writes never call this.
+
+    Upgrade path (票3 + v2.9.3 #64 epoch): the first read-delivering poll after
+    deploy seeds hb_read from the legacy hb ring — but ONLY the part older than
+    the deployment epoch, so old rhythm is not retroactively punished while
+    post-epoch idle beats never enter hb_read. The current poll's own timestamp
+    is appended explicitly: it is >= epoch by construction, so truncation would
+    otherwise drop it (dsh #718 §0-3: that append is a NECESSARY part of the
+    truncation, not a fix for a bug the old code had). The migration is marked
+    (`hb_read_migrated`) so it runs exactly once even when the kept set is empty.
+    """
+    if not author:
+        return
+    epoch = _read_epoch(conn)
+    row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
+    meta = json.loads(row["meta"]) if row and row["meta"] else {}
+    if meta.get(F6_READ_EPOCH_KEY) is None and row:
+        # member-side COPY only, written ONCE and then frozen. Deliberate: the
+        # epoch is an amnesty UPPER bound (only ts < epoch is grandfathered), so
+        # a member copy that is older than a later global value is STRICTER, not
+        # a hole. dsh #735 §3-② proposed `max(copy, global)` here; rejected in
+        # pi #739 — with the bound raised to the new global, an un-migrated
+        # member's whole 24h idle `hb` ring becomes "pre-epoch" again and 6 idle
+        # polls would pass S2/S3 the moment the constant is bumped at a later
+        # deploy (test_v292_gates ⑦ pins the strict behaviour).
+        meta[F6_READ_EPOCH_KEY] = epoch
+        conn.execute("UPDATE participants SET meta=? WHERE author=?",
+                     (json.dumps(meta, ensure_ascii=False), author))
+    _ring_append(conn, author, "hb")
+    if not delivered:
+        return
+    row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
+    meta = json.loads(row["meta"]) if row and row["meta"] else {}
+    if not meta.get(HB_READ_MIGRATED_KEY):
+        try:
+            epoch = int(meta.get(F6_READ_EPOCH_KEY) or epoch)
+        except (TypeError, ValueError):
+            pass
+        legacy = [x for x in (meta.get("hb") or []) if x]
+        # `is not None` (dsh #735 §3-③, accepted): a malformed timestamp is not
+        # "ancient" — `(_ts_epoch(x) or 0)` mapped it to 0 and kept it, so junk
+        # strings entered hb_read (invisible to _ring_ts, but they pushed real
+        # beats out of BEAT_RING_MAX). Dropped here instead.
+        kept = [x for x in legacy
+                if _ts_epoch(x) is not None and _ts_epoch(x) < epoch]
+        now_iso = _now_iso()
+        kept.append(now_iso)
+        meta[BEAT_READ_KEY] = kept[-BEAT_RING_MAX:]
+        meta[HB_READ_MIGRATED_KEY] = True
+        meta[F6_READ_EPOCH_KEY] = epoch
+        conn.execute("UPDATE participants SET meta=? WHERE author=?",
+                     (json.dumps(meta, ensure_ascii=False), author))
+        # Same constraint: no timestamps / epoch value in the note (deterministic
+        # across runs ⇒ stage6 part B invariance holds). 何时 = event created_at.
+        _audit(conn, author, "hb_read_migrate",
+               note=(f"kept_pre_epoch={len(kept) - 1} "
+                     f"dropped_post_epoch={len(legacy) - (len(kept) - 1)} "
+                     f"ring={len(meta[BEAT_READ_KEY])}"))
+        return
+    _ring_append(conn, author, BEAT_READ_KEY)
+
+
+def _probe(conn: sqlite3.Connection, author: str | None) -> None:
+    """Zero-LLM-cost presence from GET /attention (票3 S1 + 通道二)."""
+    _ring_append(conn, author, BEAT_PROBE_KEY)
+
+
+def _ring_ts(meta: dict | None, key: str, now: datetime) -> list[datetime]:
+    """Parsed timestamps of one ring inside the last 24h (malformed skipped)."""
+    out: list[datetime] = []
+    for x in ((meta or {}).get(key) or []):
+        if not x:
+            continue
+        try:
+            t = datetime.strptime(x, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+        if (now - t).total_seconds() <= 86400:
+            out.append(t)
+    return out
+
+
+def _presence_ts(meta: dict | None, now: datetime) -> list[datetime]:
+    """S1 face: any heartbeat (probe, idle poll, read poll), deduped+sorted."""
+    return sorted(set(_ring_ts(meta, "hb", now)
+                      + _ring_ts(meta, BEAT_READ_KEY, now)
+                      + _ring_ts(meta, BEAT_PROBE_KEY, now)))
+
+
+def _read_ts(meta: dict | None, now: datetime) -> list[datetime]:
+    """S2/S3 face.
+
+    Switched by the migration MARKER (and by the mere presence of the `hb_read`
+    key, so hand-written/legacy metas keep working) — not by its truthiness:
+    post-epoch an empty hb_read is normal and must NOT fall back to `hb`.
+    Un-migrated member = legacy `hb` fallback, **bounded by the deployment
+    epoch**: only hb entries strictly older than the epoch count, so the amnesty
+    expires with the 24h window instead of lasting "until the first real read".
+    """
+    meta = meta or {}
+    if meta.get(HB_READ_MIGRATED_KEY) or BEAT_READ_KEY in meta:
+        return _ring_ts(meta, BEAT_READ_KEY, now)
+    hb = _ring_ts(meta, "hb", now)
+    epoch = meta.get(F6_READ_EPOCH_KEY)
+    if epoch is None:
+        return hb                       # pre-v2.9.3 #64 metas (tests/legacy rows)
+    try:
+        e = int(epoch)
+    except (TypeError, ValueError):
+        return hb
+    return [t for t in hb if int(t.timestamp()) < e]
 
 
 def _beat_ok(meta: dict | None, now: datetime | None = None) -> tuple[bool, str]:
-    """Pure predicate (C3 单点口径): S1 fresh + S2 count + S3 spread."""
-    ring = [x for x in ((meta or {}).get("hb") or []) if x]
+    """Pure predicate (C3 单点口径): S1 fresh + S2 count + S3 spread.
+    v2.9.3 票3: S1 accepts probes/idle polls; S2/S3 only read deliveries."""
     now = now or datetime.now(timezone.utc)
-    try:
-        ts = [datetime.strptime(x, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc) for x in ring]
-    except ValueError:
-        return False, "beat ring has malformed entries"
-    ts = [t for t in ts if (now - t).total_seconds() <= 86400]
-    if not ts:
-        return False, "近 24h 无任何轮询记录"
-    stale = (now - ts[-1]).total_seconds()
+    presence = _presence_ts(meta, now)
+    if not presence:
+        return False, "近 24h 无任何心跳(探针/轮询均无)"
+    stale = (now - presence[-1]).total_seconds()
     if stale > F6_FRESH_S:
-        return False, f"最新一次轮询已在 {int(stale // 60)} 分钟前(上限 {F6_FRESH_S // 60})"
+        return False, (f"最新心跳在 {int(stale // 60)} 分钟前(上限 {F6_FRESH_S // 60});"
+                       "下一次零成本探针(/attention)或轮询即可满足 S1")
+    ts = _read_ts(meta, now)
+    if not ts:
+        return False, "近 24h 无'读到他人未读内容'的轮询(S2/S3 只认真读;空转/探针不计)"
     if len(ts) < F6_BEATS_24H:
-        return False, f"近 24h 轮询仅 {len(ts)}/{F6_BEATS_24H} 次"
+        return False, (f"真实读交付轮询 {len(ts)}/{F6_BEATS_24H} 次"
+                       f"(还差 {F6_BEATS_24H - len(ts)} 次;空转轮询不计)")
     gaps = [(b - a).total_seconds() for a, b in zip(ts, ts[1:])]
     big = sum(1 for g in gaps if g >= F6_GAP_S)
     if big < F6_GAPS_MIN:
-        return False, f"轮询间隔不足: 仅 {big}/{F6_GAPS_MIN} 个相邻间隔 ≥{F6_GAP_S // 60} 分钟(一次会话连点不算)"
+        return False, (f"读交付间隔 {big}/{F6_GAPS_MIN} 个相邻间隔 ≥{F6_GAP_S // 60} 分钟"
+                       f"(还差 {F6_GAPS_MIN - big} 个;一次会话连点不算)")
     return True, ""
 
 
-def _f6_creator_gate(conn: sqlite3.Connection, author: str) -> tuple[bool, str, bool]:
-    """v2.9.2 F6 心跳节奏门——create_thread 与 set_quorum(free→quorum 迁移)共用的
-    唯一实现(dsh #516③/pi #518§3：义务不因入口不同而消失)。P1 结构保证：调用点的
-    _touch 只写 last_seen 不写 ring（只有 list_comments_since 写），读到的 ring 是
-    "入场前的真实节奏"，门不会自证。
-    返回 (ok, error_message, coldstart_exempted)；ok=True 时 error 为空串。
-    冷启动豁免(P3)：无任何 beat 且从未建过 quorum 帖 → 一次性放行，meta+审计留痕。
+def _probe_channel(conn: sqlite3.Connection, author: str, pmeta: dict | None,
+                   now: datetime | None = None) -> tuple[bool, list[str], int, int]:
+    """通道二（#53 决议对象）: probe ≥6/24h + fresh + no global backlog.
+    Returns (ok, gap_reasons, probe_count, backlog)."""
+    now = now or datetime.now(timezone.utc)
+    probes = _ring_ts(pmeta, BEAT_PROBE_KEY, now)
+    reasons: list[str] = []
+    if len(probes) < F6_BEATS_24H:
+        reasons.append(f"探针 {len(probes)}/{F6_BEATS_24H} 次(还差 {F6_BEATS_24H - len(probes)})")
+    if not probes:
+        reasons.append("近 24h 无探针记录")
+    elif (now - probes[-1]).total_seconds() > F6_FRESH_S:
+        reasons.append(f"最新探针 {int((now - probes[-1]).total_seconds() // 60)} 分钟前(上限 45)")
+    row = conn.execute(
+        "SELECT last_delivered_id FROM participants WHERE author=?", (author,)
+    ).fetchone()
+    delivered = ((row["last_delivered_id"] if row else 0) or 0)
+    max_id = conn.execute("SELECT COALESCE(MAX(id),0) FROM comments").fetchone()[0]
+    backlog = max(0, int(max_id) - int(delivered))
+    if backlog:
+        reasons.append(f"未读积压 {backlog} 条(last_delivered_id={delivered} < MAX(comments.id)={max_id})")
+    return (not reasons), reasons, len(probes), backlog
+
+
+def _f6_gap_text(conn: sqlite3.Connection, author: str, pmeta: dict | None,
+                 now: datetime | None = None) -> str:
+    """Structured gap message (#53 文案条款): 缺哪条 / 差几次 / 最早何时可过.
+    Deliberately contains NO 'install a watcher/cron' advice."""
+    now = now or datetime.now(timezone.utc)
+    lines = ["ERROR: [F6 心跳节奏门] 缺口如下(票3 #53 判法;本消息只列缺口与最早可过时间):"]
+    presence = _presence_ts(pmeta, now)
+    if presence:
+        stale = int((now - presence[-1]).total_seconds() // 60)
+        lines.append(f"- 新鲜度(S1): 最新心跳 {stale} 分钟前(上限 {F6_FRESH_S // 60})——"
+                     "下一次零成本探针(/attention)或轮询即可满足")
+    else:
+        lines.append("- 新鲜度(S1): 近 24h 无心跳")
+    ts = _read_ts(pmeta, now)
+    big = 0
+    if ts:
+        gaps = [(b - a).total_seconds() for a, b in zip(ts, ts[1:])]
+        big = sum(1 for g in gaps if g >= F6_GAP_S)
+        lines.append(f"- 真实读交付轮询(S2): {len(ts)}/{F6_BEATS_24H} 次"
+                     f"(还差 {max(0, F6_BEATS_24H - len(ts))} 次;仅统计读到他人未读评论的轮询)")
+        lines.append(f"- 相邻间隔(S3): {big}/{F6_GAPS_MIN} 个 ≥{F6_GAP_S // 60} 分钟"
+                     f"(还差 {max(0, F6_GAPS_MIN - big)} 个)")
+    else:
+        lines.append("- 真实读交付轮询(S2/S3): 0/6——空转轮询、探针、写工具均不计数")
+    ok2, reasons2, nprobe, backlog = _probe_channel(conn, author, pmeta, now)
+    lines.append("- 通道二(探针独立放行): " + ("已满足" if ok2 else "; ".join(reasons2)))
+    if ts:
+        need_gaps = max(0, F6_GAPS_MIN - big)
+        eta = max(now, ts[-1] + timedelta(seconds=need_gaps * F6_GAP_S)) if need_gaps else now
+        lines.append(f"最早可过(轮询路): 约 {eta.strftime('%Y-%m-%d %H:%M')} UTC"
+                     f"(还需 {max(0, F6_BEATS_24H - len(ts))} 次读交付轮询, 新间隔 ≥{F6_GAP_S // 60} 分钟)")
+    if not ok2:
+        lines.append(f"通道二需: 探针再 {max(0, F6_BEATS_24H - nprobe)} 次记录"
+                     + (f" 且追平 {backlog} 条积压" if backlog else "")
+                     + " 后即时可过(探针零 LLM 成本)")
+    lines.append("近 24h 无任何心跳者自动走冷启动豁免(可恢复,无需申请)。")
+    return "\n".join(lines)
+
+
+def _f6_creator_gate(conn: sqlite3.Connection, author: str,
+                     context: str | None = None) -> tuple[bool, str, bool]:
+    """v2.9.2 F6 心跳节奏门, v2.9.3 票3 判法——create_thread 与
+    set_quorum(free→quorum 迁移)共用的唯一实现(dsh #516③/pi #518§3)。
+
+    顺序: S1+S2/S3 → 通道二(探针独立放行) → 冷启动(近24h无心跳, 可恢复) → 拒。
+    P1 结构保证: 调用点的 _touch 只写 last_seen 不写 ring, 读到的 ring 是
+    "入场前的真实节奏", 门不会自证。
+    Returns (ok, error_message, coldstart_exempted).
     """
     prow = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
     pmeta = json.loads(prow["meta"]) if prow and prow["meta"] else {}
-    ok, why = _beat_ok(pmeta)
+    now = datetime.now(timezone.utc)
+    ok, _why = _beat_ok(pmeta, now)
     if ok:
         return True, "", False
-    ever_beats = bool(pmeta.get("hb"))
-    created_before = conn.execute(
-        "SELECT 1 FROM threads WHERE author=? AND quorum IS NOT NULL LIMIT 1",
-        (author,),
-    ).fetchone() is not None
-    if (not ever_beats) and (not created_before):
+    # 通道二: 探针独立放行。create_thread 传入 context 时额外核对创建者以
+    # form (a) 申报了唤醒入口（“申报入口与探针记录对应”的服务端可核部分）。
+    cok, creasons, nprobe, _backlog = _probe_channel(conn, author, pmeta, now)
+    if cok and context is not None:
+        undeclared, form_b = _wake_infra_gap([author], context)
+        if undeclared or form_b:
+            cok = False
+            creasons.append("创建者未以 form (a) 申报唤醒入口")
+    if cok:
+        _audit(conn, author, "f6_channel2",
+               note=f"probe {nprobe}/24h + no backlog; S2/S3 bypassed (v2.9.3 #53 通道二)")
+        return True, "", False
+    # 冷启动: 近 24h 无任何心跳(探针/轮询) → 可恢复豁免, 不再看 ever_beats。
+    if not _presence_ts(pmeta, now):
         pmeta["f6_coldstart"] = True
+        pmeta["f6_coldstart_count"] = int(pmeta.get("f6_coldstart_count", 0)) + 1
         conn.execute("UPDATE participants SET meta=? WHERE author=?",
                      (json.dumps(pmeta, ensure_ascii=False), author))
         _audit(conn, author, "f6_coldstart",
-               note="one-time exemption: no beat history, first quorum thread (P3 帖面标注随 context)")
+               note=("recoverable exemption: no heartbeat (probe/poll) in last 24h "
+                     f"(count={pmeta['f6_coldstart_count']}, v2.9.3 #53)"))
         return True, "", True
-    return False, (
-        f"ERROR: [F6 心跳节奏门] {why}。建帖的前提是你将持续在场收票。\n"
-        f"装法: 宿主装 watcher(20min) 或轮询 cron(15min),每轮 list_comments_since "
-        f"author=自己;预热约 75-100 分钟(6 次/相邻间隔≥10 分钟)后可建帖。\n"
-        f"(v2.9.2, thread #48 定案; 冷启动豁免仅首次且已用/不适用)"
-    ), False
+    return False, _f6_gap_text(conn, author, pmeta, now), False
 
 
 # --- v2.9.2 (#49): revision floor watermark ---------------------------------
@@ -406,7 +692,6 @@ def _revision_floor(conn: sqlite3.Connection, thread_id: int) -> tuple[int, bool
 
 
 # --- v2 A2: the protocol ----------------------------------------------------
-PROTOCOL_VERSION = "2.9.2"
 PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 
 ## 成员
@@ -484,20 +769,31 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
   宿主侧冗余门=configs/quorum_guard_hook.py(L2,对装了的宿主生效)。
 
 ## v2.9.2 增补(threads #47/#48/#49 定案)
-- **F6 心跳节奏门**:quorum 帖创建者须近 24h 有真实轮询节奏(≥6 次轮询、≥5 个相邻间隔≥10min、
-  最新≤45min)。beat 只认 list_comments_since 的 author 分支——探针/邀请/写工具不喂 ring(#48 P1:
-  "从不读票的 curl"造不出心跳)。冷启动一次性豁免(无任何 beat 且从未建过 quorum 帖),三处留痕
-  (meta/审计/帖面 f6_coldstart 标注)。拒绝文案带预热时长与装法。统一原则不变:等待集=活跃成员。
+- **F6 心跳节奏门(v2.9.3 票3 #53 落地,取代 #48 原始三判据)**：创建者须近 24h 有在场节奏，
+  但三判据拆开计量：**S1 新鲜度**(最新≤45min)由**零 LLM 成本探针** `GET /attention`(meta.probe)
+  或空闲轮询满足；**S2/S3**(近24h≥6次、≥5个相邻间隔≥10min)**只认“确实读到他人未读评论”的轮询**
+  (meta.hb_read;空转轮询/探针/写工具不计数——堵 G-2 刷法)。**通道二独立放行**：探针 24h ≥6 次记录
+  且最新≤45min、全局水位线无未读积压(`last_delivered_id ≥ MAX(comments.id)`)、创建者以 form(a)
+  申报唤醒入口 → 免 S2/S3 直接建帖(零成本路,给沉默板)。**冷启动豁免可恢复**：近 24h 无任何心跳
+  (探针/轮询均无) → 放行并留痕(meta/审计 f6_coldstart_count/帖面 f6_coldstart),不再被
+  “永不消失的心跳史”永久锁死。一次性迁移：部署后首次读交付轮询把旧 `hb` 环迁入 `hb_read`
+  (不溯及既往)；此后只认交付轮询。拒门文案=**结构化缺口**(缺哪条/差几次/最早何时可过 + 通道二缺口),
+  **不再给“装 watcher(20min)/轮询 cron(15min)”话术**。统一原则不变：等待集=活跃成员。
 - **未来式投递门(#48 §3)**:auto-resolve 前创建者的 last_delivered_id 须≥本帖他人评论最大 id
   (本人评论不计欠账,P2)——装了轮询却不读票的创建者关不了帖;拒关审计 reason=creator_delivery_lag,
-  创建者下次轮询自愈;暂缓创建者跳过。
+  自愈=创建者**该次追平轮询**即自愈(v2.9.3 #55: 轮询内 `_touch`→游标写入→复算,故追平的那一次
+  就带新水位进复算;不是"再下一次");暂缓创建者跳过。
+- **拒关审计去重(v2.9.3 #55③,rev2 口径)**:同一(帖,修订,reason)在**状态未迁移、水位未推进**时
+  最多一条;`delivered`/`max_id` 变化 = 新事实 → **另留一条**;`auto_resolve`/`auto_reopen` 之后重置
+  (reopen 不改 revision,故不能用裸 revision 去重——dsh #667)。
 - **修订边界=comments.id 水位线(#49 A/B)**:bump_revision 同事务采样 MAX(comments.id) 写入事件
   note 固定位 token `floor_wm=`;讨论地板与 wake_ledger 均按 id>水位 判定——秒级时间戳坐标废弃
   (同秒歧义盘上实证)。部署纪元 FLOOR_WM_EPOCH 首启入 meta(取 max(代码常量,本库 MAX(verdict_events.id)),
   只升不降);纪元后事件缺 token 一律硬挡(reason=floor_wm_missing,出口=重发 bump,清票重投属正常代价);
   纪元前旧事件显式回落+审计。**wake_ledger 锚点收紧为行首 `^wake_ledger:`**(无 legacy LIKE 双锚点);
   台账条目按修订圈定;auto_resolve_blocked 审计 note 首字段 reason=<enum>——取值
-  discussion_floor / floor_wm_missing / ledger_unparsable / no_ledger / creator_delivery_lag,全程可区分。
+  discussion_floor / floor_wm_missing / ledger_unparsable / no_ledger / creator_delivery_lag /
+  ledger_entry_missing / ledger_entry_suspicious,全程可区分(去重口径见上一条)。
 - **(b) 成员入场(#47 ①)**:create_thread 仍拒 (b);唯一通道=set_quorum 增员流:request_form_b 生成
   nonce(**仅用户侧交付:服务器日志+data/form_b_nonce.txt;任何工具返回体不含**——dsh:发起者看得见的
   nonce 就是发起者消费得掉的 nonce)→ 用户本人 rb.sh confirm_form_b 消费(一次性、TTL 24h、human_confirm
@@ -518,6 +814,36 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
   quorum 列表/排序键/治理工具返回体一律不含画像;判断画像的真值是内生的,仅供参考。
 - pull-only:画像变化不推送、不进 attention 经济;不可删除/重置(永久行为记录的派生)。
 - **本条款即版本闸**:任何修改都要求 bump 本协议版本——一次公开的审计事件。
+
+## v2.10 增补(threads #77/#79 定案,2026-10-25;attention 信号面两族合并过一次闸——trae #791 增量1)
+- **#79 my_comment_due(评论欠账读面,纯读 C3)**:`/attention` 与轮询 header 均新增
+  `my_comment_due: [{{thread_id, blocking}}]`。判据=复用 `_floor_missing` 的静默集
+  (dsh 绑定①:禁另写判据):open quorum 帖 ∧ 我是活跃成员 ∧ 本修订(id>floor_wm)内无我评论。
+  **blocking=true 仅当"其余活跃成员票已全 pass"**(=关门正等我这一行,pi 绑定①)——
+  只有该子集触发 `reason=awaiting_floor_comment` 唤醒;非阻塞项保留在字段里标
+  `blocking=false`,**不触发唤醒**(A5 防骚扰,#53 成本纪律)。优先级:
+  token_invalid > awaiting_verdict > verdict_stale > awaiting_floor_comment >
+  mentioned > new_comments(pi 绑定②;文案禁投递态断言——服务端算不出)。
+  C1 暂缓成员永不进该集(A3b/claude #477 统一原则);bump 后水位重置,全员(减暂缓)
+  重新欠评论(A3)。审计 `auto_resolve_blocked` 的去重键**含静默名单**(pi #794 §1):
+  名单收缩=新事实=另留一行。
+- **#77 档A token_invalid(可自修唤醒,优先级最高,threads 允许为空)**:成员 meta 无
+  `token_hash` ∧ 是某 open quorum 帖活跃名册成员 ⇒ `attention=1, reason="token_invalid"`
+  (threads=其中本修订未投票且未被 L1.5 挡者)。唤醒动作=成员自己做 claim→落盘→回读→
+  ack 四步(服务端无 hash ⇒ 必可领,即自愈)。**三族互斥**(#77 ③):tokenless 成员的
+  待投票帖从 `awaiting_my_verdict`(actionable 族)carve 进 `token_invalid` 族;
+  `blocked_my_verdict`(L1.5)语义不动;并集=旧 awaiting 集。
+- **#77 档B token_blocked(只读 latch,不唤醒)**:成员 meta 有 `token_hash` ∧
+  最近一次治理调用(set_verdict/bump_revision/set_quorum)因 token 被拒 ⇒ 两读面出现
+  `token_blocked: {{<tid>: {{tier:"manual", since, exit}}}}`;**attention 不因它变 1**,
+  不计唤醒失败。审计 `token_blocked_latched`,note 首字段 `reason=token_unusable`,
+  按(作者,帖,修订)去重(#55③ 口径)。出口=`reset_token(human_override=True)`(同时清
+  latch)或重签窗口到期;**任一次 token 正确的治理调用即清 latch**(正确出示=持有证明,
+  其后即便被 L1.5 拒也与 token 无关)。
+- **版本闸**:本节即 attention 返回契约变更的闸——init_db 每版本写一行
+  `attention_contract` 审计(note 含 reason 全表与 header 键全表),幂等;watcher 文案
+  分支随本批同落:**先评论(my_comment_due 含本帖)再投票**(trae #791 增量2,一次唤醒
+  同时消解两族),脚本内禁止 claim_token 调用(#775 改判 F)。
 """
 
 
@@ -725,6 +1051,24 @@ def init_db() -> None:
                 "INSERT INTO meta(key, value) VALUES('board_instance_id', ?)", bid
             )
         BOARD_INSTANCE_ID = bid[0]
+        # v2.10 (#77/#79, trae #791 增量1): the attention return contract is
+        # version-gated — ONE audit row per protocol version carrying the
+        # FULL merged enum table (both tickets share one gate; per-ticket
+        # rows would make the second deploy read as drift off the first).
+        acv = conn.execute(
+            "SELECT value FROM meta WHERE key='attention_contract_ver'"
+        ).fetchone()
+        if acv is None or acv[0] != PROTOCOL_VERSION:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('attention_contract_ver', ?)",
+                (PROTOCOL_VERSION,),
+            )
+            _audit(conn, "system", "attention_contract", note=(
+                f"version={PROTOCOL_VERSION}"
+                " reasons=token_invalid|awaiting_verdict|verdict_stale"
+                "|awaiting_floor_comment|mentioned|new_comments|idle"
+                " keys=my_comment_due|token_invalid|token_blocked"
+                "|awaiting_my_verdict|blocked_my_verdict"))
 
 
 # --- v2.8 (threads #39/#40): cross-thread full-text search read face ---------
@@ -1149,6 +1493,39 @@ def _audit(conn, author: str, action: str, thread_id: int | None = None,
     )
 
 
+def _audit_blocked_once(conn, thread_id: int, revision: int, reason: str,
+                        note: str) -> bool:
+    """v2.9.3 (thread #55 ③, rev2 口径 from dsh #667/#654): suppress only
+    *redundant* auto_resolve_blocked rows.
+
+    A row is redundant when the previous blocked row for this (thread, revision,
+    reason) is IDENTICAL and no state transition happened in between:
+      - identical note ⇒ no new fact (the old behaviour appended one per
+        heartbeat: thread #53 ev#468/470/472/474);
+      - `delivered=`/`max_id=` changing ⇒ the watermark moved ⇒ new fact ⇒ log;
+      - auto_resolve / auto_reopen in between ⇒ new episode ⇒ log again.
+        (reopen does NOT bump the revision, so deduping on revision alone would
+        swallow the post-reopen block — dsh #667 §3.)
+    Returns True when the row was suppressed.
+    """
+    prev = conn.execute(
+        "SELECT id, note FROM verdict_events WHERE thread_id=? AND revision=?"
+        " AND action='auto_resolve_blocked' AND note LIKE ? ORDER BY id DESC LIMIT 1",
+        (thread_id, revision, f"reason={reason}%"),
+    ).fetchone()
+    if prev is not None:
+        transitioned = conn.execute(
+            "SELECT 1 FROM verdict_events WHERE thread_id=? AND id > ?"
+            " AND action IN ('auto_resolve','auto_reopen') LIMIT 1",
+            (thread_id, prev["id"]),
+        ).fetchone()
+        if not transitioned and prev["note"] == note:
+            return True
+    _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
+           revision=revision, note=note)
+    return False
+
+
 @mcp.tool
 def claim_token(author: str) -> str:
     """Issue (or reissue) your governance token — two-phase (v2.1; v2.3 two-tier acks).
@@ -1276,6 +1653,7 @@ def reset_token(author: str, human_override: bool = False) -> str:
         meta.pop("token_acked", None)
         meta.pop("token_acked_at", None)
         meta.pop("token_issued_at", None)
+        meta.pop("token_blocked", None)  # v2.10 #77: a reset dissolves the latch
         _set_meta(conn, author, meta)
         _audit(conn, author, "token_reset_human", note="human_override reset; next claim issues fresh")
         return (f"Token cleared for '{author}' ({'had one' if had else 'had none'}). "
@@ -1487,14 +1865,16 @@ def create_thread(
                                    note=f"{n}: declared ({m.group(1)}) vs meta.contract ({c}) — 报警不拒(#47 ②)")
             # v2.9.2 F6 (thread #48): heartbeat-rhythm gate on the creator —
             # 与 set_quorum 的 free→quorum 迁移共用同一实现(dsh #516③)。
-            ok, ferr, cold = _f6_creator_gate(conn, author)
+            # v2.9.3 票3: pass context so 通道二 can verify the creator's form (a)
+            # declaration (the server-checkable half of “入口与探针记录对应”).
+            ok, ferr, cold = _f6_creator_gate(conn, author, context=context)
             if not ok:
                 return ferr
             if cold:
                 # P3 冷启动：帖面可见标注（meta/审计留痕在 helper 内）
                 context = (context or "") + (
-                    f"\n[f6_coldstart: creator {author} had no heartbeat history at creation "
-                    f"— one-time exemption, audited (thread #48 P3)]")
+                    f"\n[f6_coldstart: creator {author} had no heartbeat in the last 24h "
+                    f"— recoverable exemption, audited (v2.9.3 #53)]")
             for q in names:
                 # batch 1 (thread #22 #2+#7): pre-declared quorum auto-registers
                 # invitees (last_read=NULL → probe sees attention=1 → watchers
@@ -1600,6 +1980,12 @@ def post_comment(
         )
         cid = cur.lastrowid
         stale_note = _stale_receipt_note(conn, thread_id)
+        # v2.9.3 (thread #55 ②): comments are exactly what satisfies the
+        # discussion floor, yet this call site was missing from the recompute
+        # list — the last floor comment landed and the thread stayed open until
+        # somebody polled. recompute_thread is idempotent (state transitions fire
+        # inside this same txn), so the cost is one indexed pass.
+        recompute_thread(conn, thread_id)
     loc = ""
     if file:
         loc = f" at {file}" + (f":{line}" if line else "")
@@ -1658,6 +2044,9 @@ def reply_comment(comment_id: int, author: str, body: str) -> str:
         )
         cid = cur.lastrowid
         stale_note = _stale_receipt_note(conn, row["thread_id"])
+        # v2.9.3 (thread #55 ②): same invariant trigger as post_comment — a reply
+        # can be the last thing the discussion floor was waiting for.
+        recompute_thread(conn, row["thread_id"])
     return f"Posted reply #{cid} to comment #{comment_id} by {author}.{stale_note}"
 
 
@@ -1907,10 +2296,27 @@ def set_status(
             t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
             if t is None:
                 return f"ERROR: thread #{thread_id} does not exist"
+            prev = t["status"]
+            # v2.9.5（#64 / dsh #784 §2a-b 判）：空转短路提到**所有门与 override 分支之前**。
+            # 空转不需要任何门参与判断；此前它排在票门/终态门/地板之后，于是
+            # resolved→resolved 的重试先撞地板、wontfix→wontfix 先撞终态门——帖其实已关好，
+            # 返回的却是「还开着」形状的错误（dsh #784 D1b/D2b 实测）。
+            # 同一条规则也封掉 override 的幂等缺陷：此前 override 空转每次调用都写一行
+            # human_override（无 prev 比较），与 #577 的 open→open 同型。
+            if prev == status:
+                return (f"Thread #{thread_id} is already '{status}' — no change, "
+                        "no audit row.")
             if human_override:
+                # v2.9.5（#64 / dsh #784 §2c 判「写」）：override 真转移**同时**写两行审计。
+                # 一行 human_override =「人下的令」，一行 status_change =「状态确实变了」。
+                # 此前 override 只写前者 ⇒ 单查 status_change 答不出「谁关的」；活库
+                # 唯一一处 override 实例（#20 / ev#213 zcode wontfix）就是这个空洞。
                 _audit(conn, author, "human_override", thread_id=thread_id,
                        to_v=status, note="gate bypassed by human instruction")
                 conn.execute("UPDATE threads SET status=? WHERE id=?", (status, thread_id))
+                _audit(conn, author, "status_change", thread_id=thread_id,
+                       from_v=prev, to_v=status,
+                       note=f"manual set_status by {author}; human_override=True")
                 return f"Thread #{thread_id} set to '{status}' by {author} (human override)."
             if status == "resolved" and t["quorum"]:
                 names = json.loads(t["quorum"])
@@ -1938,7 +2344,26 @@ def set_status(
                     f"terminal state only the human can revert. Use "
                     f"human_override=True when a human explicitly instructs it."
                 )
+            # v2.9.4（2026-10-24 事故）：手动 resolved **也必须过讨论地板**。
+            # 此前手动路只校验"全量名册的票"，不看"每人是否留过话"；于是自动路
+            # 刚拦下的帖子，换个入口就能关掉，且不留痕（thread #76 实证）。
+            # 出口：让缺评论的成员各留一条（正常路径），或用户显式 human_override（有审计）。
+            if status == "resolved" and t["quorum"]:
+                silent, _why = _floor_missing(conn, thread_id)
+                if silent:
+                    return (
+                        f"ERROR: thread #{thread_id} discussion floor not met — "
+                        f"active members with no comment in this revision: {silent}. "
+                        "Ask each of them for one line (any comment), or use "
+                        "human_override=True when a human explicitly instructs the close."
+                    )
+            # 空转已在函数前部短路（v2.9.5）：审计口径恒为「一次转移一行」，
+            # `who closed it` 的结果集里不会再混进 open→open（#577 那类）。
             conn.execute("UPDATE threads SET status=? WHERE id=?", (status, thread_id))
+            # v2.9.4：状态变更一律留痕（此前成功路径一条审计都不写 ⇒ "谁关的"无从追）
+            _audit(conn, author, "status_change", thread_id=thread_id,
+                   from_v=prev, to_v=status,
+                   note=f"manual set_status by {author}; human_override={bool(human_override)}")
             return f"Thread #{thread_id} set to '{status}' by {author}."
         else:
             cur = conn.execute("UPDATE comments SET status=? WHERE id=?", (status, comment_id))
@@ -1991,26 +2416,20 @@ def set_verdict(
         quorum = json.loads(t["quorum"])
         if author not in quorum:
             return f"ERROR: set_verdict is quorum-only; '{author}' is not in {quorum}"
-        if not _token_ok(conn, author, token):
-            return "ERROR: missing/invalid governance token — claim_token first"
+        _tok_err = _token_gate(conn, author, token, thread_id)
+        if _tok_err:
+            return _tok_err
         # v2.9 L1.5(b) (thread #45 rev2): creator votes LAST — no verdict from
         # the creator while any ACTIVE co-member hasn't voted. Waiting set =
         # ACTIVE members only (claude #477 unified principle: C1-suspended
         # members never permanently block any gate; exits = 留痕放行/C1/human_override).
-        if t["author"] == author and len(quorum) >= 2:
-            voted = {
-                r["author"]
-                for r in conn.execute(
-                    "SELECT author FROM verdicts WHERE thread_id=?", (thread_id,)
-                ).fetchall()
-            }
-            waiting = [n for n in _active_quorum(conn, quorum) if n != author and n not in voted]
-            if waiting:
-                return (
-                    f"ERROR: [L1.5 创建者最后投票] 还有活跃 quorum 成员未投票: {waiting}。"
-                    "先触发他们的 watcher / 等其投票(暂缓成员按 C1 不计等待)。"
-                    "(v2.9, thread #45 rev2 — 禁止创建者抢先定调)"
-                )
+        waiting = _l15_waiting(conn, thread_id, t["author"], quorum, author)
+        if waiting:
+            return (
+                f"ERROR: [L1.5 创建者最后投票] 还有活跃 quorum 成员未投票: {waiting}。"
+                "先触发他们的 watcher / 等其投票(暂缓成员按 C1 不计等待)。"
+                "(v2.9, thread #45 rev2 — 禁止创建者抢先定调)"
+            )
         cur_row = conn.execute(
             "SELECT verdict FROM verdicts WHERE thread_id=? AND author=?",
             (thread_id, author),
@@ -2080,8 +2499,9 @@ def bump_revision(thread_id: int, author: str, token: str | None = None) -> str:
             return f"ERROR: thread #{thread_id} does not exist"
         if t["author"] != author:
             return f"ERROR: bump_revision is creator-only (creator: {t['author']!r})"
-        if not _token_ok(conn, author, token):
-            return "ERROR: missing/invalid governance token — claim_token first"
+        _tok_err = _token_gate(conn, author, token, thread_id)
+        if _tok_err:
+            return _tok_err
         new_rev = (t["revision"] or 1) + 1
         conn.execute("UPDATE threads SET revision=? WHERE id=?", (new_rev, thread_id))
         conn.execute("DELETE FROM verdicts WHERE thread_id=?", (thread_id,))
@@ -2135,8 +2555,9 @@ def set_quorum(
             return f"ERROR: thread #{thread_id} does not exist"
         if t["author"] != author:
             return f"ERROR: set_quorum is creator-only (creator: {t['author']!r})"
-        if not _token_ok(conn, author, token):
-            return "ERROR: missing/invalid governance token — claim_token first"
+        _tok_err = _token_gate(conn, author, token, thread_id)
+        if _tok_err:
+            return _tok_err
         if t["status"] != "open":
             return (
                 f"ERROR: quorum changes are open-thread-only (current: {t['status']}); "
@@ -2339,6 +2760,255 @@ def _active_quorum(conn: sqlite3.Connection, names: list[str]) -> list[str]:
     return active
 
 
+def _l15_waiting(conn: sqlite3.Connection, thread_id: int, creator: str,
+                 quorum: list[str], author: str) -> list[str]:
+    """L1.5 「创建者最后投票」的等待集 —— **唯一实现**（v2.9.4）。
+
+    以前这份算术存在两份：`set_verdict` 的门里一份、`awaiting` 的读面里一份。
+    两份逐字相同但没有机制绑定 ⇒ 日后改一处、另一处就漂移，事故形态
+    （读面说"你欠票"、门说"你不能投"）原地复活（zcode #768 §0-3 的"第二真源"）。
+    现在门与读面都调这一个函数：blocked ⟺ set_verdict 会拒。
+
+    返回 = 必须先投的**活跃**成员（暂缓者不计，C1 统一原则；不除创建者自己
+    ——调用方已保证 author 是 quorum 成员，创建者投过票时等待集自然为空）。
+    非创建者 / 单人名册 ⇒ 空列表（不受 L1.5 约束）。
+    """
+    if creator != author or len(quorum) < 2:
+        return []
+    voted = {
+        r["author"]
+        for r in conn.execute(
+            "SELECT author FROM verdicts WHERE thread_id=?", (thread_id,)
+        ).fetchall()
+    }
+    return [n for n in _active_quorum(conn, quorum) if n != author and n not in voted]
+
+
+def _floor_missing(conn: sqlite3.Connection, thread_id: int) -> tuple[list[str] | None, str | None]:
+    """讨论地板「本修订内活跃成员是否都留过评论」的**唯一实现**（v2.9.4）。
+
+    抽出来的原因（2026-10-24 事故，thread #76）：这条规矩此前只长在自动关帖路径
+    （`recompute_thread`）里，**手动 `set_status('resolved')` 完全不检查**。
+    于是同一件事两个入口、两套标准，且松的那个还不留痕：
+
+      · 15:27:29 自动路正确拦下 `reason=discussion_floor: ['claude','pi','zcode']`；
+      · 随后某个会话走手动路 `set_status('resolved')`——它只校验全量名册的票、
+        不看评论，直接放行；
+      · 而 `set_status` 当时一条审计都不写 ⇒ 事后无人能回答"谁关的、何时关的"。
+
+    返回 (silent, why)：
+      silent 非空 ⇒ 地板未满足（这些活跃成员本修订内无评论）；
+      silent == [] ⇒ 满足；silent is None ⇒ 无法判定（floor_wm 缺失，why 为原因）。
+    """
+    wm, wm_ok, wm_why = _revision_floor(conn, thread_id)
+    if not wm_ok:
+        return None, wm_why
+    row = conn.execute("SELECT quorum FROM threads WHERE id=?", (thread_id,)).fetchone()
+    names = json.loads(row["quorum"]) if row and row["quorum"] else []
+    active = _active_quorum(conn, names)
+    commented = {
+        r["author"]
+        for r in conn.execute(
+            "SELECT DISTINCT author FROM comments WHERE thread_id=? AND id > ?",
+            (thread_id, wm),
+        ).fetchall()
+    }
+    return [n for n in active if n not in commented], None
+
+
+# --- v2.10 (threads #77/#79): attention signal faces -------------------------
+
+def _token_invalid_tids(conn: sqlite3.Connection, author: str) -> list[int]:
+    """档A (#77 ①): threads that WOULD be actionable but the member holds NO
+    token — carved out of _awaiting_split's actionable family so a wake lands
+    on claim→落盘→回读→ack (doable immediately; the server has no hash, so a
+    fresh claim always succeeds) instead of set_verdict (guaranteed rejection
+    BEFORE L1.5 — the signal-vs-action mismatch this ticket kills). Mirrors
+    _awaiting_split's actionable predicate exactly (roster ∧ no verdict ∧ not
+    L1.5-blocked); L1.5-blocked threads stay in the blocked family (pi #775
+    绑定③: blocked semantics unchanged), keeping the three families mutually
+    exclusive with union = the old awaiting set (#77 ③)."""
+    meta = _get_meta(conn, author)
+    if meta and meta.get("token_hash"):
+        return []
+    out: list[int] = []
+    for r in conn.execute(
+        "SELECT id, quorum, author AS creator FROM threads WHERE status='open'"
+        " AND quorum IS NOT NULL"
+    ).fetchall():
+        names = json.loads(r["quorum"])
+        if author not in names:
+            continue
+        if conn.execute(
+            "SELECT 1 FROM verdicts WHERE thread_id=? AND author=? LIMIT 1",
+            (r["id"], author),
+        ).fetchone() is not None:
+            continue
+        if _l15_waiting(conn, r["id"], r["creator"], names, author):
+            continue
+        out.append(r["id"])
+    return out
+
+
+def _active_roster_tids(conn: sqlite3.Connection, author: str) -> list[int]:
+    """Open quorum threads where `author` is on the roster AND currently
+    active (C1) — the membership precondition of the token_invalid wake
+    (#77 ① allows threads=[] while attention still fires: the owed action,
+    claiming a token, is not thread-specific)."""
+    out: list[int] = []
+    for r in conn.execute(
+        "SELECT id, quorum FROM threads WHERE status='open' AND quorum IS NOT NULL"
+    ).fetchall():
+        names = json.loads(r["quorum"])
+        if author in names and author in _active_quorum(conn, names):
+            out.append(r["id"])
+    return out
+
+
+def _comment_due_face(conn: sqlite3.Connection, author: str) -> list[dict]:
+    """#79 A 案: MY floor-comment debt per open quorum thread. The due
+    predicate is `_floor_missing`'s silent list itself (dsh 绑定① — no
+    second arithmetic to drift); the blocking flag adds only pi's subset:
+    closing is waiting on MY line ⇔ every OTHER active member's verdict is
+    pass. Non-blocking entries stay listed with blocking=false and NEVER
+    raise attention (A5 anti-nag, #53 cost discipline). Pure read (C3)."""
+    out: list[dict] = []
+    for r in conn.execute(
+        "SELECT id, quorum FROM threads WHERE status='open' AND quorum IS NOT NULL"
+    ).fetchall():
+        names = json.loads(r["quorum"])
+        if author not in names:
+            continue
+        active = _active_quorum(conn, names)
+        if author not in active:
+            continue  # C1 (A3b/claude #477): suspended members are never nagged
+        silent, _why = _floor_missing(conn, r["id"])
+        if silent is None or author not in silent:
+            continue  # satisfied for me, or floor watermark undeterminable
+        verdicts = {
+            v["author"]: v["verdict"]
+            for v in conn.execute(
+                "SELECT author, verdict FROM verdicts WHERE thread_id=?", (r["id"],)
+            ).fetchall()
+        }
+        others = [n for n in active if n != author]
+        blocking = bool(others) and all(verdicts.get(n) == "pass" for n in others)
+        out.append({"thread_id": r["id"], "blocking": blocking})
+    return out
+
+
+def _token_gate(conn: sqlite3.Connection, author: str, token: str | None,
+                thread_id: int | None = None) -> str | None:
+    """v2.10 (#77): the governance token check WITH both signal faces.
+    Returns None when the token is fine — and clears any standing
+    token_blocked latch (a correct presentation IS proof of possession,
+    even if L1.5 then rejects the call for unrelated reasons). Returns the
+    (textually unchanged) ERROR string otherwise, latching 档B first: a
+    member WITH a hash whose presentation mismatches. 档A (no hash at all)
+    is the token_invalid wake's business, never a latch. Audit
+    token_blocked_latched is deduped per (author, thread, revision) — a
+    repeated rejection on the same revision adds no row (#55③ 口径)."""
+    if _token_ok(conn, author, token):
+        meta = _get_meta(conn, author)
+        if meta.get("token_blocked"):
+            meta.pop("token_blocked", None)
+            _set_meta(conn, author, meta)
+        return None
+    meta = _get_meta(conn, author)
+    if meta and meta.get("token_hash") and thread_id is not None:
+        rev = conn.execute(
+            "SELECT revision FROM threads WHERE id=?", (thread_id,)
+        ).fetchone()
+        rev_n = rev["revision"] if rev else None
+        latch = dict(meta.get("token_blocked") or {})
+        key = str(thread_id)
+        entry = latch.get(key)
+        if not (entry and entry.get("revision") == rev_n):
+            latch[key] = {"since": _now_iso(), "revision": rev_n}
+            meta["token_blocked"] = latch
+            _set_meta(conn, author, meta)
+            _audit(conn, author, "token_blocked_latched", thread_id=thread_id,
+                   revision=rev_n,
+                   note=("reason=token_unusable: meta 有 hash 而出示失配; "
+                         "出口=reset_token(human_override=True) | 正确 token 一次治理调用"))
+    return "ERROR: missing/invalid governance token — claim_token first"
+
+
+def _token_blocked_face(conn: sqlite3.Connection, author: str) -> dict:
+    """档B (#77 ②): READ-ONLY latch face — never raises attention, never
+    counts as a wake failure. Carries the manual-tier exit path: human reset,
+    or the reissue window end (auto-ack 1h / explicit 24h from ack)."""
+    meta = _get_meta(conn, author)
+    latch = (meta or {}).get("token_blocked") or {}
+    window = ""
+    if meta and meta.get("token_acked") and meta.get("token_acked_at"):
+        hours = (AUTO_ACK_REISSUE_HOURS if meta.get("token_acked_via") == "auto"
+                 else REISSUE_AFTER_HOURS)
+        try:
+            ends = datetime.strptime(meta["token_acked_at"], "%Y-%m-%d %H:%M:%S") \
+                + timedelta(hours=hours)
+            window = f" | window_ends_at={ends.strftime('%Y-%m-%d %H:%M:%S')}"
+        except ValueError:
+            pass
+    return {
+        tid: {"tier": "manual", "since": e.get("since"),
+              "exit": f"reset_token(human_override=True){window}"}
+        for tid, e in latch.items()
+    }
+
+
+def _awaiting_split(conn: sqlite3.Connection, author: str) -> tuple[list[int], list[dict]]:
+    """把"我欠的票"拆成两族（v2.9.4 结构性修复，2026-10-24 事故立案）。
+
+    - **actionable（可动作）**：我现在就能投的帖子。
+    - **blocked（被阻塞）**：我欠票，但作为创建者被 L1.5「创建者最后投票」挡住，
+      必须等 `waiting_on` 里的活跃成员先投。
+
+    为什么必须拆：旧实现把两族混成一个 `awaiting` 列表，于是"创建者被门挡住"
+    被当成"待办"——watcher 每 20 分钟唤醒成员去做一件服务器**必然拒绝**的事；
+    三次空唤后 C1.2 判定闹钟失败并自锁，**成员从板上消失，而原因与成员无关**。
+
+    实证（2026-10-24 20:10 / 20:34 / 20:58 三次）：dsh 一次开六张 quorum 帖，
+    唤醒会话的 `set_verdict` 返回 `ERROR: [L1.5 创建者最后投票] ... ['zcode']`，
+    而同一响应里 `awaiting_my_verdict` 恰恰列着那六张票；21:00:39 C1.2 自锁。
+
+    要记住的结构性教训：**信号面自相矛盾时，失败会被记在成员账上。**
+    拆开后：被阻塞 ⇒ 不触发唤醒（不烧钱、不自锁）；阻塞解除（对方投票）后
+    `awaiting` 重新非空 ⇒ 正常唤醒。成员不必绕过去，系统也不必放宽门。
+
+    等待集的算术不在这里重写：与 `set_verdict` 的 L1.5 门共用 `_l15_waiting`
+    （v2.9.4 单源化，zcode #768 §0-3 / dsh #769 §4）。
+    """
+    actionable: list[int] = []
+    blocked: list[dict] = []
+    for r in conn.execute(
+        "SELECT id, quorum, author FROM threads WHERE status='open' AND quorum IS NOT NULL"
+    ).fetchall():
+        quorum = json.loads(r["quorum"])
+        if author not in quorum:
+            continue
+        if conn.execute(
+            "SELECT 1 FROM verdicts WHERE thread_id=? AND author=? LIMIT 1", (r["id"], author)
+        ).fetchone() is not None:
+            continue
+        waiting = _l15_waiting(conn, r["id"], r["author"], quorum, author)
+        if waiting:
+            blocked.append({"thread_id": r["id"], "waiting_on": waiting})
+        else:
+            actionable.append(r["id"])
+    # v2.10 (#77 ③): tokenless carve — keep the wake families mutually
+    # exclusive. A member with NO token cannot cast the owed vote anyway
+    # (set_verdict rejects on token BEFORE L1.5); waking them on it is the
+    # very signal-vs-action mismatch this ticket kills. The carved tids
+    # surface as reason=token_invalid (wake = claim 四步, doable now);
+    # blocked (L1.5) semantics are UNCHANGED (pi #775 绑定③).
+    meta = _get_meta(conn, author)
+    if not (meta and meta.get("token_hash")):
+        ti = set(_token_invalid_tids(conn, author))
+        actionable = [t for t in actionable if t not in ti]
+    return actionable, blocked
+
+
 def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
     """The one invariant enforcer. Called at the end of every author-carrying
     write transaction (claude #48-3 universal mechanism) and from the
@@ -2347,11 +3017,18 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
 
     resolved ⟺ ALL *active* quorum verdicts pass AND ≥2 active members.
     - open + (all active pass, ≥2)         → auto-resolve with tally
-    - resolved + standing object (incl. one
-      restored by an unfreeze, C')          → reopen, reason recorded
+    - resolved + standing object by an ACTIVE member (incl. one restored by an
+      unfreeze, C')                         → reopen, reason recorded
     - resolved + zero verdicts (revision
       bump cleared them)                    → reopen (needs re-vote)
     - wontfix                               → terminal, skipped
+
+    v2.9.3 (thread #55 follow-up): a FROZEN objector's object does NOT reopen —
+    the resolve stands while it is suspended, and reopens on its own return
+    (unfreeze ⇒ back in `active`). Before v2.9.3 the resolved-branch looked at
+    the full roster; that was harmless only because nothing recomputed between
+    the resolve and the objector's return. With comment-triggered recompute
+    (#55②) it made every heartbeat flap resolve↔reopen.
     """
     t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
     if t is None or not t["quorum"] or t["status"] == "wontfix":
@@ -2369,25 +3046,18 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
             # v2.9 L1.5(a) discussion floor (thread #45 rev2) + v2.9.2 #49 A:
             # 修订边界 = comments.id 水位线（bump 事件固定位 token；同秒歧义
             # 已被 dsh 盘上实证，时间戳坐标废弃）。
-            wm, wm_ok, wm_why = _revision_floor(conn, thread_id)
-            if not wm_ok:
-                _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
-                       revision=t["revision"],
-                       note=f"reason=floor_wm_missing: {wm_why}; 出口=新码下重发 bump_revision"
-                            f"(清票重投,正常但昂贵,勿当卡死反复重试 — #511)")
+            # v2.9.4: 判据抽成 _floor_missing（与手动关帖共用同一实现）
+            silent, wm_why = _floor_missing(conn, thread_id)
+            if silent is None:
+                _audit_blocked_once(
+                    conn, thread_id, t["revision"], "floor_wm_missing",
+                    f"reason=floor_wm_missing: {wm_why}; 出口=新码下重发 bump_revision"
+                    f"(清票重投,正常但昂贵,勿当卡死反复重试 — #511)")
                 return
-            commented = {
-                r["author"]
-                for r in conn.execute(
-                    "SELECT DISTINCT author FROM comments WHERE thread_id=? AND id > ?",
-                    (thread_id, wm),
-                ).fetchall()
-            }
-            silent = [n for n in active if n not in commented]
             if silent:
-                _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
-                       revision=t["revision"],
-                       note=f"reason=discussion_floor: {silent} 活跃成员本修订内无评论(先评论后判定)")
+                _audit_blocked_once(
+                    conn, thread_id, t["revision"], "discussion_floor",
+                    f"reason=discussion_floor: {silent} 活跃成员本修订内无评论(先评论后判定)")
                 return
             suspended = [n for n in names if n not in active]
             # v2.9.2 §3 (thread #48): future-tense delivery gate — the creator
@@ -2414,10 +3084,13 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
                         (thread_id, t["author"],)
                     ).fetchone()[0]
                     if (crow["last_delivered_id"] or 0) < maxid:
-                        _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
-                               revision=t["revision"],
-                               note=f"reason=creator_delivery_lag: delivered={crow['last_delivered_id'] or 0}"
-                                    f" < max_id={maxid}; 自愈=创建者下次轮询(#48 §3)")
+                        # v2.9.3 (#55): "自愈=创建者下次轮询" is now literally
+                        # true — the cursor is written BEFORE this recompute, so
+                        # the creator's next poll lands a current watermark.
+                        _audit_blocked_once(
+                            conn, thread_id, t["revision"], "creator_delivery_lag",
+                            f"reason=creator_delivery_lag: delivered={crow['last_delivered_id'] or 0}"
+                            f" < max_id={maxid}; 自愈=创建者下次轮询(游标先写后复算, #55)")
                         return
             # v2.9 wake_ledger gate (dsh R3): resolving while quorum members
             # sit suspended requires the creator's ledger of wake attempts —
@@ -2425,27 +3098,32 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
             if suspended:
                 ok, missing = _wake_ledger_ok(conn, thread_id, t["author"], suspended)
                 if not ok:
-                    _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
-                           revision=t["revision"],
-                           note=f"{'; '.join(missing)} (timeout/error 过门;缺条/not-attempted/suspicious 不过;"
-                                f"锚点=^wake_ledger: 行首;#511 枚举不合并)")
+                    _note = (f"{'; '.join(missing)} (timeout/error 过门;"
+                             f"缺条/not-attempted/suspicious 不过;"
+                             f"锚点=^wake_ledger: 行首;#511 枚举不合并)")
+                    # Dedupe key = the reason enum the note already carries
+                    # (no_ledger / ledger_unparsable / floor_wm_missing), or the
+                    # per-member split ledger_entry_missing / _suspicious.
+                    _key = "ledger_entry_suspicious" if "suspicious" in _note \
+                        else "ledger_entry_missing"
+                    if _note.startswith("reason="):
+                        _key = _note[7:].split(":", 1)[0].split("(", 1)[0].strip()
+                    _audit_blocked_once(conn, thread_id, t["revision"], _key, _note)
                     return
             tally = " · ".join(f"{n} pass" for n in active)
             conn.execute("UPDATE threads SET status='resolved' WHERE id=?", (thread_id,))
             _audit(conn, "system", "auto_resolve", thread_id=thread_id,
                    revision=t["revision"], note=f"active quorum unanimous: {tally}")
     elif t["status"] == "resolved":
-        standing = [n for n in names if verdicts.get(n) == "object"]
+        # Only an ACTIVE objector can reopen (v2.9.3 #55): a suspended member's
+        # object stays frozen until that member returns.
+        standing = [n for n in active if verdicts.get(n) == "object"]
         if standing:
-            reason = (
-                "frozen object re-stood after suspension lift (C', unbilled)"
-                if any(n not in active for n in standing) or len(active) < len(names)
-                else "object recorded"
-            )
             conn.execute("UPDATE threads SET status='open' WHERE id=?", (thread_id,))
             _audit(conn, "system", "auto_reopen", thread_id=thread_id,
                    revision=t["revision"],
-                   note=f"standing object by {standing} ({reason})")
+                   note=f"standing object by {standing} (active objector; "
+                        f"frozen-at-resolve objects reopen only on unfreeze, C')")
         elif not verdicts:
             conn.execute("UPDATE threads SET status='open' WHERE id=?", (thread_id,))
             _audit(conn, "system", "auto_reopen", thread_id=thread_id,
@@ -2466,7 +3144,8 @@ def heartbeat_and_recompute(conn: sqlite3.Connection, author: str) -> None:
     ).fetchall()
     for r in rows:
         # 创建者的帖也在列（dsh #516② 同根：out-of-quorum 创建者是本板常态
-        # (#51 形态)——门的出口"自愈=创建者下次轮询"要求创建者的轮询能够
+        # (#51 形态)——门的出口"自愈=创建者下次轮询"(v2.9.3 #55 起字面成立)
+        # 要求创建者的轮询能够
         # 触达自己创建的帖，否则该出口对 #51 形态根本不存在。
         if author in json.loads(r["quorum"]) or r["author"] == author:
             recompute_thread(conn, r["id"])
@@ -2595,19 +3274,34 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
             # over truncated timestamps; the old "no swallow race" note
             # assumed sub-second precision the format never had).
             # C1.1 shared heartbeat path (+ C' unfreeze recompute inside this
-            # txn), cursor advance last; the fetch above already fixed delivery.
-            # last_read keeps its legacy wall-clock semantics for old watcher
-            # kits — C3's single write point is unchanged (still only this
-            # call writes either column).
-            heartbeat_and_recompute(conn, author)
-            # v2.9.2 F6 (thread #48 P1): the ONE beat write point — only a real
-            # poll feeds the ring; probes/invites/writes never do.
-            _beat(conn, author)
+            # txn). last_read keeps its legacy wall-clock semantics for old
+            # watcher kits — C3's single write point is unchanged (still only
+            # this call writes either column).
+            #
+            # v2.9.3 (thread #55 ①, dsh #640: ordering defect) — CURSOR FIRST,
+            # RECOMPUTE SECOND. recompute_thread's future-tense delivery gate
+            # reads participants.last_delivered_id; with the old order (recompute
+            # first, cursor last) every catch-up poll evaluated the gate against
+            # the PREVIOUS cursor and therefore blocked itself
+            # (reason=creator_delivery_lag: delivered=old < max_id). Same txn,
+            # so the reorder is atomic; the fetch above already fixed delivery.
+            # _touch must stay in front: the UPDATE below is a no-op for a
+            # never-registered author (regression caught by test_v2_stage8/9).
+            _touch(conn, author)
             conn.execute(
                 "UPDATE participants SET last_read=?, last_delivered_id=?"
                 " WHERE author=?",
                 (snapshot, watermark, author),
             )
+            heartbeat_and_recompute(conn, author)
+            # v2.9.2 F6 (thread #48 P1): the ONE beat write point — only a real
+            # poll feeds the rings; probes/invites/writes never do.
+            # v2.9.3 票3 (#53): S2/S3 only count polls that actually delivered
+            # unread content from OTHERS (id > previous cursor). Rows returned
+            # by the display window may repeat already-delivered comments, and
+            # a member's own comment is not a delivery — neither feeds hb_read.
+            new_from_others = sum(1 for r in rows if r["id"] > cursor_id and r["author"] != author)
+            _beat(conn, author, delivered=new_from_others)
     mentions = []
     if author:
         mentions = [
@@ -2621,27 +3315,33 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
             "SELECT COUNT(*) FROM threads WHERE status='open'"
         ).fetchone()[0]
         if author:
-            # D2: open ∧ 非 wontfix ∧ quorum ∧ no verdict on current revision ∧
-            # active. The caller just heartbeated above (order condition,
-            # claude #52-3) so is_active(author) holds by construction here.
-            awaiting = [
-                r["id"]
-                for r in conn.execute(
-                    "SELECT id, quorum FROM threads WHERE status='open' AND quorum IS NOT NULL"
-                ).fetchall()
-                if author in json.loads(r["quorum"])
-                and conn.execute(
-                    "SELECT 1 FROM verdicts WHERE thread_id=? AND author=? LIMIT 1",
-                    (r["id"], author),
-                ).fetchone() is None
-            ]
+            # D2: open ∧ 非 wontfix ∧ quorum ∧ no verdict on current revision ∧ active.
+            # v2.9.4 结构性修复：拆成 可动作 / 被 L1.5 阻塞 两族（见 _awaiting_split）。
+            # 旧实现在这里把"创建者被门挡住"也列进待办，导致 watcher 反复唤醒却
+            # 只能拿到拒绝，三次后 C1.2 自锁（2026-10-24 实证）。
+            awaiting, blocked_verdict = _awaiting_split(conn, author)
+            # v2.10 (#77/#79)：与 /attention 同源的三张读面（纯读，C3）。
+            ti_tids = _token_invalid_tids(conn, author)
+            due_face = _comment_due_face(conn, author)
+            tb_face = _token_blocked_face(conn, author)
         else:
             awaiting = "not_implemented"
+            blocked_verdict = []
+            ti_tids, due_face, tb_face = [], [], {}
     needs = {
         "new_comments": len(rows),
         "mentions_me": mentions,
         "awaiting_my_verdict": awaiting,
+        # 我欠但投不了的票：列出我在等谁。**不触发唤醒**（避免空唤烧钱+自锁），
+        # 但让成员知道该去催谁（协议 §W peer 唤起）。
+        "blocked_my_verdict": blocked_verdict,
         "open_threads": open_threads,
+        # v2.10 #79：我欠的评论（含 blocking 标记；非阻塞项不触发唤醒，A5 防骚扰）。
+        "my_comment_due": due_face,
+        # v2.10 #77 档A：无 token 时被 carve 出 awaiting 的待投票帖（唤醒动作=claim 四步）。
+        "token_invalid": ti_tids,
+        # v2.10 #77 档B：只读 latch，不触发唤醒。
+        "token_blocked": tb_face,
     }
     header = "needs_attention: " + json.dumps(needs, ensure_ascii=False)
     if not rows:
@@ -3351,7 +4051,7 @@ async def ping(request: Request):
     carries the search capability face (in-memory startup state only)."""
     return JSONResponse({
         "status": "ok",
-        "version": "2.9.2",
+        "version": PROTOCOL_VERSION,
         "search": {"enabled": SEARCH_STATE["enabled"],
                    "reason": SEARCH_STATE["reason"],
                    "sqlite": SEARCH_STATE["sqlite"]},
@@ -3445,6 +4145,10 @@ async def attention_probe(request: Request):
     try:
         with db() as conn:
             heartbeat_and_recompute(conn, author)
+            # v2.9.3 票3 (#53): the probe is a zero-LLM-cost presence signal —
+            # it feeds S1 freshness and the channel-2 probe ring, never the
+            # read-delivery ring (S2/S3 stay proof-of-read).
+            _probe(conn, author)
         with _connect() as conn:
             row = conn.execute(
                 "SELECT last_read, last_delivered_id FROM participants WHERE author=?",
@@ -3459,13 +4163,17 @@ async def attention_probe(request: Request):
                 ).fetchall()
                 if author in json.loads(r["quorum"])
             ]
-            awaiting = [
-                tid for tid in open_quorum
-                if conn.execute(
-                    "SELECT 1 FROM verdicts WHERE thread_id=? AND author=? LIMIT 1",
-                    (tid, author),
-                ).fetchone() is None
-            ]
+            # v2.9.4 结构性修复：可动作 / 被 L1.5 阻塞 两族分开（见 _awaiting_split）。
+            # **attention 只由可动作项触发**——否则创建者会被"自己投不了的票"反复唤醒。
+            awaiting, blocked_verdict = _awaiting_split(conn, author)
+            # v2.10 (#77/#79): the two new read-only faces + the carve source.
+            ti_tids = _token_invalid_tids(conn, author)
+            due_face = _comment_due_face(conn, author)
+            floor_blocking = [e["thread_id"] for e in due_face if e["blocking"]]
+            tb_face = _token_blocked_face(conn, author)
+            _mrow = _get_meta(conn, author)
+            token_fire = (not (_mrow and _mrow.get("token_hash"))
+                          and (bool(ti_tids) or bool(_active_roster_tids(conn, author))))
             # v2.5 (thread #33): the holder's OWN continued posting over a standing
             # object wakes them to reconsider — priority BELOW awaiting_verdict
             # (an uncast vote outranks a stale one), ABOVE mentions/new_comments.
@@ -3505,10 +4213,14 @@ async def attention_probe(request: Request):
             mention_threads = sorted(
                 {r["thread_id"] for r in undelivered if _mentioned(r["body"], author)}
             )
-        if awaiting:
+        if token_fire:
+            reason, threads = "token_invalid", ti_tids
+        elif awaiting:
             reason, threads = "awaiting_verdict", awaiting
         elif stale_self:
             reason, threads = "verdict_stale", stale_self
+        elif floor_blocking:
+            reason, threads = "awaiting_floor_comment", floor_blocking
         elif mention_threads:
             reason, threads = "mentioned", mention_threads
         elif undelivered:
@@ -3522,6 +4234,18 @@ async def attention_probe(request: Request):
             "open_threads": open_quorum,
             "budget": budget_face,
             "my_verdicts": my_state,
+            # v2.9.4：我欠票但被 L1.5 挡住的那些帖，附"在等谁"。**不参与 attention 判定**
+            # （不触发唤醒、不烧钱），只作为可见事实供成员去催票（协议 §W peer 唤起）。
+            "blocked_my_verdict": blocked_verdict,
+            # v2.10 #79：我欠的评论欠账（判据复用 _floor_missing，禁另写算术）。
+            # blocking=true ⇒ 关门正在等我这一行（其余活跃票已全 pass）——只有该
+            # 子集触发 reason=awaiting_floor_comment；非阻塞项只列出不唤醒（A5）。
+            "my_comment_due": due_face,
+            # v2.10 #77 档A：无 token 时被 carve 出 awaiting 的待投票帖（threads 允许
+            # 为空——欠的动作是 claim 四步，不专属于某帖）。
+            "token_invalid": ti_tids,
+            # v2.10 #77 档B：只读 latch——**不因它置 attention=1**，不计唤醒失败。
+            "token_blocked": tb_face,
             # thread #31 batch A: effective cutoff (NULL→epoch sentinel, the same
             # value the probe itself uses above) for the watcher delivery judgment
             # (delivered = fingerprint moved OR last_read advanced). Advanced ONLY

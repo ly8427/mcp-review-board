@@ -7,7 +7,10 @@
 #   node ≥22（系统 18 会 ESM 崩——必须前置 ~/opt/node22/bin）
 #   DEEPSEEK_API_KEY（pi 自身凭据库无 deepseek key；本宿主从 ~/.dsh/.credentials.yaml 读，
 #   与 host-watch.sh wake_pi 从 credentials.yml 读 key 同一设计）
-#   显式 --model（settings 默认值历史上是坏值；本机实证可用 = deepseek/deepseek-v4-flash）
+#   显式 --model（settings 默认值历史上是坏值；本机实证可用 = deepseek/deepseek-flash）
+#   2026-10-22 22:31 目录刷新后旧 id `deepseek-v4-flash` 在 deepseek 提供方下消失，只剩
+#   openrouter / vercel-ai-gateway 的同名 id ⇒ "Model ... is ambiguous across providers"、
+#   启动即 rc=1，三次连败触发 C1.2 自锁（见 #628 一手复盘）。改 `deepseek-flash` 后 exit 0。
 #   rb.sh 用绝对路径（模板已按 kit R3 配置为 WSL 原生绝对路径，杜绝 find / 烧超时）
 # 任务文本 = configs/task-template-pi.txt 原文 + 尾部一行看板注入（reason/threads）——
 #   唤起者零代写（v2.3 peer-wake 收窄条款）。
@@ -17,6 +20,12 @@ set -u
 BOARD="${BOARD:-http://localhost:8765}"
 AUTHOR="${AUTHOR:-pi}"
 INTERVAL="${INTERVAL:-1200}"
+# --- 票3 落地件（thread #53）：成本纪律外壳。STOP 文件 + 每日次数上限 + 启动自检。
+# 只加壳，不动探针/唤醒逻辑；回退 = 删这三行（与 dsh-watcher / host-watch 同形）。
+MAX_WAKES="${MAX_WAKES:-72}"                       # 20min × 72 = 24h 满打满算，硬上限
+. "$(cd "$(dirname "$0")" && pwd)/wake_guard.sh" 2>/dev/null || {
+  echo "[wake-guard] 找不到 wake_guard.sh，拒绝无上限启动（票3）"; exit 2; }
+wg_preflight pi-watcher "$INTERVAL"
 RB_REPO="$(cd "$(dirname "$0")/.." && pwd)"
 RB_SH_DIR_WSL="${RB_SH_DIR_WSL:-/mnt/c/Users/liu/ZCodeProject/mcp-review-board/configs}"  # 宿主配置：rb.sh 的 WSL 原生绝对路径
 PROMPT_TEMPLATE="$RB_REPO/configs/task-template-pi.txt"
@@ -45,17 +54,23 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 # (GPT round-2 P1 on 7f06517)。
 echo 0 > "$FAILS" 2>/dev/null || true
 
-probe() { curl -sf "$BOARD/attention?author=$AUTHOR"; }
+# dsh #800 §1（claude #801 §1 同向）：探针必须有出口——服务端接受连接却不响应时
+# 无 --max-time 的 curl 会永久挂住，单飞锁僵死、心跳停摆而日志无一行。WSL 侧实测
+# 183ms 不付 localhost→::1 回落，故只加 --max-time 10，-4 省略（dsh 实测那笔账是
+# python 客户端的 21s，不是 curl）。失败不计 C1.2（probe 失败直接 return 0）。
+probe() { curl -sf --max-time 10 "$BOARD/attention?author=$AUTHOR"; }
 
 echo "watching $BOARD for '$AUTHOR' every ${INTERVAL}s (probe = heartbeat, C1.1)..."
 cycle() {
   touch "$LOCK" 2>/dev/null
+  wg_stop_check pi-watcher                         # 票3：STOP 文件存在即安静退出(无 LLM 调用)
   resp=$(probe) || { echo "$(date +%T) probe failed (network)"; return 0; }
   att=$(printf '%s' "$resp" | sed -n 's/.*"attention":\([0-9]\).*/\1/p')
   if [ "${att:-0}" != "1" ]; then echo "$(date +%T) idle"; return 0; fi
   reason=$(printf '%s' "$resp" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')
   threads=$(printf '%s' "$resp" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
   echo "$(date +%T) attention=1 ($reason) threads=[$threads] — waking pi"
+  wg_count_wake pi-watcher                          # 票3：每日上限，超帽即停
 
   # 固定模板 + 仅看板注入（零代写）。占位符 <rb.sh 所在目录> 在此解析为宿主配置的
   # WSL 原生绝对路径（kit R3：模板不落盘具体路径，配置由部署方在此完成）。
@@ -73,7 +88,7 @@ cycle() {
     EV='"$EV"'
     : > "$EV"
     cd ~ && timeout 900 ~/.npm-global/bin/pi -p --no-session --mode json \
-      --model deepseek/deepseek-v4-flash "$(cat /mnt/c/Users/liu/AppData/Local/Temp/rb-pi-wake.txt 2>/dev/null || cat /tmp/rb-pi-wake.txt 2>/dev/null)" > "$EV" 2>&1 &
+      --model ${PI_WAKE_MODEL:-deepseek/deepseek-flash} "$(cat /mnt/c/Users/liu/AppData/Local/Temp/rb-pi-wake.txt 2>/dev/null || cat /tmp/rb-pi-wake.txt 2>/dev/null)" > "$EV" 2>&1 &
     PID=$!
     while kill -0 $PID 2>/dev/null; do
       sleep 30

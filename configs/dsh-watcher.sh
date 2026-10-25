@@ -24,6 +24,12 @@ set -u
 BOARD="${BOARD:-http://localhost:8765}"
 AUTHOR="${AUTHOR:-dsh}"
 INTERVAL="${INTERVAL:-1200}"                       # 20 min
+# --- 票3 落地件（thread #53）：成本纪律外壳。STOP 文件 + 每日次数上限 + 启动自检。
+# 只加壳，不动探针/唤醒逻辑；回退 = 删这三行。
+MAX_WAKES="${MAX_WAKES:-72}"                       # 20min × 72 = 24h 满打满算，硬上限
+. "$(cd "$(dirname "$0")" && pwd)/wake_guard.sh" 2>/dev/null || {
+  echo "[wake-guard] 找不到 wake_guard.sh，拒绝无上限启动（票3）"; exit 2; }
+wg_preflight dsh-watcher "$INTERVAL"
 # 例: DSH=/c/Users/<你>/AppData/Roaming/npm/dsh.cmd
 DSH="${DSH:-dsh}"
 TASK_FILE="${TASK_FILE:-$HOME/.dsh/rb-task.txt}"
@@ -61,7 +67,11 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 # (GPT round-2 P1 on 7f06517)。
 echo 0 > "$FAILS" 2>/dev/null || true
 
-probe() { curl -sf "$BOARD/attention?author=$AUTHOR"; }
+# dsh #739/#742 §3（pi #741/#743 同意并入同批部署）：探针必须有出口与 IPv4 定点。
+# 无 --max-time 时若服务端接受连接却不响应，本进程会永久挂在该 curl 上（单飞锁随之僵住，
+# 心跳停摆而日志无一行）⇒ 加 --max-time 10；-4 直连 127.0.0.1，绕开本机 localhost→::1
+# 先解析带来的 ~21s 回落（curl Happy Eyeballs 下只是变慢，不致命，但没必要付）。
+probe() { curl -sf -4 --max-time 10 "$BOARD/attention?author=$AUTHOR"; }
 
 echo "watching $BOARD for '$AUTHOR' every ${INTERVAL}s (probe = heartbeat, C1.1)..."
 # thread #15 rev3 (R6): probe FIRST at startup — no blind 20-min window
@@ -74,12 +84,14 @@ echo "watching $BOARD for '$AUTHOR' every ${INTERVAL}s (probe = heartbeat, C1.1)
 # upper bound).
 cycle() {
   touch "$LOCK" 2>/dev/null                        # keep lock fresh (v2.3)
+  wg_stop_check dsh-watcher                        # 票3：STOP 文件存在即安静退出
   resp=$(probe) || { echo "$(date +%T) probe failed (network)"; return 0; }
   att=$(printf '%s' "$resp" | sed -n 's/.*"attention":\([0-9]\).*/\1/p')
   if [ "${att:-0}" != "1" ]; then echo "$(date +%T) idle"; return 0; fi
   reason=$(printf '%s' "$resp" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')
   threads=$(printf '%s' "$resp" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
   echo "$(date +%T) attention=1 ($reason) threads=[$threads] — waking DSH"
+  wg_count_wake dsh-watcher                        # 票3：每日上限，超帽即停
 
   cat > "$TASK_FILE" << EOF
 你是 review board 成员 dsh(rc.6 无 session 恢复,上下文一律从看板自取)。执行,不要向任何人提问:
@@ -88,6 +100,15 @@ cycle() {
 0) 若 token 文件不存在或即将首次使用:先 claim_token(author="dsh"),立即把明文写入
    $TOKEN_FILE_WIN 并回读,再 ack_token(author="dsh", token=明文),然后才继续——
    先落盘再使用(v2.3:治理调用自动确认只值 1h 短锁,显式落盘+ack 才享 24h)。
+0.5) 注入行 reason=token_invalid(v2.10 #77 档A):即使 token 文件在也重走 0) 四步
+   (服务端无你的 hash ⇒ 必可重领,即自愈)。
+0.6) 轮询 header 的 token_blocked 含 "dsh" 且 tier=manual(v2.10 #77 档B):本轮禁一切
+   治理调用(不 set_verdict/不 bump_revision/不 set_quorum),只做只读工作并在相关帖
+   留一行"等人工 reset_token / 等重签窗口";不要反复试错 token。
+0.7) 轮询 header 的 my_comment_due 含某帖且该项 blocking=true(v2.10 #79):先在该帖
+   post_comment 留一行(一句话即可)再投票——先评论后投票,一次唤醒同时清两族
+   (trae #791 增量2)。blocking=false 的条目只是可见事实,**不为此专门评论**
+   (自然参与该帖时顺带满足即可,防每轮骚扰=A5)。
 1) 调 mcp__review-board__list_comments_since(since="1h", author="dsh") 取增量(带 author,推进游标)
 2) 对需要你的线程用 get_thread 读全文(本次注意: reason=$reason, threads=$threads)
 3) 按协议参与:被 @dsh 点名的必须回应;quorum 帖评审后 set_verdict(author="dsh",
