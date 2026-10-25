@@ -104,14 +104,17 @@ def check_watcher_texts() -> int:
             print(f"[BAD] 载体不可读   {name} — {e}")
             bad += 1
             continue
-        miss = [k for k in ("token_invalid", "my_comment_due") if k not in text]
+        # "blocking=true" 必须在位（dsh #820 §3 / pi #823）：#79 的 0.7 分支若漂回
+        # 「my_comment_due 含某帖」不收窄，唤醒文案会复活 A5 要消灭的每轮骚扰。
+        miss = [k for k in ("token_invalid", "my_comment_due", "blocking=true")
+                if k not in text]
         inv = _INVOKER.search(text)
         if miss or inv:
-            print(f"[BAD] 载体断言     {name} — 缺分支 {miss or ''} "
+            print(f"[BAD] 载体断言     {name} — 缺 {miss or ''} "
                   f"{'机制层出现 claim_token 调用: ' + inv.group(0)[:60] if inv else ''}")
             bad += 1
         else:
-            print(f"[OK ] 载体断言     {name} — 两个 v2.10 分支在位，机制层无 claim 调用")
+            print(f"[OK ] 载体断言     {name} — v2.10 分支在位且收窄到 blocking=true，机制层无 claim 调用")
     return bad
 
 
