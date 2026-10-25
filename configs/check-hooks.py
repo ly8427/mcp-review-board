@@ -95,8 +95,9 @@ def classify(rc, stdout: bytes, stderr: bytes) -> tuple[str, str]:
 WATCHERS = ("task-template-pi.txt", "claude-polling-prompt.txt", "dsh-watcher.sh")
 _INVOKER = re.compile(r"(curl|wget|Invoke-WebRequest|tools/call|/mcp)[^\n]{0,120}claim_token",
                       re.IGNORECASE)
-# 服务端 /attention 的 reason 全序（server.py v2.10 reason 链的载体侧镜像）；
-# 载体侧用 header 键名：awaiting_my_verdict/mentions_me。
+# 服务端 /attention 的 reason 全序——载体侧镜像用的是轮询**响应字段名**,
+# 顺序一致但非逐字同名(awaiting_verdict↔awaiting_my_verdict, mentioned↔mentions_me;
+# GPT PR#6 二轮:勿再写"逐字一致")。
 _PRIORITY_CHAIN = ("token_invalid > awaiting_my_verdict > verdict_stale"
                    " > awaiting_floor_comment > mentions_me > new_comments")
 _PRIORITY_OLD = "优先级 awaiting_my_verdict > mentions_me"  # v2.9 旧链，禁再出现
