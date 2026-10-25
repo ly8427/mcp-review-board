@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -80,6 +81,40 @@ def classify(rc, stdout: bytes, stderr: bytes) -> tuple[str, str]:
     return "ERROR", f"rc={rc} {(err or out)[:120]}"
 
 
+# --- v2.10 (#77 ④ + #775 改判 F)：watcher 载体静态断言 ------------------------
+# 三份载体（pi 模板 / claude 轮询提示词 / dsh 内联任务文本）必须：
+#   ① 含 token_invalid 分支（档A 自修四步的文案在，唤醒才有可执行动作）；
+#   ② 含 my_comment_due 分支（#79 先评论后投票）；
+#   ③ 机制层（curl/POST/JSON-RPC）**不得**出现 claim_token 调用——claim 只能由
+#      被唤醒的成员自己发起（明文只显示一次，无人值守领取=把明文写进日志）；
+#      文本里对成员的指令（rb.sh claim_token / claim_token(author=…)）不算机制调用。
+WATCHERS = ("task-template-pi.txt", "claude-polling-prompt.txt", "dsh-watcher.sh")
+_INVOKER = re.compile(r"(curl|wget|Invoke-WebRequest|tools/call|/mcp)[^\n]{0,120}claim_token",
+                      re.IGNORECASE)
+
+
+def check_watcher_texts() -> int:
+    here = pathlib.Path(__file__).resolve().parent
+    bad = 0
+    for name in WATCHERS:
+        p = here / name
+        try:
+            text = p.read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"[BAD] 载体不可读   {name} — {e}")
+            bad += 1
+            continue
+        miss = [k for k in ("token_invalid", "my_comment_due") if k not in text]
+        inv = _INVOKER.search(text)
+        if miss or inv:
+            print(f"[BAD] 载体断言     {name} — 缺分支 {miss or ''} "
+                  f"{'机制层出现 claim_token 调用: ' + inv.group(0)[:60] if inv else ''}")
+            bad += 1
+        else:
+            print(f"[OK ] 载体断言     {name} — 两个 v2.10 分支在位，机制层无 claim 调用")
+    return bad
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=str(DEFAULT_CFG))
@@ -110,6 +145,7 @@ def main() -> int:
         print(f"[{flag}] {state:<11} {c['event']:<11} {c['command'][:70]}")
         print(f"        rc={rc} | {detail}")
     print()
+    bad += check_watcher_texts()  # v2.10：watcher 载体静态断言一并计入结论
     print("结论：" + ("全部在岗" if bad == 0 else f"{bad} 条不在岗"))
     return 0 if bad == 0 else 1
 
