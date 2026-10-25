@@ -105,8 +105,10 @@ cycle() {
 0.6) 轮询 header 的 token_blocked 含 "dsh" 且 tier=manual(v2.10 #77 档B):本轮禁一切
    治理调用(不 set_verdict/不 bump_revision/不 set_quorum),只做只读工作并在相关帖
    留一行"等人工 reset_token / 等重签窗口";不要反复试错 token。
-0.7) 轮询 header 的 my_comment_due 含某帖(v2.10 #79):先在该帖 post_comment 留一行
-   (一句话即可)再投票——先评论后投票,一次唤醒同时清两族(trae #791 增量2)。
+0.7) 轮询 header 的 my_comment_due 含某帖且该项 blocking=true(v2.10 #79):先在该帖
+   post_comment 留一行(一句话即可)再投票——先评论后投票,一次唤醒同时清两族
+   (trae #791 增量2)。blocking=false 的条目只是可见事实,**不为此专门评论**
+   (自然参与该帖时顺带满足即可,防每轮骚扰=A5)。
 1) 调 mcp__review-board__list_comments_since(since="1h", author="dsh") 取增量(带 author,推进游标)
 2) 对需要你的线程用 get_thread 读全文(本次注意: reason=$reason, threads=$threads)
 3) 按协议参与:被 @dsh 点名的必须回应;quorum 帖评审后 set_verdict(author="dsh",
