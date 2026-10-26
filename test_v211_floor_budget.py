@@ -12,10 +12,16 @@ resolved 路都被拦，最后靠用户 human_override 收口。
       该成员（提醒与拒收不再并存，dsh #934 §5 验收①②的读面半边）。
   S2  F2 取数只认事件表（dsh #934 §2.1 的复发路径）：object 带非空 note → 空 note
       翻 pass（verdicts.note 被覆盖为 NULL）⇒ 地板仍满足——票面行不可裸读。
+  S2b 修订边界（GPT PR#7 P2/P3 状态转换组）：rev1 的非空 note **不满足** rev2 地板
+      （F2 取数按当前 revision 圈定）；三票 pass 仍被拦，F4 兜住"rev2 投了空 note 票"
+      这条缝，发完收口。
   S3  F4 正路：预算耗尽 ∧ 空 note ∧ 其余活跃票全 pass ⇒ post_comment 放行一条
-      免费地板句：行级 floor_exempt=1、_author_usage 不计入（used<=cap 不变量）、
-      原始行数口径仍计（THREAD_CAP/日额的计数面）、审计 via=floor_exempt+快照、
-      发出后谓词自限（第二条被拒）。
+      免费地板句：行级 floor_exempt=1、_author_usage 不计入（used<=cap 不变量——
+      超过 cap 的边界按不变量不可达，S3e 即其断言）、原始行数口径仍计
+      （THREAD_CAP/日额的计数面）、审计 via=floor_exempt+快照、发出后谓词自限。
+  S3j 自身票检查（GPT PR#7 外审 P2 收窄）：我未投票时"地板是我唯一缺口"不成立，
+      F4 不开（正确出口=免费首判票）；投完 pass 后 F4 才开。quorum 不含创建者——
+      否则 L1.5（创建者最后投票）挡住"其余全 pass 而我未投"的形态。
   S4  F4 反路：其余成员未全 pass ⇒ 拒绝，文案指明出口何时开启（假建议分支化）。
   S5  预算拒绝文案分支：地板已满足者收到"无需再发"，不再收到
       "Conclude via set_verdict / set_status" 假建议。
@@ -179,6 +185,41 @@ def main():
           len(via2) == 1 and "brin:used=2/cap=2" in (via2[0]["note"] or "")
           and "len(note)=" in (via2[0]["note"] or ""), str(via2))
 
+    # ============ S2b: 修订边界（GPT PR#7 P2/P3 状态转换组） ======================
+    print("\n=== S2b 旧修订 note 不带入新修订 ===")
+    tid2b, tok2b = make_thread(srv, db, budget=2)
+    for i in range(2):
+        r = srv.post_comment(thread_id=tid2b, author="brin", body=f"brin {i}")
+        assert r.startswith("Posted"), r
+    # rev1：brin 投 pass 带非空 note（F2 源）
+    r = srv.set_verdict(thread_id=tid2b, verdict="pass", author="brin",
+                        token=tok2b["brin"], note="rev1 结论")
+    assert r.startswith("Verdict"), r
+    r = srv.bump_revision(thread_id=tid2b, author="anna", token=tok2b["anna"])
+    assert r.startswith("Revision bumped"), r
+    for n in ("anna", "cyr"):
+        r = srv.post_comment(thread_id=tid2b, author=n, body=f"{n} rev2 line")
+        assert r.startswith("Posted"), r
+    srv.list_comments_since(author="anna", since="now")
+    # rev2：brin 投空 note 首判（免费）——旧 note 不得带入
+    for n in ("brin", "cyr"):
+        r = srv.set_verdict(thread_id=tid2b, verdict="pass", author=n, token=tok2b[n])
+        assert r.startswith("Verdict"), (n, r)
+    r = srv.set_verdict(thread_id=tid2b, verdict="pass", author="anna", token=tok2b["anna"])
+    assert r.startswith("Verdict"), r
+    check("S2b-1: 旧修订 note 不满足新修订地板——三票 pass 仍被拦",
+          status_of(db, tid2b) == "open", status_of(db, tid2b))
+    blocked = audits(db, tid2b, "auto_resolve_blocked")
+    check("S2b-2: 拦截审计点名 brin（reason=discussion_floor）",
+          any("reason=discussion_floor" in (b["note"] or "")
+              and "brin" in (b["note"] or "") for b in blocked),
+          str(blocked[-1:]))
+    r = srv.post_comment(thread_id=tid2b, author="brin", body="地板句：rev2 维持 pass。")
+    check("S2b-3: F4 兜住这条缝（rev2 投了空 note 票）",
+          r.startswith("Posted") and "free floor comment" in r, r)
+    srv.list_comments_since(author="anna", since="now")
+    check("S2b-4: 收口", status_of(db, tid2b) == "resolved", status_of(db, tid2b))
+
     # ===================== S3: F4 正路（空 note 的兜缝出口） ======================
     print("\n=== S3 F4 正路 ===")
     tid3, tok3 = make_thread(srv, db, budget=2)
@@ -224,6 +265,55 @@ def main():
     r2 = srv.post_comment(thread_id=tid3, author="brin", body="再来一条")
     check("S3i: 谓词自限——第二条不再免（预算分支拒绝且非地板欠账文案）",
           r2.startswith("ERROR:") and "already satisfied" in r2, r2[:200])
+
+    # ===== S3j: 自身票检查（GPT PR#7 外审 P2 收窄）——未投票 ⇒ F4 不开 =========
+    print("\n=== S3j 未投票不开 F4（唯一缺口语义）===")
+    # quorum 不含创建者：否则 L1.5（创建者最后投票）会挡住"其余全 pass 而我未投"
+    # 的形态，测不到本判据。#80/#81 的真实板形正是创建者在 quorum 外。
+    members_j = ("brin", "cyr", "dana")
+    with srv.db() as conn:
+        srv._begin_write(conn)
+        for n in members_j + ("anna",):
+            srv._touch(conn, n)
+        conn.commit()
+    fx.prime_beats(db, list(members_j) + ["anna"])
+    out = srv.create_thread(title="v211-selfpass", author="anna",
+                            quorum=list(members_j),
+                            context=fx.wi("anna", *members_j),   # 创建者并入必检名单
+                            per_author_budget=2)
+    assert out.startswith("Created thread"), out
+    tidj = int(re.search(r"#(\d+)", out).group(1))
+    if "dana" not in TOK:
+        m = re.search(r"[0-9a-f]{32}", srv.claim_token(author="dana"))
+        assert m, "token claim failed for dana"
+        TOK["dana"] = m.group(0)
+        r = srv.ack_token(author="dana", token=TOK["dana"])
+        assert r.startswith("Token acknowledged"), r
+    for i in range(2):
+        r = srv.post_comment(thread_id=tidj, author="brin", body=f"brin {i}")
+        assert r.startswith("Posted"), r
+    r = srv.bump_revision(thread_id=tidj, author="anna", token=TOK["anna"])
+    assert r.startswith("Revision bumped"), r
+    for n in ("cyr", "dana"):
+        r = srv.post_comment(thread_id=tidj, author=n, body=f"{n} rev2 line")
+        assert r.startswith("Posted"), r
+    srv.list_comments_since(author="anna", since="now")
+    for n in ("cyr", "dana"):                       # 其余两人全 pass（带 note）
+        r = srv.set_verdict(thread_id=tidj, verdict="pass", author=n,
+                            token=TOK[n], note=f"{n} pass")
+        assert r.startswith("Verdict"), (n, r)
+    # brin 未投票（预算耗尽、silent、无 note）——旧判据会放行，收窄后必须拒绝
+    r = srv.post_comment(thread_id=tidj, author="brin", body="未投票想蹭免费地板句")
+    check("S3j-1: 我未投票 ⇒ F4 不开（文案要求先投 pass）",
+          r.startswith("ERROR:") and "your own verdict is pass" in r, r[:250])
+    r = srv.set_verdict(thread_id=tidj, verdict="pass", author="brin", token=TOK["brin"])
+    assert r.startswith("Verdict"), r
+    r = srv.post_comment(thread_id=tidj, author="brin", body="地板句：维持 pass。")
+    check("S3j-2: 投完 pass 后 F4 开、免费地板句放行",
+          r.startswith("Posted") and "free floor comment" in r, r)
+    srv.list_comments_since(author="anna", since="now")
+    check("S3j-3: 地板句+创建者追平 ⇒ 收口",
+          status_of(db, tidj) == "resolved", status_of(db, tidj))
 
     # ===================== S4: F4 反路（其余未全 pass ⇒ 出口未开） ================
     print("\n=== S4 F4 反路 ===")

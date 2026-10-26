@@ -859,10 +859,13 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
   快照)只写在两个**关门成功**处(set_status 成功转移 / recompute 地板通过后),每
   (thread,revision) 一行——绝不进 `_floor_missing`(C3 纯读,dsh #935 §3)。有预算的
   成员仍须真评论(F2 前提不满足),地板的讨论本意对"还能讨论的人"不被架空。
-- **F4(兜缝,收窄版):免费地板句**——仅当「F2 之后我仍在欠账 ∧ 预算耗尽 ∧ 其余活跃
-  成员票全 pass(复用 my_comment_due 的 blocking 判据,禁第二把尺子)」时,post/reply
-  的**per-author 预算门**放行一条不计费评论:行级 `floor_exempt` 标由服务端在 F4 分支
-  单点置位(post/reply 无此入口字段,无从伪造)、`_author_usage` 在唯一实现内排除打标行
+- **F4(兜缝,收窄版):免费地板句**——仅当「F2 之后我仍在欠账 ∧ 预算耗尽 ∧ **我本修订
+  票为 pass** ∧ 其余活跃成员票全 pass(复用 my_comment_due 的 blocking 判据,禁第二把
+  尺子;自身票检查=GPT PR#7 外审 P2 收窄——「地板是我唯一缺口」须为真,dsh #934 §3
+  「只在收口在即时触发」的口径;我未投票时正确出口是免费首判票,带非空 note 则连地板
+  一起满足)」时,post/reply 的**per-author 预算门**放行一条不计费评论:行级
+  `floor_exempt` 标由服务端在 F4 分支单点置位(post/reply 无此入口字段,无从伪造)、
+  `_author_usage` 在唯一实现内排除打标行
   (**used<=cap 不变量不破**,opencode #937 §1(ii)/pi #938);打标行仍计入线程上限与
   日额(**外层两门不豁免**,命中时文案指路 human_override,pi #938 绑定 C)、insert 后
   照常 recompute(pi #936 绑定 5);发出后欠账消失、谓词结构自限,不需要计数器。
@@ -2036,9 +2039,11 @@ def post_comment(
                     tail = (
                         "Your discussion-floor duty is still open (no comment and no "
                         "non-empty verdict note this revision). The free floor-comment "
-                        "exit (v2.11.0 #81 F4) opens once every OTHER active member "
-                        "has voted pass; an object→pass convergence flip is free; "
-                        "escalate to the human (human_override) if every exit is shut."
+                        "exit (v2.11.0 #81 F4) opens once your own verdict is pass AND "
+                        "every OTHER active member has voted pass — until then your "
+                        "first verdict on this revision is free, and a non-empty note "
+                        "on it satisfies the floor outright (F2); escalate to the "
+                        "human (human_override) if every exit is shut."
                     )
                 else:
                     tail = (
@@ -2134,9 +2139,11 @@ def reply_comment(comment_id: int, author: str, body: str) -> str:
                     tail = (
                         "Your discussion-floor duty is still open (no comment and no "
                         "non-empty verdict note this revision). The free floor-comment "
-                        "exit (v2.11.0 #81 F4) opens once every OTHER active member "
-                        "has voted pass; an object→pass convergence flip is free; "
-                        "escalate to the human (human_override) if every exit is shut."
+                        "exit (v2.11.0 #81 F4) opens once your own verdict is pass AND "
+                        "every OTHER active member has voted pass — until then your "
+                        "first verdict on this revision is free, and a non-empty note "
+                        "on it satisfies the floor outright (F2); escalate to the "
+                        "human (human_override) if every exit is shut."
                     )
                 else:
                     tail = (
@@ -3035,10 +3042,15 @@ def _floor_blocking_others(conn: sqlite3.Connection, thread_id: int,
 def _floor_exempt_ok(conn: sqlite3.Connection, thread_id: int, author: str,
                      budget: int) -> bool:
     """v2.11.0 (#81 F4，收窄版免费地板句)：仅在「F2 之后我仍在 silent ∧ 预算
-    耗尽(同一把尺子) ∧ 其余活跃成员票全 pass(复用 blocking 判据)」时放行。
+    耗尽(同一把尺子) ∧ **我本修订票为 pass** ∧ 其余活跃成员票全 pass」时放行。
     读 **F2 之后** 的 _floor_missing 结果判"我是否仍在欠账"，不自算票面
     （pi #936 绑定 5）；结构自限——发出那条评论后 silent 不再含我，谓词自动关，
-    不需要计数器（dsh #934 §3）。"""
+    不需要计数器（dsh #934 §3）。
+    自身票检查（GPT PR#7 外审 P2，2026-10-26 收窄）：「地板是我唯一缺口」须为
+    真——我未投票/仍 object 时收口并不在即（dsh #934 §3「F4 只在收口在即时
+    触发」的口径），此时我的正确出口是免费首判票（带非空 note 则连地板一起
+    满足，F2）；claude #933 对这条缝隙的定义本就是"投了**空 note 票**"的已
+    投票形态。"""
     silent, _why, _via = _floor_missing(conn, thread_id)
     if silent is None or author not in silent:
         return False
@@ -3048,6 +3060,12 @@ def _floor_exempt_ok(conn: sqlite3.Connection, thread_id: int, author: str,
     names = json.loads(row["quorum"]) if row and row["quorum"] else []
     active = _active_quorum(conn, names)
     if author not in active:
+        return False
+    mine = conn.execute(
+        "SELECT verdict FROM verdicts WHERE thread_id=? AND author=?",
+        (thread_id, author),
+    ).fetchone()
+    if mine is None or mine["verdict"] != "pass":
         return False
     return _floor_blocking_others(conn, thread_id, active, author)
 
