@@ -10,6 +10,10 @@ V1.1(2026-10-27):按外部评审(GPT,PR #8 Request Changes)修复三项——
      杜绝引号/命令替换被重解释;
   F3 修复单编号 = 工具+参数哈希前 6 位 + 序号后缀(-2/-3/…),同工具同参数的
      后续单子各自独立登记、独立生命周期,不再被旧记录吞掉。
+V1.2(2026-10-27):短回复修复(用户追问证伪"真实回复不可能少于 30 字"的判断)——
+  ①待办单子的催办/派发/核对不再依赖正文提取,状态机始终运行(否则单子静默停滞);
+  ②正文提取兜底:无 30 字以上候选时,接受含修复单/回执行的短串
+  (协议回执行如"执行 ab12cd"仅 9 字,轮询短汇报同样可能不足 30 字)。
 
 背景:模型在处置类工具调用(CronDelete/CronUpdate/看板写入)上有"想说A发成B"的
 生成层走样(2026-09-23/10-01/10-15/10-26 四次实证)。但**事后识别100%可靠**——
@@ -119,10 +123,24 @@ def extract_text(payload):
         for k, v in payload.items():
             if re.search(r"response|preview|last|message|assistant|text|output", str(k), re.I):
                 keyed += [s for s in strings(v)]
-    keyed = [s for s in keyed if len(s) >= 30]
-    if keyed:
-        return max(keyed, key=len)
+    longs = [s for s in keyed if len(s) >= 30]
+    if longs:
+        return max(longs, key=len)
+    # V1.2 兜底:短回复也必须能处理——协议回执行(如"执行 ab12cd")不到 30 字,
+    # 轮询短汇报也可能不到;任何含修复单/回执行(行首裸写)的候选串都接受。
+    hits = [s for s in keyed if _has_action_line(s)]
+    if hits:
+        return max(hits, key=len)
     return None
+
+
+def _has_action_line(s) -> bool:
+    if not isinstance(s, str):
+        return False
+    for line in strip_code(s).splitlines():
+        if ORDER_RE.match(line) or RECEIPT_RE.match(line):
+            return True
+    return False
 
 
 def strip_code(text: str) -> str:
@@ -241,11 +259,10 @@ def main() -> None:
     if not isinstance(payload, dict):
         allow()
 
+    # V1.2:正文提取失败(超短回复)不再整体退出——新单/回执解析自然为空,
+    # 但待办单子的催办/派发/核对不依赖正文,必须照常运行(否则单子静默停滞)。
     text = extract_text(payload)
-    if text is None:
-        allow()
-
-    plain = strip_code(text)
+    plain = strip_code(text) if isinstance(text, str) else ""
     state = load_state()
     now = time.time()
 
