@@ -13,6 +13,12 @@ V1.4(2026-10-27):按评审第三轮收口 F4——销账语义从"观察到目�
   记录 {type:tool_result, tool_use_id, is_error} 按编号回指(格式为 2026-10-27
   本机真实 rollout 采样实证);只有调用没结果 / 结果带错 / 调用无编号 → 不销账,
   保守待核转人工。
+V1.5(2026-10-27):按评审第四轮收口 F5/F6——
+  F5:CronDelete 增加业务成功字段校验(结果须含 deleted:true,防"正常返回但
+  业务未达成");无业务字段工具(看板族)的 V1 保证范围 = "调用结果未报错",
+  不含"业务目标已确认实现"(留档,待实证返回形状后再加字段);
+  F6:状态文件改原子写(临时文件+替换);写失败 → 停发一切派发/催办指令,
+  报警(文件+标准错误)转人工,放行收工——状态未持久化绝不驱动副作用。
 V1.2(2026-10-27):短回复修复(用户追问证伪"真实回复不可能少于 30 字"的判断)——
   待办单子的催办/派发/核对不再依赖正文提取,状态机始终运行;正文提取兜底接受
   含修复单/回执行的短串(V1.3 起由"扫描全部候选串"取代)。
@@ -108,12 +114,33 @@ def load_state() -> dict:
     return {h: v for h, v in st.items() if isinstance(v, dict) and now - v.get("ts", 0) < STATE_TTL}
 
 
-def save_state(st: dict) -> None:
+def save_state(st: dict) -> bool:
+    """原子写(临时文件+替换)。返回是否成功——失败时调用方必须停发派发/催办
+    指令并报警转人工(F6:状态没落盘,绝不驱动副作用)。"""
+    tmp = STATE_PATH + ".tmp"
     try:
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(st, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, STATE_PATH)
+        return True
     except OSError as e:
         log("state-write-fail", str(e))
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _save_failure_alarm() -> None:
+    msg = (f"修复单状态文件写入失败: {STATE_PATH} —— 修复单流程已停发一切指令,"
+           f"本回合放行;请人工检查磁盘/权限后重试(未落盘的单子会重新登记)。")
+    try:
+        with open(ALARM_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+    sys.stderr.write(f"[repair-gate] {msg}\n")
 
 
 def candidate_strings(payload):
@@ -238,15 +265,34 @@ def _collect_matching_calls(obj, tool: str, target, variants, out: list) -> None
 
 def _collect_results(obj, out: list) -> None:
     """收集工具执行结果(真实记录格式:{type:"tool_result",tool_use_id,is_error,
-    content},按 tool_use_id 与调用 id 配对)。"""
+    content},按 tool_use_id 与调用 id 配对);content 一并留作业务成功校验。"""
     if isinstance(obj, dict):
         if obj.get("type") == "tool_result" and isinstance(obj.get("tool_use_id"), str):
-            out.append((obj["tool_use_id"], bool(obj.get("is_error"))))
+            out.append((obj["tool_use_id"], bool(obj.get("is_error")),
+                        str(obj.get("content") or "")))
         for v in obj.values():
             _collect_results(v, out)
     elif isinstance(obj, list):
         for v in obj:
             _collect_results(v, out)
+
+
+# F5(评审第四轮):有明确业务成功字段的工具,成功必须见到该字段——
+# "结果未报错"≠"业务达成"(例:CronDelete 正常返回 {"deleted": false})。
+# 无字段工具(看板族)的 V1 保证范围 = "结果未报错",已在文件头与 PR 留档。
+_SUCCESS_MARKERS = {
+    "CronDelete": ('"deleted": true', '"deleted":true', "deleted: true",
+                   "'deleted': True", '"deleted": True'),
+}
+
+
+def _result_success(tool: str, err: bool, content: str) -> bool:
+    if err:
+        return False
+    markers = _SUCCESS_MARKERS.get(tool)
+    if markers:
+        return any(m in content for m in markers)
+    return True  # 无业务字段工具:V1 保证="结果未报错"(见文件头 F5 边界声明)
 
 
 def verify_execution(payload, tool: str, args: str, offset) -> bool:
@@ -277,7 +323,7 @@ def verify_execution(payload, tool: str, args: str, offset) -> bool:
     ids = {cid for cid in call_ids if cid}
     if not ids:
         return False
-    ok = {rid for rid, err in results if not err}
+    ok = {rid for rid, err, content in results if _result_success(tool, err, content)}
     return any(rid in ok for rid in ids)
 
 
@@ -415,7 +461,10 @@ def main() -> None:
                 f"若尚未执行或执行失败,按派发指令继续或重开修复单。")
             need_bounce = True
 
-    save_state(state)
+    if not save_state(state):
+        # F6:状态没落盘 → 停发一切派发/催办指令,报警转人工,放行收工
+        _save_failure_alarm()
+        allow()
     if need_bounce:
         bounce("[repair-gate] 修复单事务未结:\n" + "\n".join("- " + m for m in msgs))
     allow()

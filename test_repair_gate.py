@@ -148,10 +148,11 @@ class Harness(unittest.TestCase):
     # ---------- F1+F4 核销：同一条调用记录 + 配对的成功结果 ----------
 
     CALL_OK = ['{"toolCalls":[{"id":"call_ok1","name":"CronDelete","input":{"id":"42"}}]}',
-               '{"type":"tool_result","tool_use_id":"call_ok1","content":"deleted: true"}']
+               '{"type":"tool_result","tool_use_id":"call_ok1","content":"{\\"deleted\\": true}"}']
     CALL_STR_ARGS = ['{"toolCalls":[{"id":"call_s1","name":"CronDelete",'
                      '"arguments":"{\\"id\\":\\"42\\"}"}]}',
-                     '{"type":"tool_result","tool_use_id":"call_s1","content":"ok"}']
+                     '{"type":"tool_result","tool_use_id":"call_s1",'
+                     '"content":"{\\"deleted\\": true}"}']
     CALL_ERR = ['{"toolCalls":[{"id":"call_e1","name":"CronDelete","input":{"id":"42"}}]}',
                 '{"type":"tool_result","tool_use_id":"call_e1","is_error":true,'
                 '"content":"permission denied"}']
@@ -193,6 +194,25 @@ class Harness(unittest.TestCase):
         v = self._check(h, self.CALL_NO_RESULT)
         self.assertFalse(v.get("done"))
         self.assertFalse(v.get("alarm"))
+
+    def test_verify_business_false_not_done(self):
+        """F5 翻转条件:结果未报错但业务字段为否({"deleted": false}) → 不得销账。"""
+        h = self._dispatched(['{"start":true}'])
+        v = self._check(h, ['{"toolCalls":[{"id":"call_b1","name":"CronDelete","input":{"id":"42"}}]}',
+                            '{"type":"tool_result","tool_use_id":"call_b1",'
+                            '"content":"{\\"deleted\\": false}"}'])
+        self.assertFalse(v.get("done"))
+        self.assertFalse(v.get("alarm"))
+
+    def test_state_save_failure_stops_dispatch(self):
+        """F6:状态写不进 → 不发任何派发/催办指令,报警转人工,放行。"""
+        os.makedirs(self.state, exist_ok=True)  # 状态路径是目录 → 原子替换必败
+        rc, b, err = self.gate("开单说明文字超过三十个字符长度要求补足内容。\n"
+                               + ORDER_LINE + "\n继续说明。")
+        self.assertEqual(rc, 0)
+        self.assertIsNone(b, "状态未落盘不得派发/催办")
+        self.assertIn("写入失败", err)
+        self.assertTrue(os.path.exists(self.alarm))
 
     def test_verify_split_records_not_done(self):
         """F1 翻转条件:工具名与参数分属不同记录时不得核销。"""
