@@ -134,7 +134,8 @@ CREATE TABLE IF NOT EXISTS comments (
     line       INTEGER,
     severity   TEXT,
     status     TEXT    NOT NULL DEFAULT 'open',
-    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+    floor_exempt INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments(thread_id);
 CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments(parent_id);
@@ -204,7 +205,7 @@ SUSPEND_AFTER_HOURS = 24
 # --- v2 A1: participant registry / heartbeat --------------------------------
 # Single source of truth for the served version (v2.9.3 #55: was duplicated in
 # three literals — FastMCP serverInfo, /ping, PROTOCOL header — and drifted).
-PROTOCOL_VERSION = "2.10.0"
+PROTOCOL_VERSION = "2.11.0"
 mcp = FastMCP("ReviewBoard", version=PROTOCOL_VERSION)  # align serverInfo with pyproject
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -844,6 +845,43 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
   `attention_contract` 审计(note 含 reason 全表与 header 键全表),幂等;watcher 文案
   分支随本批同落:**先评论(my_comment_due 含本帖)再投票**(trae #791 增量2,一次唤醒
   同时消解两族),脚本内禁止 claim_token 调用(#775 改判 F)。
+
+## v2.11.0 增补(threads #80/#81 定案,2026-10-26——地板×预算闭环死结)
+- **事故定性**:#80 rev2 三票 pass 全落账,但两位成员评论预算 20/20 耗尽、发不出地板
+  要求的那条评论——**讨论地板把"到场义务"实现成"计费发言"**,预算耗尽时义务物理
+  不可履行且无免费通道,auto/manual 两条 resolved 路都被拦(dsh #929/#932:结构性死锁,
+  UTC 日切不自愈)。与 v2.5 已修的"计费硬闸锁死预算耗尽成员的认错翻转"同族。
+- **F2(主路):票面 note 代地板**——预算耗尽(同一把尺子 `_author_usage>=cap`) ∧ 本修订
+  内 verdict_events 留过**非空** note(action 含 `verdict_free`,首判即带 note 是最常见
+  形态;不设长度阈值,1 字即公开署名的到场证据,pi #936 §4)⇒ 地板视为满足。取数只认
+  事件表(append-only;`verdicts.note` 会被空 note 翻票覆盖,dsh #934 §2.1);审计
+  `floor_satisfied_via_note`(via=verdict_note + revision + 每人 used/cap 与 note 长度
+  快照)只写在两个**关门成功**处(set_status 成功转移 / recompute 地板通过后),每
+  (thread,revision) 一行——绝不进 `_floor_missing`(C3 纯读,dsh #935 §3)。有预算的
+  成员仍须真评论(F2 前提不满足),地板的讨论本意对"还能讨论的人"不被架空。
+- **F4(兜缝,收窄版):免费地板句**——仅当「F2 之后我仍在欠账 ∧ 预算耗尽 ∧ **我本修订
+  票为 pass** ∧ 其余活跃成员票全 pass(复用 my_comment_due 的 blocking 判据,禁第二把
+  尺子;自身票检查=GPT PR#7 外审 P2 收窄——「地板是我唯一缺口」须为真,dsh #934 §3
+  「只在收口在即时触发」的口径;我未投票时正确出口是免费首判票,带非空 note 则连地板
+  一起满足)」时,post/reply 的**per-author 预算门**放行一条不计费评论:行级
+  `floor_exempt` 标由服务端在 F4 分支单点置位(post/reply 无此入口字段,无从伪造)、
+  `_author_usage` 在唯一实现内排除打标行
+  (**used<=cap 不变量不破**,opencode #937 §1(ii)/pi #938);打标行仍计入线程上限与
+  日额(**外层两门不豁免**,命中时文案指路 human_override,pi #938 绑定 C)、insert 后
+  照常 recompute(pi #936 绑定 5);发出后欠账消失、谓词结构自限,不需要计数器。
+- **set_quorum 守卫**:本修订已有票行的帖改评审人名单必须 `human_override`,审计记
+  「评审人集合被改写(原→新)」——remove 欠地板成员+add 新人可**形式解开**地板/票门,
+  该通道必须留人工痕(thread #81 dsh §4 静态核实:能做,但禁止默默做)。
+- **override 审计补名单**:human_override 关帖的审计 note 带当时的 floor_missing 名单
+  + revision(#80 的 ev#607/608 只有"gate bypassed"一句,事后查不出豁免了谁的义务)。
+  #80 本次 override 收口记为**人工例外路径**先例(非合规范式);存量不回溯,dsh #934 §1
+  反事实:F2 若在,06:55:33 那次 recompute 即自动收口——上线当天可重放验证。
+- **文案纪律**:预算/日额拒绝文案按出口真伪分支(#80 原病=两对文案互相指路的假建议);
+  `my_comment_due` 语义随 F2 自然收窄(预算耗尽∧有非空 note 的成员不再列入,提醒与
+  拒收不再并存——dsh #934 §5 验收②);成员侧三分支:有预算→真评论 / 无预算∧有 note→
+  无需动作 / 无预算∧空 note→**先投免费首判票;自己已投 pass 且其余活跃成员全 pass 时
+  才可发免费地板句**(GPT PR#7 复审 P3 补:摘要与判据同步,勿写成"预算耗尽+空 note
+  即可直发";watcher 三载体同批)。
 """
 
 
@@ -951,6 +989,18 @@ def _legacy_shape_fixups(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE threads ADD COLUMN {col} {ddl}")
 
 
+def _floor_exempt_shape(conn: sqlite3.Connection) -> None:
+    """v2.11.0 (#81 F4): comments.floor_exempt — additive column, idempotent
+    every-start fixup (same PRAGMA guard pattern as _legacy_shape_fixups;
+    additive columns are O(1) metadata ALTERs, so no version-ladder step is
+    warranted). Fresh DBs get it from schema.sql; this covers every older db."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(comments)")}
+    if "floor_exempt" not in cols:
+        conn.execute(
+            "ALTER TABLE comments ADD COLUMN floor_exempt INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 def _v21_token_backfill(conn: sqlite3.Connection) -> None:
     # v2.1 migration: legacy tokens predate the two-phase lifecycle; their
     # holders proved possession (governance use / audited hub recovery),
@@ -981,6 +1031,7 @@ def init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _connect() as conn:
         conn.executescript(_load_schema())
+        _floor_exempt_shape(conn)  # v2.11.0 (#81 F4): pre-column dbs converge here
         conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
         row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
         if row is None:
@@ -1355,9 +1406,15 @@ POSTS_PER_DAY = 50      # per author across the whole board (设计 A3 措辞)
 
 
 def _author_usage(conn: sqlite3.Connection, thread_id: int, author: str) -> int:
-    """Budget usage = comments + costed verdict flips (A5 3a: flips are billed)."""
+    """Budget usage = comments + costed verdict flips (A5 3a: flips are billed).
+    v2.11.0 (#81 F4, pi #938 绑定 B): floor_exempt rows are EXCLUDED here — in
+    this ONE implementation (no per-callsite filtering) — so "can I post" and
+    "am I exhausted" stay the same ruler and used<=cap remains observable.
+    Exempt rows still count toward THREAD_CAP and POSTS_PER_DAY (those checks
+    count raw comments); they also still satisfy the discussion floor."""
     n = conn.execute(
-        "SELECT COUNT(*) FROM comments WHERE thread_id=? AND author=?",
+        "SELECT COUNT(*) FROM comments WHERE thread_id=? AND author=?"
+        " AND COALESCE(floor_exempt, 0) = 0",
         (thread_id, author),
     ).fetchone()[0]
     v = conn.execute(
@@ -1960,25 +2017,68 @@ def post_comment(
                 f"({THREAD_CAP} comments). No further posts or replies accepted. "
                 f"Conclude the discussion with set_status(thread_id, 'resolved' or 'wontfix')."
             )
-        budget = conn.execute(
-            "SELECT per_author_budget FROM threads WHERE id=?", (thread_id,)
-        ).fetchone()[0]
-        if _author_usage(conn, thread_id, author) >= budget:
-            return (
-                f"ERROR: {author} reached the per-author budget ({budget}) in "
-                f"thread #{thread_id}. Conclude via set_verdict / set_status."
-            )
+        trow = conn.execute(
+            "SELECT per_author_budget, revision FROM threads WHERE id=?", (thread_id,)
+        ).fetchone()
+        budget, t_rev = trow["per_author_budget"], trow["revision"]
+        used = _author_usage(conn, thread_id, author)
+        floor_exempt_post = False
+        if used >= budget:
+            # v2.11.0 (#81 F4)：收口时刻的免费地板句——预算耗尽 ∧ F2 之后我仍在
+            # 地板欠账 ∧ 其余活跃成员票全 pass（复用 blocking 判据，不自算）。
+            # 行级 floor_exempt 标由服务端在本分支单点置位（post_comment 无此
+            # 入口字段，客户端无从伪造，pi #938 绑定 A）；不计费（_author_usage
+            # 排除打标行，used<=cap 不变量不破）、仍计入线程上限与日额、insert
+            # 后照常 recompute（pi #936 绑定 5）。
+            if _floor_exempt_ok(conn, thread_id, author, budget):
+                floor_exempt_post = True
+            else:
+                # v2.11.0 (#81, dsh #935 §1)：假建议分支化——旧文案
+                # "Conclude via set_verdict / set_status" 在 #80 链路是假建议
+                # （票已 pass、set_status 撞同一堵墙）。按出口真伪分支。
+                silent, _fw, _fvn = _floor_missing(conn, thread_id)
+                if author in (silent or []):
+                    tail = (
+                        "Your discussion-floor duty is still open (no comment and no "
+                        "non-empty verdict note this revision). The free floor-comment "
+                        "exit (v2.11.0 #81 F4) opens once your own verdict is pass AND "
+                        "every OTHER active member has voted pass — until then your "
+                        "first verdict on this revision is free, and a non-empty note "
+                        "on it satisfies the floor outright (F2); escalate to the "
+                        "human (human_override) if every exit is shut."
+                    )
+                else:
+                    tail = (
+                        "Your discussion-floor duty is already satisfied (non-empty "
+                        "verdict note or a comment on this revision, v2.11.0 #81 F2) "
+                        "— no further comment is needed."
+                    )
+                return (
+                    f"ERROR: {author} reached the per-author budget ({budget}) in "
+                    f"thread #{thread_id}. {tail}"
+                )
         if _count_today(conn, "comments", author) >= POSTS_PER_DAY:
+            # v2.11.0 (#81, opencode #937 §2 / pi #938 绑定 C)：F4 只豁免 per-author
+            # 预算这一道门；日额/线程总额命中时显式指路 human_override（留痕放行），
+            # 不再让两对文案互相指路（#80 原病）。
             return (
                 f"ERROR: {author} reached the daily post limit "
-                f"({POSTS_PER_DAY}/day across the board)."
+                f"({POSTS_PER_DAY}/day across the board). This gate is NOT exempted "
+                "by the floor-comment exit — escalate to the human (human_override) "
+                "if a close is blocked on this."
             )
         cur = conn.execute(
-            """INSERT INTO comments(thread_id, parent_id, author, body, file, line, severity)
-               VALUES (?, NULL, ?, ?, ?, ?, ?)""",
-            (thread_id, author, body, file, line, severity),
+            """INSERT INTO comments(thread_id, parent_id, author, body, file, line, severity, floor_exempt)
+               VALUES (?, NULL, ?, ?, ?, ?, ?, ?)""",
+            (thread_id, author, body, file, line, severity,
+             1 if floor_exempt_post else 0),
         )
         cid = cur.lastrowid
+        if floor_exempt_post:
+            _audit(conn, author, "floor_exempt", thread_id=thread_id,
+                   revision=t_rev, costed=0,
+                   note=f"via=floor_exempt; used={used}/cap={budget}; "
+                        f"free floor comment #{cid} (v2.11.0 #81 F4)")
         stale_note = _stale_receipt_note(conn, thread_id)
         # v2.9.3 (thread #55 ②): comments are exactly what satisfies the
         # discussion floor, yet this call site was missing from the recompute
@@ -1990,7 +2090,8 @@ def post_comment(
     if file:
         loc = f" at {file}" + (f":{line}" if line else "")
     sev = f" [{severity}]" if severity else ""
-    return f"Posted comment #{cid} in thread #{thread_id} by {author}{sev}{loc}.{stale_note}"
+    free_tag = " (free floor comment — budget untouched, v2.11.0 #81 F4)" if floor_exempt_post else ""
+    return f"Posted comment #{cid} in thread #{thread_id} by {author}{sev}{loc}.{free_tag}{stale_note}"
 
 
 @mcp.tool
@@ -2024,30 +2125,64 @@ def reply_comment(comment_id: int, author: str, body: str) -> str:
                 f"({THREAD_CAP} comments). No further posts or replies accepted. "
                 f"Conclude the discussion with set_status(thread_id, 'resolved' or 'wontfix')."
             )
-        budget = conn.execute(
-            "SELECT per_author_budget FROM threads WHERE id=?", (row["thread_id"],)
-        ).fetchone()[0]
-        if _author_usage(conn, row["thread_id"], author) >= budget:
-            return (
-                f"ERROR: {author} reached the per-author budget ({budget}) in "
-                f"thread #{row['thread_id']}. Conclude via set_verdict / set_status."
-            )
+        trow = conn.execute(
+            "SELECT per_author_budget, revision FROM threads WHERE id=?", (row["thread_id"],)
+        ).fetchone()
+        budget, t_rev = trow["per_author_budget"], trow["revision"]
+        used = _author_usage(conn, row["thread_id"], author)
+        floor_exempt_post = False
+        if used >= budget:
+            # v2.11.0 (#81 F4)：与 post_comment 同款——收口时刻免费地板句（reply 面）。
+            if _floor_exempt_ok(conn, row["thread_id"], author, budget):
+                floor_exempt_post = True
+            else:
+                silent, _fw, _fvn = _floor_missing(conn, row["thread_id"])
+                if author in (silent or []):
+                    tail = (
+                        "Your discussion-floor duty is still open (no comment and no "
+                        "non-empty verdict note this revision). The free floor-comment "
+                        "exit (v2.11.0 #81 F4) opens once your own verdict is pass AND "
+                        "every OTHER active member has voted pass — until then your "
+                        "first verdict on this revision is free, and a non-empty note "
+                        "on it satisfies the floor outright (F2); escalate to the "
+                        "human (human_override) if every exit is shut."
+                    )
+                else:
+                    tail = (
+                        "Your discussion-floor duty is already satisfied (non-empty "
+                        "verdict note or a comment on this revision, v2.11.0 #81 F2) "
+                        "— no further comment is needed."
+                    )
+                return (
+                    f"ERROR: {author} reached the per-author budget ({budget}) in "
+                    f"thread #{row['thread_id']}. {tail}"
+                )
         if _count_today(conn, "comments", author) >= POSTS_PER_DAY:
+            # v2.11.0 (#81)：同 post_comment——日额门不豁免，指路 human_override。
             return (
                 f"ERROR: {author} reached the daily post limit "
-                f"({POSTS_PER_DAY}/day across the board)."
+                f"({POSTS_PER_DAY}/day across the board). This gate is NOT exempted "
+                "by the floor-comment exit — escalate to the human (human_override) "
+                "if a close is blocked on this."
             )
         cur = conn.execute(
-            """INSERT INTO comments(thread_id, parent_id, author, body)
-               VALUES (?, ?, ?, ?)""",
-            (row["thread_id"], comment_id, author, body),
+            """INSERT INTO comments(thread_id, parent_id, author, body, floor_exempt)
+               VALUES (?, ?, ?, ?, ?)""",
+            (row["thread_id"], comment_id, author, body,
+             1 if floor_exempt_post else 0),
         )
         cid = cur.lastrowid
+        if floor_exempt_post:
+            _audit(conn, author, "floor_exempt", thread_id=row["thread_id"],
+                   revision=t_rev, costed=0,
+                   note=f"via=floor_exempt; used={used}/cap={budget}; "
+                        f"free floor reply #{cid} (v2.11.0 #81 F4)")
         stale_note = _stale_receipt_note(conn, row["thread_id"])
         # v2.9.3 (thread #55 ②): same invariant trigger as post_comment — a reply
         # can be the last thing the discussion floor was waiting for.
         recompute_thread(conn, row["thread_id"])
-    return f"Posted reply #{cid} to comment #{comment_id} by {author}.{stale_note}"
+    free_tag = " (free floor comment — budget untouched, v2.11.0 #81 F4)" if floor_exempt_post else ""
+    return f"Posted reply #{cid} to comment #{comment_id} by {author}.{free_tag}{stale_note}"
 
 
 @mcp.tool
@@ -2311,8 +2446,17 @@ def set_status(
                 # 一行 human_override =「人下的令」，一行 status_change =「状态确实变了」。
                 # 此前 override 只写前者 ⇒ 单查 status_change 答不出「谁关的」；活库
                 # 唯一一处 override 实例（#20 / ev#213 zcode wontfix）就是这个空洞。
+                # v2.11.0 (#81, dsh #934 §5)：override 关帖审计补当时地板欠账名单 +
+                # revision——#80 的 ev#607/608 只有"gate bypassed"一句，事后查不出
+                # 豁免了谁的义务。成本=一次纯读（仅 quorum 帖）。
+                ho_extra = ""
+                if t["quorum"]:
+                    _silent, _fw, _fvn = _floor_missing(conn, thread_id)
+                    if _silent is not None:
+                        ho_extra = (f"; floor_missing={_silent}; "
+                                    f"revision={t['revision']}")
                 _audit(conn, author, "human_override", thread_id=thread_id,
-                       to_v=status, note="gate bypassed by human instruction")
+                       to_v=status, note="gate bypassed by human instruction" + ho_extra)
                 conn.execute("UPDATE threads SET status=? WHERE id=?", (status, thread_id))
                 _audit(conn, author, "status_change", thread_id=thread_id,
                        from_v=prev, to_v=status,
@@ -2349,14 +2493,20 @@ def set_status(
             # 刚拦下的帖子，换个入口就能关掉，且不留痕（thread #76 实证）。
             # 出口：让缺评论的成员各留一条（正常路径），或用户显式 human_override（有审计）。
             if status == "resolved" and t["quorum"]:
-                silent, _why = _floor_missing(conn, thread_id)
+                silent, _why, floor_via = _floor_missing(conn, thread_id)
                 if silent:
                     return (
                         f"ERROR: thread #{thread_id} discussion floor not met — "
                         f"active members with no comment in this revision: {silent}. "
-                        "Ask each of them for one line (any comment), or use "
-                        "human_override=True when a human explicitly instructs the close."
+                        "Ask each of them for one line (any comment). Budget-exhausted "
+                        "members: a non-empty verdict note on this revision already "
+                        "satisfies the floor (v2.11.0 #81 F2); or, once they themselves "
+                        "AND every other active member have voted pass, they may post "
+                        "ONE free floor comment (#81 F4). Or use human_override=True "
+                        "when a human explicitly instructs the close."
                     )
+            else:
+                floor_via = []
             # 空转已在函数前部短路（v2.9.5）：审计口径恒为「一次转移一行」，
             # `who closed it` 的结果集里不会再混进 open→open（#577 那类）。
             conn.execute("UPDATE threads SET status=? WHERE id=?", (status, thread_id))
@@ -2364,6 +2514,11 @@ def set_status(
             _audit(conn, author, "status_change", thread_id=thread_id,
                    from_v=prev, to_v=status,
                    note=f"manual set_status by {author}; human_override={bool(human_override)}")
+            # v2.11.0 (#81, dsh #935 §3)：手动关门的 F2 出口审计——写在关门成功处，
+            # 不进 _floor_missing（C3 纯读）。via 名单来自上面的地板检查。
+            if status == "resolved" and t["quorum"] and floor_via:
+                _audit_floor_via_note(conn, thread_id, t["revision"], floor_via,
+                                      t["per_author_budget"])
             return f"Thread #{thread_id} set to '{status}' by {author}."
         else:
             cur = conn.execute("UPDATE comments SET status=? WHERE id=?", (status, comment_id))
@@ -2530,11 +2685,17 @@ def set_quorum(
     add: list[str] | None = None,
     remove: list[str] | None = None,
     wake_infra: str | None = None,
+    human_override: bool = False,
 ) -> str:
     """Creator-only: amend a thread's quorum (open threads only; floor ≥2).
 
     Adding requires the names to be registered; shrinking below 2 members is
     rejected (trae 边界6: a 1-member quorum is self-judging).
+
+    v2.11.0 (#81, dsh #934 §4 — 静态核实"能做，但禁止"后的低成本堵法)：本修订
+    已有票行的帖改评审人名单必须 human_override（审计记「评审人集合被改写
+    原→新」）——remove 欠地板成员+add 新人可以**形式解开**地板/票门，这条
+    通道必须留人工痕。
 
     Args:
         thread_id: the thread (must be open).
@@ -2546,6 +2707,8 @@ def set_quorum(
         wake_infra: v2.9 L1 gate — declaration block for the ADDED names
             (same `- name: X | form: (a) | ...` format create_thread requires);
             adding without a compliant declaration is rejected.
+        human_override: required when this revision already has standing
+            verdicts (the rewrite can formally unlock gates; audited).
     """
     with db() as conn:
         _begin_write(conn)
@@ -2562,6 +2725,17 @@ def set_quorum(
             return (
                 f"ERROR: quorum changes are open-thread-only (current: {t['status']}); "
                 "resolved/wontfix quorums are frozen (changing one breaks its invariant)"
+            )
+        # v2.11.0 (#81)：票行在 ⇒ 改名单=改写评审人集合（可形式解门），必须人工明示。
+        has_verdicts = conn.execute(
+            "SELECT 1 FROM verdicts WHERE thread_id=? LIMIT 1", (thread_id,)
+        ).fetchone() is not None
+        if has_verdicts and not human_override:
+            return (
+                f"ERROR: thread #{thread_id} has standing verdicts this revision — "
+                "rewriting the quorum can formally unlock the floor/verdict gates "
+                "(thread #81 dsh §4: 能做,但禁止默默做). Re-issue with "
+                "human_override=True; the audit will record 原→新."
             )
         names = json.loads(t["quorum"]) if t["quorum"] else []
         if add:
@@ -2595,6 +2769,8 @@ def set_quorum(
                      (json.dumps(new_names, ensure_ascii=False), thread_id))
         _audit(conn, author, "set_quorum", thread_id=thread_id,
                note=f"{names} -> {new_names}"
+                    + (" | quorum rewritten with standing verdicts (human_override)"
+                       if (has_verdicts and human_override) else "")
                     + (f" | wake_infra: {wake_infra}" if (add and wake_infra) else ""))
         recompute_thread(conn, thread_id)
         return f"Quorum updated: {names} → {new_names} (thread #{thread_id})."
@@ -2784,7 +2960,7 @@ def _l15_waiting(conn: sqlite3.Connection, thread_id: int, creator: str,
     return [n for n in _active_quorum(conn, quorum) if n != author and n not in voted]
 
 
-def _floor_missing(conn: sqlite3.Connection, thread_id: int) -> tuple[list[str] | None, str | None]:
+def _floor_missing(conn: sqlite3.Connection, thread_id: int) -> tuple[list[str] | None, str | None, list[str]]:
     """讨论地板「本修订内活跃成员是否都留过评论」的**唯一实现**（v2.9.4）。
 
     抽出来的原因（2026-10-24 事故，thread #76）：这条规矩此前只长在自动关帖路径
@@ -2796,14 +2972,25 @@ def _floor_missing(conn: sqlite3.Connection, thread_id: int) -> tuple[list[str] 
         不看评论，直接放行；
       · 而 `set_status` 当时一条审计都不写 ⇒ 事后无人能回答"谁关的、何时关的"。
 
-    返回 (silent, why)：
-      silent 非空 ⇒ 地板未满足（这些活跃成员本修订内无评论）；
+    v2.11.0 (thread #81 F2——地板×预算闭环死结的修法主路)：**预算耗尽 ∧ 本修订
+    票面留过非空 note ⇒ 到场义务视为已履行**（note 代地板）。#80 实证：dsh/pi
+    各 20/20 耗尽、票面 note 1349/1319 字，地板却还等他们发评论——义务被实现成
+    计费发言，物理不可能履行。取数只认 verdict_events（append-only，action 含
+    verdict_free——首判即带 note 是最常见形态；verdicts.note 会被空 note 翻票
+    覆盖，dsh #934 §2.1）；"耗尽"字面复用 _author_usage>=cap（同一把尺子）；
+    只对 silent 逐个算（dsh #935 §3 成本纪律——对全名册算=每轮多 N 次查询）。
+
+    返回 (silent, why, via_note)：
+      silent 非空 ⇒ 地板未满足（这些活跃成员本修订内无评论且 F2 未救）；
       silent == [] ⇒ 满足；silent is None ⇒ 无法判定（floor_wm 缺失，why 为原因）。
+      via_note ⇒ 本次由 F2（票面 note）救下的成员（仅在 silent 可判定时有意义）。
     """
     wm, wm_ok, wm_why = _revision_floor(conn, thread_id)
     if not wm_ok:
-        return None, wm_why
-    row = conn.execute("SELECT quorum FROM threads WHERE id=?", (thread_id,)).fetchone()
+        return None, wm_why, []
+    row = conn.execute(
+        "SELECT quorum, per_author_budget, revision FROM threads WHERE id=?", (thread_id,)
+    ).fetchone()
     names = json.loads(row["quorum"]) if row and row["quorum"] else []
     active = _active_quorum(conn, names)
     commented = {
@@ -2813,7 +3000,106 @@ def _floor_missing(conn: sqlite3.Connection, thread_id: int) -> tuple[list[str] 
             (thread_id, wm),
         ).fetchall()
     }
-    return [n for n in active if n not in commented], None
+    silent = [n for n in active if n not in commented]
+    if not silent:
+        return [], None, []
+    budget = row["per_author_budget"] if row else 20
+    revision = row["revision"] if row else 1
+    via_note: list[str] = []
+    still: list[str] = []
+    for n in silent:
+        # v2.11.0 (#81): note 先查（便宜、可下钻）再查 usage——没有 note 的成员
+        # 不付 usage 的两次 COUNT。不设 note 长度阈值（pi #936 §4 否决项：
+        # 1 字 note 已是公开署名的到场证据，阈值=新的可发明参数）。
+        note_row = conn.execute(
+            "SELECT 1 FROM verdict_events WHERE thread_id=? AND author=? AND revision=?"
+            " AND action IN ('verdict','verdict_free')"
+            " AND note IS NOT NULL AND TRIM(note)<>'' LIMIT 1",
+            (thread_id, n, revision),
+        ).fetchone()
+        if note_row is not None and _author_usage(conn, thread_id, n) >= budget:
+            via_note.append(n)
+        else:
+            still.append(n)
+    return still, None, via_note
+
+
+def _floor_blocking_others(conn: sqlite3.Connection, thread_id: int,
+                           active: list[str], author: str) -> bool:
+    """「关帖只差我一句」判据（#79 起 _comment_due_face 的 blocking 定义，
+    v2.11.0 #81 F4 绑定抽成共用——dsh #934 §3「必须复用」，禁第二把尺子）：
+    其余活跃成员票全 pass ⇔ 地板是我唯一缺口。"""
+    others = [n for n in active if n != author]
+    if not others:
+        return False
+    verdicts = {
+        v["author"]: v["verdict"]
+        for v in conn.execute(
+            "SELECT author, verdict FROM verdicts WHERE thread_id=?", (thread_id,)
+        ).fetchall()
+    }
+    return all(verdicts.get(n) == "pass" for n in others)
+
+
+def _floor_exempt_ok(conn: sqlite3.Connection, thread_id: int, author: str,
+                     budget: int) -> bool:
+    """v2.11.0 (#81 F4，收窄版免费地板句)：仅在「F2 之后我仍在 silent ∧ 预算
+    耗尽(同一把尺子) ∧ **我本修订票为 pass** ∧ 其余活跃成员票全 pass」时放行。
+    读 **F2 之后** 的 _floor_missing 结果判"我是否仍在欠账"，不自算票面
+    （pi #936 绑定 5）；结构自限——发出那条评论后 silent 不再含我，谓词自动关，
+    不需要计数器（dsh #934 §3）。
+    自身票检查（GPT PR#7 外审 P2，2026-10-26 收窄）：「地板是我唯一缺口」须为
+    真——我未投票/仍 object 时收口并不在即（dsh #934 §3「F4 只在收口在即时
+    触发」的口径），此时我的正确出口是免费首判票（带非空 note 则连地板一起
+    满足，F2）；claude #933 对这条缝隙的定义本就是"投了**空 note 票**"的已
+    投票形态。"""
+    silent, _why, _via = _floor_missing(conn, thread_id)
+    if silent is None or author not in silent:
+        return False
+    if _author_usage(conn, thread_id, author) < budget:
+        return False
+    row = conn.execute("SELECT quorum FROM threads WHERE id=?", (thread_id,)).fetchone()
+    names = json.loads(row["quorum"]) if row and row["quorum"] else []
+    active = _active_quorum(conn, names)
+    if author not in active:
+        return False
+    mine = conn.execute(
+        "SELECT verdict FROM verdicts WHERE thread_id=? AND author=?",
+        (thread_id, author),
+    ).fetchone()
+    if mine is None or mine["verdict"] != "pass":
+        return False
+    return _floor_blocking_others(conn, thread_id, active, author)
+
+
+def _audit_floor_via_note(conn: sqlite3.Connection, thread_id: int,
+                           revision: int, members: list[str], budget: int) -> None:
+    """v2.11.0 (#81, dsh #934 §3 / dsh #935 §3)：F2 出口的关门审计——带
+    via=verdict_note + revision + 每人 used/cap 与 note 长度快照（pi #936 §4）。
+    只写在两个「关门成功」处（set_status 成功转移 / recompute 地板通过后），
+    绝不进 _floor_missing（C3 纯读）。每 (thread, revision) 一行：快照只在
+    首次通过时记，重复 recompute 不刷（#55③ 的去重口径）。"""
+    prev = conn.execute(
+        "SELECT 1 FROM verdict_events WHERE thread_id=? AND revision=?"
+        " AND action='floor_satisfied_via_note' LIMIT 1",
+        (thread_id, revision),
+    ).fetchone()
+    if prev is not None:
+        return
+    parts = []
+    for n in members:
+        used = _author_usage(conn, thread_id, n)
+        ln = conn.execute(
+            "SELECT MAX(LENGTH(TRIM(note))) FROM verdict_events"
+            " WHERE thread_id=? AND author=? AND revision=?"
+            " AND action IN ('verdict','verdict_free')"
+            " AND note IS NOT NULL AND TRIM(note)<>''",
+            (thread_id, n, revision),
+        ).fetchone()[0]
+        parts.append(f"{n}:used={used}/cap={budget},len(note)={ln}")
+    _audit(conn, "system", "floor_satisfied_via_note", thread_id=thread_id,
+           revision=revision,
+           note=f"via=verdict_note; {'; '.join(parts)} (v2.11.0 #81 F2)")
 
 
 # --- v2.10 (threads #77/#79): attention signal faces -------------------------
@@ -2882,17 +3168,10 @@ def _comment_due_face(conn: sqlite3.Connection, author: str) -> list[dict]:
         active = _active_quorum(conn, names)
         if author not in active:
             continue  # C1 (A3b/claude #477): suspended members are never nagged
-        silent, _why = _floor_missing(conn, r["id"])
+        silent, _why, _via = _floor_missing(conn, r["id"])
         if silent is None or author not in silent:
             continue  # satisfied for me, or floor watermark undeterminable
-        verdicts = {
-            v["author"]: v["verdict"]
-            for v in conn.execute(
-                "SELECT author, verdict FROM verdicts WHERE thread_id=?", (r["id"],)
-            ).fetchall()
-        }
-        others = [n for n in active if n != author]
-        blocking = bool(others) and all(verdicts.get(n) == "pass" for n in others)
+        blocking = _floor_blocking_others(conn, r["id"], active, author)
         out.append({"thread_id": r["id"], "blocking": blocking})
     return out
 
@@ -3047,7 +3326,7 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
             # 修订边界 = comments.id 水位线（bump 事件固定位 token；同秒歧义
             # 已被 dsh 盘上实证，时间戳坐标废弃）。
             # v2.9.4: 判据抽成 _floor_missing（与手动关帖共用同一实现）
-            silent, wm_why = _floor_missing(conn, thread_id)
+            silent, wm_why, via_note = _floor_missing(conn, thread_id)
             if silent is None:
                 _audit_blocked_once(
                     conn, thread_id, t["revision"], "floor_wm_missing",
@@ -3059,6 +3338,12 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
                     conn, thread_id, t["revision"], "discussion_floor",
                     f"reason=discussion_floor: {silent} 活跃成员本修订内无评论(先评论后判定)")
                 return
+            # v2.11.0 (#81, dsh #935 §3)：地板通过后写 F2 出口审计（关门成功处；
+            # 每 (thread, revision) 一行）。#80 的死结当年靠人肉复算才知道谁缺——
+            # 有了这行,事件流可诊断是哪条出口放的行。
+            if via_note:
+                _audit_floor_via_note(conn, thread_id, t["revision"], via_note,
+                                      t["per_author_budget"])
             suspended = [n for n in names if n not in active]
             # v2.9.2 §3 (thread #48): future-tense delivery gate — the creator
             # must have RECEIVED every co-member comment (delivery watermark,
