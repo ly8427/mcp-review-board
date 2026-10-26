@@ -145,7 +145,17 @@ class Harness(unittest.TestCase):
         v = list(self.st().values())[0]
         self.assertTrue(v["void"])
 
-    # ---------- F1 核销：同一条结构化记录 ----------
+    # ---------- F1+F4 核销：同一条调用记录 + 配对的成功结果 ----------
+
+    CALL_OK = ['{"toolCalls":[{"id":"call_ok1","name":"CronDelete","input":{"id":"42"}}]}',
+               '{"type":"tool_result","tool_use_id":"call_ok1","content":"deleted: true"}']
+    CALL_STR_ARGS = ['{"toolCalls":[{"id":"call_s1","name":"CronDelete",'
+                     '"arguments":"{\\"id\\":\\"42\\"}"}]}',
+                     '{"type":"tool_result","tool_use_id":"call_s1","content":"ok"}']
+    CALL_ERR = ['{"toolCalls":[{"id":"call_e1","name":"CronDelete","input":{"id":"42"}}]}',
+                '{"type":"tool_result","tool_use_id":"call_e1","is_error":true,'
+                '"content":"permission denied"}']
+    CALL_NO_RESULT = ['{"toolCalls":[{"id":"call_n1","name":"CronDelete","input":{"id":"42"}}]}']
 
     def _dispatched(self, initial_rollout):
         h = self._register()
@@ -156,43 +166,54 @@ class Harness(unittest.TestCase):
         self.assertTrue(v["dispatched"], "应已派发并记录锚点")
         return h
 
-    def test_verify_same_record_done(self):
+    def _check(self, h, rollout):
+        rc, b, _ = self.gate("汇报内容超过三十个字符,说明本轮情况,补足长度要求。",
+                             rollout=rollout, append=True)
+        return self.st()[h]
+
+    def test_verify_call_with_success_result_done(self):
+        """调用(带编号)+配对的非错误结果 → 销账。"""
         h = self._dispatched(['{"start":true}'])
-        self.gate("子代理已执行完毕并报告成功,本回合汇报结束,内容超过三十个字符。",
-                  rollout=['{"toolCalls":[{"name":"CronDelete","arguments":{"id":"42"}}]}'],
-                  append=True)
-        self.assertTrue(self.st()[h].get("done"))
+        self.assertTrue(self._check(h, self.CALL_OK).get("done"))
 
     def test_verify_string_form_args_done(self):
         h = self._dispatched(['{"start":true}'])
-        self.gate("子代理已执行完毕并报告成功,本回合汇报结束,内容超过三十个字符。",
-                  rollout=['{"toolCalls":[{"name":"CronDelete","arguments":"{\\"id\\":\\"42\\"}"}]}'],
-                  append=True)
-        self.assertTrue(self.st()[h].get("done"))
+        self.assertTrue(self._check(h, self.CALL_STR_ARGS).get("done"))
+
+    def test_verify_error_result_not_done(self):
+        """F4 翻转条件:调用存在但结果带错 → 不得销账。"""
+        h = self._dispatched(['{"start":true}'])
+        v = self._check(h, self.CALL_ERR)
+        self.assertFalse(v.get("done"))
+        self.assertFalse(v.get("alarm"))
+
+    def test_verify_call_without_result_not_done(self):
+        """F4 翻转条件:只有调用没有结果 → 不得销账。"""
+        h = self._dispatched(['{"start":true}'])
+        v = self._check(h, self.CALL_NO_RESULT)
+        self.assertFalse(v.get("done"))
+        self.assertFalse(v.get("alarm"))
 
     def test_verify_split_records_not_done(self):
-        """翻转条件:工具名与参数分属不同记录时不得核销。"""
+        """F1 翻转条件:工具名与参数分属不同记录时不得核销。"""
         h = self._dispatched(['{"start":true}'])
-        self.gate("汇报内容超过三十个字符,说明本轮情况,补足长度要求。",
-                  rollout=['{"toolCalls":[{"name":"CronDelete","arguments":{"id":"99"}}]}',
-                           '{"note":"别处出现的目标参数字符串 {\\"id\\":\\"42\\"}"}'],
-                  append=True)
-        v = self.st()[h]
+        v = self._check(h, ['{"toolCalls":[{"id":"call_x","name":"CronDelete","input":{"id":"99"}}]}',
+                            '{"type":"tool_result","tool_use_id":"call_x","content":"ok"}',
+                            '{"note":"别处出现的目标参数字符串 {\\"id\\":\\"42\\"}"}'])
         self.assertFalse(v.get("done"))
         self.assertFalse(v.get("alarm"))
 
     def test_verify_pre_offset_not_done(self):
-        """锚点之前就存在的同名同参调用不得核销。"""
-        h = self._dispatched(['{"toolCalls":[{"name":"CronDelete","arguments":{"id":"42"}}]}'])
-        self.gate("汇报内容超过三十个字符,说明本轮情况,补足长度要求。")
+        """锚点之前就存在的成功调用+结果不得核销。"""
+        h = self._dispatched(self.CALL_OK)
+        rc, b, _ = self.gate("汇报内容超过三十个字符,说明本轮情况,补足长度要求。")
         self.assertFalse(self.st()[h].get("done"))
 
     def test_verify_other_args_not_done(self):
         h = self._dispatched(['{"start":true}'])
-        self.gate("汇报内容超过三十个字符,说明本轮情况,补足长度要求。",
-                  rollout=['{"toolCalls":[{"name":"CronDelete","arguments":{"id":"99"}}]}'],
-                  append=True)
-        self.assertFalse(self.st()[h].get("done"))
+        v = self._check(h, ['{"toolCalls":[{"id":"call_y","name":"CronDelete","input":{"id":"99"}}]}',
+                            '{"type":"tool_result","tool_use_id":"call_y","content":"ok"}'])
+        self.assertFalse(v.get("done"))
 
     # ---------- F2 派发指令的参数安全 ----------
 
@@ -210,8 +231,7 @@ class Harness(unittest.TestCase):
     def test_re_register_same_order_gets_new_id(self):
         h1 = self._dispatched(['{"start":true}'])
         self.gate("子代理已执行完毕并报告成功,本回合汇报结束,内容超过三十个字符。",
-                  rollout=['{"toolCalls":[{"name":"CronDelete","arguments":{"id":"42"}}]}'],
-                  append=True)
+                  rollout=self.CALL_OK, append=True)
         self.assertTrue(self.st()[h1].get("done"))
         rc, b, _ = self.gate("同一单再次出现,说明文字超过三十个字符长度要求补足内容。\n"
                              + ORDER_LINE + "\n补长度。")

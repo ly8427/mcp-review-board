@@ -8,6 +8,11 @@ V1.3(2026-10-27):按评审第二轮收口 F1——核销证据从"锚点后区�
   无关);名称与参数分属不同记录/不同行 = 不算证据(保守待核转人工)。另修 V1.2
   边界:不再"单选一条最长正文",而是扫描全部回复候选串——长正文与独立短回执
   并存时两者都能被读到。
+V1.4(2026-10-27):按评审第三轮收口 F4——销账语义从"观察到目标调用"升级为
+  "观察到目标调用**且其执行结果(tool_use_id 配对)成功**":调用带唯一 id,结果
+  记录 {type:tool_result, tool_use_id, is_error} 按编号回指(格式为 2026-10-27
+  本机真实 rollout 采样实证);只有调用没结果 / 结果带错 / 调用无编号 → 不销账,
+  保守待核转人工。
 V1.2(2026-10-27):短回复修复(用户追问证伪"真实回复不可能少于 30 字"的判断)——
   待办单子的催办/派发/核对不再依赖正文提取,状态机始终运行;正文提取兜底接受
   含修复单/回执行的短串(V1.3 起由"扫描全部候选串"取代)。
@@ -212,28 +217,43 @@ def _value_matches_args(v, target, variants) -> bool:
     return False
 
 
-def _record_has_call(obj, tool: str, target, variants) -> bool:
-    """在**同一条**结构化记录(含嵌套)内找:名称字段 == tool 且其参数字段与
-    目标参数匹配。名称与参数分属不同记录/不同行 → 永不拼凑。"""
+def _collect_matching_calls(obj, tool: str, target, variants, out: list) -> None:
+    """在单条结构化记录(含嵌套)内找:名称字段 == tool 且参数字段与目标参数匹配
+    的调用;收集其 id(真实记录格式:toolCalls[].{id,name,input},2026-10-27 本机
+    实测采样)。名称与参数分属不同记录/不同行 → 永不拼凑。"""
     if isinstance(obj, dict):
         name = next((obj[k] for k in _NAME_KEYS if isinstance(obj.get(k), str)), None)
         if name == tool:
             for k in _ARGS_KEYS:
                 if k in obj and _value_matches_args(obj[k], target, variants):
-                    return True
+                    cid = obj.get("id")
+                    out.append(cid if isinstance(cid, str) else None)
+                    break
         for v in obj.values():
-            if _record_has_call(v, tool, target, variants):
-                return True
+            _collect_matching_calls(v, tool, target, variants, out)
     elif isinstance(obj, list):
         for v in obj:
-            if _record_has_call(v, tool, target, variants):
-                return True
-    return False
+            _collect_matching_calls(v, tool, target, variants, out)
+
+
+def _collect_results(obj, out: list) -> None:
+    """收集工具执行结果(真实记录格式:{type:"tool_result",tool_use_id,is_error,
+    content},按 tool_use_id 与调用 id 配对)。"""
+    if isinstance(obj, dict):
+        if obj.get("type") == "tool_result" and isinstance(obj.get("tool_use_id"), str):
+            out.append((obj["tool_use_id"], bool(obj.get("is_error"))))
+        for v in obj.values():
+            _collect_results(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _collect_results(v, out)
 
 
 def verify_execution(payload, tool: str, args: str, offset) -> bool:
-    """F1(V1.3):锚点后新增内容**逐行解析为 JSON**,在单条记录内要求工具名与
-    参数同时匹配;非 JSON 行/不支持的格式 → 不算证据(保守待核,超限转人工)。"""
+    """F1+F4(V1.4):销账证据 = 锚点后 ①存在同一条记录内 工具名+参数 双匹配的
+    调用(带 id) ②该调用的执行结果(tool_use_id 配对)存在且 is_error 不为真。
+    只有调用没结果 / 结果带错 / 调用不带编号(格式不受支持) → 一律不算成功,
+    保守待核,超限转人工——"发出过调用"绝不等于"修复成功"。"""
     appended = rollout_after(payload, offset)
     if not appended:
         return False
@@ -242,6 +262,8 @@ def verify_execution(payload, tool: str, args: str, offset) -> bool:
     except ValueError:
         target = None
     variants = _arg_variants(args)
+    call_ids = []
+    results = []
     for line in appended.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -250,9 +272,13 @@ def verify_execution(payload, tool: str, args: str, offset) -> bool:
             rec = json.loads(line)
         except ValueError:
             continue
-        if _record_has_call(rec, tool, target, variants):
-            return True
-    return False
+        _collect_matching_calls(rec, tool, target, variants, call_ids)
+        _collect_results(rec, results)
+    ids = {cid for cid in call_ids if cid}
+    if not ids:
+        return False
+    ok = {rid for rid, err in results if not err}
+    return any(rid in ok for rid in ids)
 
 
 # ---------- 编号与派发指令 ----------
@@ -384,9 +410,9 @@ def main() -> None:
                 continue  # 放行收工,报警文件留痕
             v["bounces"] = v.get("bounces", 0) + 1
             msgs.append(
-                f"修复单 {h} 在派发之后的原始会话记录中未找到 {tool} 与参数匹配的"
-                f"同条执行记录。若确已执行完,直接结束回合即可(本闸下次会核到);"
-                f"若尚未执行,按派发指令继续。")
+                f"修复单 {h} 在派发之后的原始会话记录中未找到『{tool} 以指定参数执行"
+                f"且结果成功』的证据。若确已执行成功,直接结束回合即可(本闸下次会核到);"
+                f"若尚未执行或执行失败,按派发指令继续或重开修复单。")
             need_bounce = True
 
     save_state(state)
