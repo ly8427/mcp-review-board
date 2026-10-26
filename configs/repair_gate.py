@@ -2,6 +2,15 @@
 # -*- coding: utf-8 -*-
 """repair-gate — 调用走样修复单机器闸(Stop hook)。2026-10-26 用户批准实施。
 
+V1.1(2026-10-27):按外部评审(GPT,PR #8 Request Changes)修复三项——
+  F1 核销证据改为三重关联:①派发时刻的字节锚点(只认锚点之后新增的记录,
+     派发前的旧调用天然排除)②工具名命中③参数序列化命中(原样/紧凑/默认间距
+     等变体)。任一不满足→保守待核,超限转人工,绝不误核销;
+  F2 看板派发指令的参数改经 base64 传递,模型提供的 JSON 不再拼进 shell 命令,
+     杜绝引号/命令替换被重解释;
+  F3 修复单编号 = 工具+参数哈希前 6 位 + 序号后缀(-2/-3/…),同工具同参数的
+     后续单子各自独立登记、独立生命周期,不再被旧记录吞掉。
+
 背景:模型在处置类工具调用(CronDelete/CronUpdate/看板写入)上有"想说A发成B"的
 生成层走样(2026-09-23/10-01/10-15/10-26 四次实证)。但**事后识别100%可靠**——
 每次走样都被模型当场从工具结果认出。本闸把"认出之后的修复"从模型的重试路径
@@ -9,24 +18,25 @@
 
 约定(见 ZCodeProject/AGENTS.md 2026-10-26 增补):认出走样后,在回复正文
 **行首裸写**一行固定格式修复单;本闸负责 登记→回执确认→派发→核销,全程
-退回式驱动,状态由本脚本的台账文件驱动(不要求后续回复重复单行)。V1 **没有
-脚本直接执行面**——执行一律派发给两条已实证通道:Cron 类=干净子代理(全新
-上下文,无走样先例);看板类=Bash 经 WSL rb.sh(10-15 实证)。脚本直接执行面
-=V2 欠账(需先接入 quorum_guard 同款治理检查,否则绕过建帖门),见 docs/DEBT.md #10。
+退回式驱动,状态由本脚本的台账文件驱动。V1 **没有脚本直接执行面**——执行
+一律派发给两条已实证通道:Cron 类=干净子代理(全新上下文,无走样先例);
+看板类=Bash 经 WSL rb.sh(10-15 实证)。脚本直接执行面=V2 欠账,见 docs/DEBT.md #10。
 
-防误触发五层(用户 2026-10-26 点名担忧"讨论中引用格式会被误触发"):
+防误触发五层:
   L1 行首精确前缀 `修复单::` + 白名单工具名 + 合法 JSON 参数;
-  L2 代码块/反引号内的内容不扫描(讨论引用按规矩放代码块里);
+  L2 代码块/反引号内的内容不扫描;
   L3 只扫当前这条回复(历史消息里的引用一律无效);
   L4 两段式确认:首次见到只登记,必须收到回执(`执行 <编号>` 或 `误报 <编号>`)
-     才派发——纯讨论性误触发在此层被拦;两次无回执自动作废;
-  L5 核销只认原始会话记录(rollout)里出现该工具名的执行痕迹,不认模型自述;
-     全部判定写日志 configs/repair-gate-log.txt。
+     才派发;两次无回执自动作废;
+  L5 核销只认原始会话记录(rollout)里 派发之后 出现的 工具名+参数 双命中,
+     不认模型自述;全部判定写日志 configs/repair-gate-log.txt。
 
-失败哲学:脚本任何异常一律放行(fail-open,不 brick 会话);但"不确定的修复单"
-只往 作废/待确认 方向走,绝不往执行方向走。每张单退回有上限,超限写报警文件
+失败哲学:脚本任何异常一律放行(fail-open,不 brick 会话)——因此本闸是
+"漏了有人工兜底"的护栏,不是强制执行的安全闸;但"不确定的修复单"只往
+作废/待确认 方向走,绝不往执行方向走。每张单退回有上限,超限写报警文件
 转人工,绝不把回合锁在循环里。
 """
+import base64
 import hashlib
 import json
 import os
@@ -40,7 +50,7 @@ LOG_PATH = os.environ.get("RB_REPAIR_LOG", os.path.join(BASE, "repair-gate-log.t
 ALARM_PATH = os.environ.get("RB_REPAIR_ALARM", os.path.join(BASE, "repair-gate-alarm.txt"))
 
 ORDER_RE = re.compile(r"^修复单::\s*([A-Za-z_][A-Za-z0-9_.]*?)\s+(\{.*\})\s*$")
-RECEIPT_RE = re.compile(r"^(执行|误报)\s+([0-9a-f]{6})\s*$")
+RECEIPT_RE = re.compile(r"^(执行|误报)\s+([0-9a-f]{6}(?:-[0-9]+)?)\s*$")
 ALLOW_TOOLS = {
     "CronDelete", "CronUpdate",
     "mcp__review-board__create_thread",
@@ -122,35 +132,91 @@ def strip_code(text: str) -> str:
     return text
 
 
-def rollout_tail(payload) -> str:
-    """读原始会话记录尾段(核销证据来源)。读不到返回空串(核销保守处理)。"""
+# ---------- rollout 读取与核销证据(F1 三重关联) ----------
+
+def _rollout_path(payload):
     sid = payload.get("session_id") if isinstance(payload, dict) else None
     sid = sid or os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("ZCODE_SESSION_ID")
     path = os.environ.get("AG_ROLLOUT")
     if not path and sid:
         path = os.path.join(os.path.expanduser("~"), ".zcode", "cli", "rollout",
                             f"model-io-session_{sid}.jsonl")
+    return path
+
+
+def rollout_size(payload) -> int:
+    """当前 rollout 文件字节数(派发时刻的锚点)。读不到返回 -1。"""
+    path = _rollout_path(payload)
     if not path:
+        return -1
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return -1
+
+
+def rollout_after(payload, offset) -> str:
+    """锚点之后新增的字节(上限 1 MiB)。文件不存在/比锚点还小(轮转清空)/锚点
+    无效 → 空串 = 保守待核,绝不把锚点前的旧记录当证据。"""
+    path = _rollout_path(payload)
+    if not path or not isinstance(offset, int) or offset < 0:
         return ""
     try:
+        if os.path.getsize(path) <= offset:
+            return ""
         with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - 262144))
-            return f.read().decode("utf-8", "replace")
+            f.seek(offset)
+            return f.read(1048576).decode("utf-8", "replace")
     except OSError:
         return ""
 
 
-def executed_in_tail(tail: str, tool: str) -> bool:
-    """L5:原始记录里出现该工具名的调用痕迹(多种记录格式兼容)。"""
-    if not tail or not tool:
+def _name_pats(tool: str):
+    return (f'"name": "{tool}"', f'"name":"{tool}"', f"'name': '{tool}'",
+            f"<name>{tool}</name>")
+
+
+def _arg_variants(args: str):
+    """参数在记录里可能以多种序列化形态出现,全部尝试(漏配新形态=待核,不误核)。"""
+    out = [args]
+    try:
+        parsed = json.loads(args)
+        for kw in ({"ensure_ascii": False, "separators": (",", ":")},
+                   {"ensure_ascii": False},
+                   {"separators": (",", ":")},
+                   {}):
+            try:
+                out.append(json.dumps(parsed, **kw))
+            except (TypeError, ValueError):
+                pass
+    except ValueError:
+        pass
+    return [v for v in out if v]
+
+
+def verify_execution(payload, tool: str, args: str, offset) -> bool:
+    """F1:成功证据必须同时满足 ①在派发锚点之后 ②工具名命中 ③参数序列化命中。
+    任一不满足 → False(保守待核,超限转人工)。"""
+    appended = rollout_after(payload, offset)
+    if not appended:
         return False
-    for pat in (f'"name": "{tool}"', f'"name":"{tool}"', f"'name': '{tool}'",
-                f"<name>{tool}</name>"):
-        if pat in tail:
-            return True
-    return False
+    if not any(p in appended for p in _name_pats(tool)):
+        return False
+    return any(v in appended for v in _arg_variants(args))
+
+
+# ---------- 编号与派发指令 ----------
+
+def alloc_order_id(state: dict, tool: str, args: str) -> str:
+    """F3:编号 = 哈希前 6 位,被占用时追加序号后缀(-2/-3/…),保证每张新单
+    独立登记、独立生命周期。"""
+    base = hashlib.sha256(f"{tool}|{args}".encode("utf-8")).hexdigest()[:6]
+    if base not in state:
+        return base
+    n = 2
+    while f"{base}-{n}" in state:
+        n += 1
+    return f"{base}-{n}"
 
 
 def dispatch_instruction(h: str, tool: str, args: str) -> str:
@@ -159,8 +225,10 @@ def dispatch_instruction(h: str, tool: str, args: str) -> str:
                 f"『调用 {tool} 工具,参数 {args},核对返回确认成功后报告结果』。"
                 f"禁止在本会话原地重发该调用(走样病灶);完成前本回合不会结束。")
     short = tool.replace("mcp__review-board__", "")
-    return (f"修复单 {h} 已确认。请在当前回合用 Bash 经 rb.sh 执行(换通道,10-15 实证):\n"
-            f"  wsl -e bash -c \"~/opt/rb/rb.sh {short} '{args}'\"\n"
+    b64 = base64.b64encode(args.encode("utf-8")).decode("ascii")
+    return (f"修复单 {h} 已确认。请在当前回合用 Bash 经 rb.sh 执行——参数经 base64 传递,"
+            f"避免 shell 重解释引号(10-15 实证通道):\n"
+            f"  wsl -e bash -c \"~/opt/rb/rb.sh {short} \\\"$(printf %s {b64} | base64 -d)\\\"\"\n"
             f"完成并核对返回成功前本回合不会结束。")
 
 
@@ -179,11 +247,10 @@ def main() -> None:
 
     plain = strip_code(text)
     state = load_state()
-    tail = rollout_tail(payload)
     now = time.time()
 
     # ---- 收集当前回复里的修复单与回执(L1/L2/L3) ----
-    orders = {}
+    orders = []
     receipts = {}
     for line in plain.splitlines():
         mo = ORDER_RE.match(line)
@@ -198,8 +265,7 @@ def main() -> None:
             except ValueError:
                 log("order-reject-json", args[:80])
                 continue
-            h = hashlib.sha256(f"{tool}|{args}".encode("utf-8")).hexdigest()[:6]
-            orders[h] = (tool, args)
+            orders.append((tool, args))
             continue
         mr = RECEIPT_RE.match(line)
         if mr:
@@ -219,11 +285,11 @@ def main() -> None:
             v["confirmed"] = True
             log("order-confirmed", h)
 
-    # ---- 新单登记 ----
-    for h, (tool, args) in orders.items():
-        if h not in state:
-            state[h] = {"ts": now, "bounces": 0, "confirmed": False, "tool": tool, "args": args}
-            log("order-register", f"{h} {tool}")
+    # ---- 新单登记(F3:独立编号) ----
+    for tool, args in orders:
+        h = alloc_order_id(state, tool, args)
+        state[h] = {"ts": now, "bounces": 0, "confirmed": False, "tool": tool, "args": args}
+        log("order-register", f"{h} {tool}")
 
     # ---- 台账状态机:驱动所有未结条目 ----
     msgs = []
@@ -234,7 +300,6 @@ def main() -> None:
         tool, args = v.get("tool", ""), v.get("args", "")
         if not v.get("confirmed"):
             if v.get("bounces", 0) >= 2:
-                # 两次催要回执无果 → 按误触发作废(真单可随时重开,作废有日志)
                 v["void"] = True
                 v["done"] = True
                 log("order-stale-void", h)
@@ -248,11 +313,12 @@ def main() -> None:
             need_bounce = True
         elif not v.get("dispatched"):
             v["dispatched"] = True
+            v["dispatch_offset"] = rollout_size(payload)  # F1:核销锚点=此刻文件字节位
             v["bounces"] = v.get("bounces", 0) + 1
             msgs.append(dispatch_instruction(h, tool, args))
             need_bounce = True
         else:
-            if executed_in_tail(tail, tool):
+            if verify_execution(payload, tool, args, v.get("dispatch_offset")):
                 v["done"] = True
                 v["finished"] = now
                 log("order-done", f"{h} {tool}")
@@ -266,11 +332,14 @@ def main() -> None:
                 except OSError:
                     pass
                 log("order-alarm", h)
+                # 报警文件的独立备份信号:标准错误流(宿主钩子日志可见),文件写失败也有痕
+                sys.stderr.write(f"[repair-gate] 修复单 {h} {tool} 多次派发未完成,转人工"
+                                 f"(报警文件 {ALARM_PATH})\n")
                 continue  # 放行收工,报警文件留痕
             v["bounces"] = v.get("bounces", 0) + 1
             msgs.append(
-                f"修复单 {h} 在原始会话记录中未见 {tool} 的执行痕迹。若确已执行完,"
-                f"直接结束回合即可(本闸下次会核到);若尚未执行,按派发指令继续。")
+                f"修复单 {h} 在派发之后的原始会话记录中未找到 {tool} 与参数的执行痕迹。"
+                f"若确已执行完,直接结束回合即可(本闸下次会核到);若尚未执行,按派发指令继续。")
             need_bounce = True
 
     save_state(state)
