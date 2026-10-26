@@ -19,6 +19,10 @@ V1.5(2026-10-27):按评审第四轮收口 F5/F6——
   不含"业务目标已确认实现"(留档,待实证返回形状后再加字段);
   F6:状态文件改原子写(临时文件+替换);写失败 → 停发一切派发/催办指令,
   报警(文件+标准错误)转人工,放行收工——状态未持久化绝不驱动副作用。
+V1.6(2026-10-27):按评审第五轮收口 F7——业务成功判定从子串搜索改为
+  **解析结果 JSON 后校验指定字段为 True**(CronDelete: result["deleted"]
+  is True);content 非字符串/解析失败/非对象/字段非 True → 一律待核,
+  不猜格式,绝不因"文本里出现过成功字样"而销账。
 V1.2(2026-10-27):短回复修复(用户追问证伪"真实回复不可能少于 30 字"的判断)——
   待办单子的催办/派发/核对不再依赖正文提取,状态机始终运行;正文提取兜底接受
   含修复单/回执行的短串(V1.3 起由"扫描全部候选串"取代)。
@@ -269,7 +273,7 @@ def _collect_results(obj, out: list) -> None:
     if isinstance(obj, dict):
         if obj.get("type") == "tool_result" and isinstance(obj.get("tool_use_id"), str):
             out.append((obj["tool_use_id"], bool(obj.get("is_error")),
-                        str(obj.get("content") or "")))
+                        obj.get("content")))
         for v in obj.values():
             _collect_results(v, out)
     elif isinstance(obj, list):
@@ -277,22 +281,28 @@ def _collect_results(obj, out: list) -> None:
             _collect_results(v, out)
 
 
-# F5(评审第四轮):有明确业务成功字段的工具,成功必须见到该字段——
-# "结果未报错"≠"业务达成"(例:CronDelete 正常返回 {"deleted": false})。
-# 无字段工具(看板族)的 V1 保证范围 = "结果未报错",已在文件头与 PR 留档。
-_SUCCESS_MARKERS = {
-    "CronDelete": ('"deleted": true', '"deleted":true', "deleted: true",
-                   "'deleted': True", '"deleted": True'),
-}
+# F5/F7(评审第四、五轮):业务成功 = **解析结果 JSON 后指定字段为 True**。
+# 不做子串搜索——"结果文本里恰好出现这几个字符"不算成功(评审反例:
+# {"deleted": false, "debug": "previous: \"deleted\": true"})。
+# content 非字符串/解析失败/非对象/字段非 True → 一律待核,不猜格式。
+_SUCCESS_FIELDS = {"CronDelete": ("deleted",)}
 
 
-def _result_success(tool: str, err: bool, content: str) -> bool:
+def _result_success(tool: str, err: bool, content) -> bool:
     if err:
         return False
-    markers = _SUCCESS_MARKERS.get(tool)
-    if markers:
-        return any(m in content for m in markers)
-    return True  # 无业务字段工具:V1 保证="结果未报错"(见文件头 F5 边界声明)
+    fields = _SUCCESS_FIELDS.get(tool)
+    if not fields:
+        return True  # 无业务字段工具:V1 保证="结果未报错"(文件头 F5 边界声明)
+    if not isinstance(content, str):
+        return False
+    try:
+        result = json.loads(content)
+    except ValueError:
+        return False
+    if not isinstance(result, dict):
+        return False
+    return all(result.get(f) is True for f in fields)
 
 
 def verify_execution(payload, tool: str, args: str, offset) -> bool:

@@ -25,6 +25,24 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 GATE = os.path.join(HERE, "configs", "repair_gate.py")
 PY = sys.executable
 
+
+def _call(cid, name="CronDelete", input=None, arguments=None):
+    """构造一条带编号的工具调用记录(真实 rollout 格式:toolCalls[].{id,name,input})。"""
+    c = {"id": cid, "name": name}
+    if arguments is not None:
+        c["arguments"] = arguments
+    else:
+        c["input"] = input if input is not None else {"id": "42"}
+    return json.dumps({"toolCalls": [c]}, ensure_ascii=False)
+
+
+def _res(rid, content, is_error=None):
+    """构造一条执行结果记录(真实 rollout 格式:{type:tool_result,tool_use_id,content})。"""
+    d = {"type": "tool_result", "tool_use_id": rid, "content": content}
+    if is_error is not None:
+        d["is_error"] = is_error
+    return json.dumps(d, ensure_ascii=False)
+
 ORDER_LINE = '修复单:: CronDelete {"id":"42"}'
 BOARD_ORDER = ('修复单:: create_thread {"title":"a\'; rm -rf /tmp/nope; `echo x` '
                '$(touch /tmp/rb-pwned)","context":"中文\\"引号\\"","n":3}')
@@ -145,18 +163,21 @@ class Harness(unittest.TestCase):
         v = list(self.st().values())[0]
         self.assertTrue(v["void"])
 
-    # ---------- F1+F4 核销：同一条调用记录 + 配对的成功结果 ----------
+    # ---------- F1+F4+F5+F7 核销：同一条调用记录 + 配对的成功结果 ----------
 
-    CALL_OK = ['{"toolCalls":[{"id":"call_ok1","name":"CronDelete","input":{"id":"42"}}]}',
-               '{"type":"tool_result","tool_use_id":"call_ok1","content":"{\\"deleted\\": true}"}']
-    CALL_STR_ARGS = ['{"toolCalls":[{"id":"call_s1","name":"CronDelete",'
-                     '"arguments":"{\\"id\\":\\"42\\"}"}]}',
-                     '{"type":"tool_result","tool_use_id":"call_s1",'
-                     '"content":"{\\"deleted\\": true}"}']
-    CALL_ERR = ['{"toolCalls":[{"id":"call_e1","name":"CronDelete","input":{"id":"42"}}]}',
-                '{"type":"tool_result","tool_use_id":"call_e1","is_error":true,'
-                '"content":"permission denied"}']
-    CALL_NO_RESULT = ['{"toolCalls":[{"id":"call_n1","name":"CronDelete","input":{"id":"42"}}]}']
+    OK_CONTENT = json.dumps({"deleted": True})
+    CALL_OK = [_call("call_ok1"), _res("call_ok1", OK_CONTENT)]
+    CALL_STR_ARGS = [_call("call_s1", arguments=json.dumps({"id": "42"})),
+                     _res("call_s1", OK_CONTENT)]
+    CALL_ERR = [_call("call_e1"), _res("call_e1", "permission denied", is_error=True)]
+    CALL_NO_RESULT = [_call("call_n1")]
+    # F7 翻转条件夹具:真实字段为否/字段缺失/内容不是 JSON/嵌套文本里出现成功字样
+    CALL_FALSE = [_call("call_b1"), _res("call_b1", json.dumps({"deleted": False}))]
+    CALL_NESTED_TRAP = [_call("call_t1"),
+                        _res("call_t1", json.dumps({"deleted": False,
+                                                     "debug": 'previous result: "deleted": true'}))]
+    CALL_MISSING_FIELD = [_call("call_m1"), _res("call_m1", json.dumps({"ok": 1}))]
+    CALL_INVALID_JSON = [_call("call_i1"), _res("call_i1", "not json at all")]
 
     def _dispatched(self, initial_rollout):
         h = self._register()
@@ -198,9 +219,28 @@ class Harness(unittest.TestCase):
     def test_verify_business_false_not_done(self):
         """F5 翻转条件:结果未报错但业务字段为否({"deleted": false}) → 不得销账。"""
         h = self._dispatched(['{"start":true}'])
-        v = self._check(h, ['{"toolCalls":[{"id":"call_b1","name":"CronDelete","input":{"id":"42"}}]}',
-                            '{"type":"tool_result","tool_use_id":"call_b1",'
-                            '"content":"{\\"deleted\\": false}"}'])
+        v = self._check(h, self.CALL_FALSE)
+        self.assertFalse(v.get("done"))
+        self.assertFalse(v.get("alarm"))
+
+    def test_verify_nested_marker_trap_not_done(self):
+        """F7 翻转条件:真实字段为否、嵌套文本里恰好出现成功字样 → 不得销账。"""
+        h = self._dispatched(['{"start":true}'])
+        v = self._check(h, self.CALL_NESTED_TRAP)
+        self.assertFalse(v.get("done"))
+        self.assertFalse(v.get("alarm"))
+
+    def test_verify_missing_success_field_not_done(self):
+        """F7 翻转条件:结果 JSON 里没有约定字段 → 不得销账。"""
+        h = self._dispatched(['{"start":true}'])
+        v = self._check(h, self.CALL_MISSING_FIELD)
+        self.assertFalse(v.get("done"))
+        self.assertFalse(v.get("alarm"))
+
+    def test_verify_invalid_json_content_not_done(self):
+        """F7 翻转条件:结果内容不是 JSON → 不得销账。"""
+        h = self._dispatched(['{"start":true}'])
+        v = self._check(h, self.CALL_INVALID_JSON)
         self.assertFalse(v.get("done"))
         self.assertFalse(v.get("alarm"))
 
