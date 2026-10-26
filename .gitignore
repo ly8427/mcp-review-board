@@ -35,3 +35,8 @@ dist/
 # runtime artifacts (watch-state task/event files, server backups)
 configs/watch-state/*/
 server.py.bak-*
+
+# repair-gate runtime artifacts (state/ledger/alarm — never publish)
+configs/repair-gate-state.json
+configs/repair-gate-log.txt
+configs/repair-gate-alarm.txt
