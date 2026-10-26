@@ -110,8 +110,8 @@ cycle() {
    ——先评论后投票,一次唤醒同时清两族(trae #791 增量2);
    ② 预算耗尽但本轮票面写过非空 note→地板已自动满足(F2),无需评论,照常投票/等收口;
    ③ 预算耗尽且没写过 note→先投免费首判票;我已投 pass 且其余活跃成员票全 pass 时,
-   post_comment 那条"地板句"不计费(F4 免费地板句,发完即收口);若日额/帖满也被拒,
-   只留一行说明并等人工(human_override)。
+   post_comment 那条"地板句"不计费(F4 免费地板句,发完、创建者读到后即收口);
+   若日额/帖满也被拒,只留一行说明并等人工(human_override)。
    blocking=false 的条目只是可见事实,**不为此专门评论**(自然参与该帖时顺带满足即可,防每轮骚扰=A5)。
 1) 调 mcp__review-board__list_comments_since(since="1h", author="dsh") 取增量(带 author,推进游标)
 2) 对需要你的线程用 get_thread 读全文(本次注意: reason=$reason, threads=$threads)

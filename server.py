@@ -879,7 +879,9 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 - **文案纪律**:预算/日额拒绝文案按出口真伪分支(#80 原病=两对文案互相指路的假建议);
   `my_comment_due` 语义随 F2 自然收窄(预算耗尽∧有非空 note 的成员不再列入,提醒与
   拒收不再并存——dsh #934 §5 验收②);成员侧三分支:有预算→真评论 / 无预算∧有 note→
-  无需动作 / 无预算∧空 note→免费地板句直接发(watcher 三载体同批)。
+  无需动作 / 无预算∧空 note→**先投免费首判票;自己已投 pass 且其余活跃成员全 pass 时
+  才可发免费地板句**(GPT PR#7 复审 P3 补:摘要与判据同步,勿写成"预算耗尽+空 note
+  即可直发";watcher 三载体同批)。
 """
 
 
@@ -2498,10 +2500,10 @@ def set_status(
                         f"active members with no comment in this revision: {silent}. "
                         "Ask each of them for one line (any comment). Budget-exhausted "
                         "members: a non-empty verdict note on this revision already "
-                        "satisfies the floor (v2.11.0 #81 F2), or they may post ONE "
-                        "free floor comment once every other active member has voted "
-                        "pass (#81 F4). Or use human_override=True when a human "
-                        "explicitly instructs the close."
+                        "satisfies the floor (v2.11.0 #81 F2); or, once they themselves "
+                        "AND every other active member have voted pass, they may post "
+                        "ONE free floor comment (#81 F4). Or use human_override=True "
+                        "when a human explicitly instructs the close."
                     )
             else:
                 floor_via = []
