@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS comments (
     line       INTEGER,                       -- optional: line number
     severity   TEXT,                          -- optional: info | minor | major | blocker
     status     TEXT    NOT NULL DEFAULT 'open', -- open | resolved | wontfix
-    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+    floor_exempt INTEGER NOT NULL DEFAULT 0   -- v2.11.0 (#81 F4): server-set only; exempt row
+                                               -- satisfies the floor but does NOT consume budget
 );
 
 CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments(thread_id);

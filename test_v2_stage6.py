@@ -296,13 +296,17 @@ def part_a_semantics():
         assert "not registered" in err.get("error", ""), err
 
         # part C (reuse this live server): protocol gate + board raw components
+        # 版本钉改为"header 必须等于服务端当前版本"(v2.9.3 钉在 v2.10.0 bump 时就
+        # 朽了——这次随 v2.11.0 (#81) 一并修;版本闸条款仍在正文):
         proto = tool("get_protocol", {})
-        assert "v2.9.3" in proto.splitlines()[0] and "版本闸" in proto, proto[:120]
+        import server as _srv_mod
+        assert proto.splitlines()[0].endswith(_srv_mod.PROTOCOL_VERSION) \
+            and "版本闸" in proto, proto[:120]
         page = urllib.request.urlopen(f"http://localhost:{PORT}/", timeout=10).read().decode()
         assert "画像:数据不足" in page           # c (4 firsts) → insufficient branch
         assert "首判20" in page                   # b → raw components, no composite (v2.9.2: TG 改 b-object 后 b 首判 19→20)
         assert "2.2-r3" in page                   # metric version travels with the brief
-        assert "协议 protocol v2.9.3" in page
+        assert f"协议 protocol v{_srv_mod.PROTOCOL_VERSION}" in page
     finally:
         proc.send_signal(signal.SIGTERM); proc.wait(timeout=10)
     print("✅ part A+C: adversarial sequence matrix — episode-local five-way "
