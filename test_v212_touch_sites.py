@@ -430,6 +430,15 @@ def main():
     check("K23 polled invitee reads 活跃, unbudged invitee still 受邀未到场",
           "k1 [活跃]" in roster and "k2 [受邀未到场]" in roster, roster)
 
+    # dsh #1296 §二: the FOURTH read face is the `/board` HTML strip, which K20-K23
+    # never touched ("0 test calls to _board_html").  An invitee used to render as
+    # "⚠️ k2 从未(受邀未到场)" — badge says "watcher broken", text says "never shown
+    # up". Pin the third state on the rendered markup, not on the helper.
+    board = srv._board_html()
+    check("K25 board HTML: invitee badge is 📨, never ⚠️ (fourth read face)",
+          "<span class='p'>📨 k2 从未(受邀未到场)" in board and "⚠️ k2" not in board,
+          [l for l in board.splitlines() if "k2" in l and "<span class='p'>" in l])
+
     # dsh #1293 §五1: an unparsable meta belongs to someone else (token_hash /
     # probe / hb_read).  Inviting must SKIP the mark, never "repair" the JSON by
     # overwriting it — that would let an inviter destroy another member's token.

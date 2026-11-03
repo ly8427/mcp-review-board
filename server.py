@@ -4481,12 +4481,18 @@ def _board_html() -> str:
         except (ValueError, TypeError):
             meta = {}
         last = p["last_seen"]
-        try:
-            then = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            idle = (datetime.now(timezone.utc) - then).total_seconds()
-        except (TypeError, ValueError):
-            idle = float("inf")
-        mark = "🟢" if idle < DISPLAY_IDLE_MIN * 60 else "⚠️"
+        if _invited_never_present(last, p["meta"]):
+            # v2.12.0 (1.1b/C2, dsh #1296 §二): the fourth read face. An invitee
+            # has never run a watcher, so ⚠️ ("watcher broken") would be a lie;
+            # three states here match the roster / seat list / profile.
+            mark = "📨"
+        else:
+            try:
+                then = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                idle = (datetime.now(timezone.utc) - then).total_seconds()
+            except (TypeError, ValueError):
+                idle = float("inf")
+            mark = "🟢" if idle < DISPLAY_IDLE_MIN * 60 else "⚠️"
         err = ""
         if meta.get("last_wake_error"):
             err = f" <span title='watcher wake failures'>🔧</span>"
