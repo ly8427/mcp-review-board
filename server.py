@@ -205,7 +205,7 @@ SUSPEND_AFTER_HOURS = 24
 # --- v2 A1: participant registry / heartbeat --------------------------------
 # Single source of truth for the served version (v2.9.3 #55: was duplicated in
 # three literals — FastMCP serverInfo, /ping, PROTOCOL header — and drifted).
-PROTOCOL_VERSION = "2.11.0"
+PROTOCOL_VERSION = "2.12.0"
 mcp = FastMCP("ReviewBoard", version=PROTOCOL_VERSION)  # align serverInfo with pyproject
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -612,14 +612,18 @@ def _f6_creator_gate(conn: sqlite3.Connection, author: str,
     顺序: S1+S2/S3 → 通道二(探针独立放行) → 冷启动(近24h无心跳, 可恢复) → 拒。
     P1 结构保证: 调用点的 _touch 只写 last_seen 不写 ring, 读到的 ring 是
     "入场前的真实节奏", 门不会自证。
-    Returns (ok, error_message, coldstart_exempted).
+    Returns (ok, error_message, exemption) where `exemption` is None or a
+    ``(audit_action, note)`` pair.  v2.12.0 (1.1a): the gate NEVER writes — a
+    gate that fires on a call which is then rejected must not leave an f6_*
+    audit row (thread #88 #1174 §三 / #1177 §三, sixth field).  The caller
+    records the exemption on its success path, after its `_touch`.
     """
     prow = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
     pmeta = json.loads(prow["meta"]) if prow and prow["meta"] else {}
     now = datetime.now(timezone.utc)
     ok, _why = _beat_ok(pmeta, now)
     if ok:
-        return True, "", False
+        return True, "", None
     # 通道二: 探针独立放行。create_thread 传入 context 时额外核对创建者以
     # form (a) 申报了唤醒入口（“申报入口与探针记录对应”的服务端可核部分）。
     cok, creasons, nprobe, _backlog = _probe_channel(conn, author, pmeta, now)
@@ -629,20 +633,44 @@ def _f6_creator_gate(conn: sqlite3.Connection, author: str,
             cok = False
             creasons.append("创建者未以 form (a) 申报唤醒入口")
     if cok:
-        _audit(conn, author, "f6_channel2",
-               note=f"probe {nprobe}/24h + no backlog; S2/S3 bypassed (v2.9.3 #53 通道二)")
-        return True, "", False
+        return True, "", (
+            "f6_channel2",
+            f"probe {nprobe}/24h + no backlog; S2/S3 bypassed (v2.9.3 #53 通道二)")
     # 冷启动: 近 24h 无任何心跳(探针/轮询) → 可恢复豁免, 不再看 ever_beats。
     if not _presence_ts(pmeta, now):
+        # v2.12.0 (batch1 1.1a, thread #88 #1173 §三①): the gate NO LONGER
+        # writes participants.meta — a gate that fires on a call that is then
+        # REJECTED must not mutate the roster (same invariant as the _touch
+        # sites). The counter and the audit row are persisted on the SUCCESS
+        # path only, via _f6_record_exemption(), AFTER the caller's _touch has
+        # guaranteed the row exists. (The old in-gate UPDATE was a silent no-op
+        # for a never-registered creator once _touch moved: the audit row
+        # remained but f6_coldstart_count / meta.f6_coldstart vanished.)
+        return True, "", (
+            "f6_coldstart",
+            "recoverable exemption: no heartbeat (probe/poll) in last 24h")
+    return False, _f6_gap_text(conn, author, pmeta, now), None
+
+
+def _f6_record_exemption(conn: sqlite3.Connection, author: str,
+                         exemption: tuple[str, str]) -> None:
+    """v2.12.0 (1.1a 附格): persist an F6 exemption on the SUCCESS path.
+
+    Must be called AFTER the caller's `_touch` in the same txn — `_set_meta` is
+    UPDATE-only, so a missing row would silently drop the cold-start counter
+    (the exact regression #1173 §三① named).  Rejected calls never reach here,
+    so they leave neither `participants.meta` changes nor f6_* audit rows.
+    """
+    action, note = exemption
+    if action == "f6_coldstart":
+        prow = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
+        pmeta = json.loads(prow["meta"]) if prow and prow["meta"] else {}
+        count = int(pmeta.get("f6_coldstart_count", 0)) + 1
         pmeta["f6_coldstart"] = True
-        pmeta["f6_coldstart_count"] = int(pmeta.get("f6_coldstart_count", 0)) + 1
-        conn.execute("UPDATE participants SET meta=? WHERE author=?",
-                     (json.dumps(pmeta, ensure_ascii=False), author))
-        _audit(conn, author, "f6_coldstart",
-               note=("recoverable exemption: no heartbeat (probe/poll) in last 24h "
-                     f"(count={pmeta['f6_coldstart_count']}, v2.9.3 #53)"))
-        return True, "", True
-    return False, _f6_gap_text(conn, author, pmeta, now), False
+        pmeta["f6_coldstart_count"] = count
+        _set_meta(conn, author, pmeta)
+        note = f"{note} (count={count}, v2.9.3 #53)"
+    _audit(conn, author, action, note=note)
 
 
 # --- v2.9.2 (#49): revision floor watermark ---------------------------------
@@ -882,6 +910,28 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
   无需动作 / 无预算∧空 note→**先投免费首判票;自己已投 pass 且其余活跃成员全 pass 时
   才可发免费地板句**(GPT PR#7 复审 P3 补:摘要与判据同步,勿写成"预算耗尽+空 note
   即可直发";watcher 三载体同批)。
+
+## v2.12.0 增补(thread #88 批次1·1.1a 定稿,2026-11-03——被拒调用不再刷心跳)
+- **心跳=一次成功调用,失败调用不写 last_seen**(备注 D 的机械面)。1.1a 把
+  `_touch` 站点从函数入口移到「最后一个可达 ERROR 之后、第一次状态写入之前」,
+  覆盖:claim_token(3:首发放/未 ack 重签/acked 重签)· ack_token(1)·
+  reset_token(1)· create_thread(创建者 + 受邀者)· set_verdict · bump_revision ·
+  set_quorum(创建者 + 新增名)· request_form_b · register_meta。落地站点数
+  **18**(机械门 `tools/check_touch_sites.py`,禁手写)。显式不在本条范围:
+  post_comment / reply_comment / set_status(预算/人工面,批次 4)。
+- **claim_token 首发放支是唯一允许「建行」的站点**:`_set_meta` 是 UPDATE-only,
+  首次发放必须先有 participants 行。被拒的 claim/ack/reset 不再建行、不再续
+  `last_seen`——匿名伪造 liveness 的通道关闭。
+- **幂等 ack 算到场**:站点在最后一个可达 ERROR 之后、幂等返回之前;语义仍是
+  「一次成功调用」,不引入「只有状态变更才算」的第二语义。
+- **冷启动计数移出 F6 门**:`_f6_creator_gate` 不再写 `participants.meta`;冷启动
+  的 `f6_coldstart`/`f6_coldstart_count` 由成功路径(`_f6_record_exemption`)
+  在 `_touch` 之后落库,被拒调用不再留状态。
+- **F-2(set_quorum 去重)**:结果名册里出现重复名 ⇒ 拒(`len(active)` 会长于
+  不同成员数,一个人即可满足 active>=2 自评自关)。
+- 版本闸三件套(**结构/返回契约/参数语义**)本条**零变更**:无 schema 改动;返回
+  体只新增上述两条 ERROR 文案(枚举形状不变);参数语义不变。随
+  `PROTOCOL_VERSION` 2.11.0→2.12.0 由 `attention_contract` 审计落一行(枚举表不变)。
 """
 
 
@@ -1601,11 +1651,15 @@ def claim_token(author: str) -> str:
     with db() as conn:
         if not author:
             return "ERROR: author required"
-        _touch(conn, author)  # registers the name if new ({} meta is fine)
         meta = _get_meta(conn, author)
         hint = ("persist it NOW (write file + read back), then ack_token — do NOT "
                 "go straight to governance: an auto-ack earns only the short lock")
         if not meta.get("token_hash"):
+            # v2.12.0 (batch1 1.1a, #1183/#1190 A): the ONLY site allowed to
+            # REGISTER a name — inside the issue branch, after every reachable
+            # ERROR exit, before the first state write. _set_meta is UPDATE-only
+            # (:1519-1521), so the row must exist before the hash is stored.
+            _touch(conn, author)  # registers the name if new ({} meta is fine)
             token = secrets.token_hex(16)
             meta.update(token_hash=hashlib.sha256(token.encode()).hexdigest(),
                         token_acked=False, token_issued_at=_now_iso())
@@ -1622,6 +1676,9 @@ def claim_token(author: str) -> str:
                         f"(claimant may have died before persisting). Free reissue "
                         f"available in {UNACKED_REISSUE_MIN - waited_min:.0f} min "
                         f"(rate limit), or ask the human for reset_token.")
+            # v2.12.0 (1.1a): success path only — the rate-limit reject above
+            # must NOT renew last_seen (that was the anonymous-liveness hole).
+            _touch(conn, author)
             token = secrets.token_hex(16)
             meta.update(token_hash=hashlib.sha256(token.encode()).hexdigest(),
                         token_acked=False, token_issued_at=_now_iso())
@@ -1641,6 +1698,10 @@ def claim_token(author: str) -> str:
             " ORDER BY id DESC LIMIT 1", (author,),
         ).fetchone()
         if last is None or _hours_since(last["created_at"]) >= window_h:
+            # v2.12.0 (1.1a): inside the THEN block — the lock-window reject at
+            # the end of this function is the ELSE side, so anchoring on the last
+            # textual ERROR would have produced dead code (#1183 §二.2).
+            _touch(conn, author)
             token = secrets.token_hex(16)
             meta.update(token_hash=hashlib.sha256(token.encode()).hexdigest(),
                         token_acked=False, token_acked_at=None,
@@ -1672,12 +1733,16 @@ def ack_token(author: str, token: str) -> str:
     longer strands the identity.
     """
     with db() as conn:
-        _touch(conn, author)
         meta = _get_meta(conn, author)
         if not meta or not meta.get("token_hash"):
             return "ERROR: no token issued for this name — claim_token first"
         if meta.get("token_hash") != hashlib.sha256(token.encode()).hexdigest():
             return "ERROR: token mismatch"
+        # v2.12.0 (1.1a, #1186 §二 / #1200 §二): after the LAST reachable ERROR
+        # and BEFORE the idempotent-ack plain return — a repeated ack is a
+        # successful, token-verified call, so it counts as presence (decision
+        # (a): heartbeat = one successful call, not "only state changes count").
+        _touch(conn, author)
         if meta.get("token_acked"):
             return f"Token for '{author}' already acknowledged at {meta.get('token_acked_at')}."
         meta["token_acked"] = True
@@ -1701,10 +1766,12 @@ def reset_token(author: str, human_override: bool = False) -> str:
     if not human_override:
         return "ERROR: reset_token requires human_override=True (set it only when the human explicitly instructs)"
     with db() as conn:
-        _touch(conn, author)
         meta = _get_meta(conn, author)
         if not meta:
             return "ERROR: unknown author"
+        # v2.12.0 (1.1a): after the only reachable ERROR — a rejected reset must
+        # not renew liveness (nor create a row for an unknown author).
+        _touch(conn, author)
         had = bool(meta.get("token_hash"))
         meta.pop("token_hash", None)
         meta.pop("token_acked", None)
@@ -1885,7 +1952,7 @@ def create_thread(
         return "ERROR: per_author_budget must be in [1, 100]"
     with db() as conn:
         _begin_write(conn)
-        _touch(conn, author)  # ORDER: register the creator BEFORE quorum check
+        exempt = None
         if quorum is not None:
             if not isinstance(quorum, list) or not all(isinstance(q, str) and q.strip() for q in quorum):
                 return "ERROR: quorum must be a list of non-empty name strings"
@@ -1924,19 +1991,14 @@ def create_thread(
             # 与 set_quorum 的 free→quorum 迁移共用同一实现(dsh #516③)。
             # v2.9.3 票3: pass context so 通道二 can verify the creator's form (a)
             # declaration (the server-checkable half of “入口与探针记录对应”).
-            ok, ferr, cold = _f6_creator_gate(conn, author, context=context)
+            ok, ferr, exempt = _f6_creator_gate(conn, author, context=context)
             if not ok:
                 return ferr
-            if cold:
-                # P3 冷启动：帖面可见标注（meta/审计留痕在 helper 内）
+            if exempt and exempt[0] == "f6_coldstart":
+                # P3 冷启动：帖面可见标注（计数在成功路径落库，见下）
                 context = (context or "") + (
                     f"\n[f6_coldstart: creator {author} had no heartbeat in the last 24h "
                     f"— recoverable exemption, audited (v2.9.3 #53)]")
-            for q in names:
-                # batch 1 (thread #22 #2+#7): pre-declared quorum auto-registers
-                # invitees (last_read=NULL → probe sees attention=1 → watchers
-                # can first-wake them without a manual poll).
-                _touch(conn, q)
             quorum_json = json.dumps(names, ensure_ascii=False)
         else:
             quorum_json = None
@@ -1947,6 +2009,19 @@ def create_thread(
         if author and quorum_json is None:
             if _count_today(conn, "threads", author) >= THREADS_PER_DAY:
                 return f"ERROR: daily thread-creation limit reached ({THREADS_PER_DAY}/day; quorum review threads are exempt)."
+        # v2.12.0 (batch1 1.1a, #1177 §六/#1173 §三①): creator + invitee
+        # heartbeats come AFTER every reachable ERROR in this function (the last
+        # one is the daily-cap reject on the free-thread branch). A rejected
+        # create must not write liveness or register anyone — the invariant the
+        # wake_infra comment above already claimed (v2.12.0 makes it literal).
+        _touch(conn, author)
+        if exempt:
+            _f6_record_exemption(conn, author, exempt)
+        for q in (names if quorum is not None else []):
+            # batch 1 (thread #22 #2+#7): pre-declared quorum auto-registers
+            # invitees (last_read=NULL → probe sees attention=1 → watchers
+            # can first-wake them without a manual poll).
+            _touch(conn, q)
         budget = per_author_budget if per_author_budget is not None else 20
         cur = conn.execute(
             "INSERT INTO threads(title, context, author, quorum, per_author_budget)"
@@ -2562,7 +2637,6 @@ def set_verdict(
         return "ERROR: 'object' requires a non-empty note: state what would change your verdict"
     with db() as conn:
         _begin_write(conn)
-        _touch(conn, author)
         t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
         if t is None:
             return f"ERROR: thread #{thread_id} does not exist"
@@ -2613,6 +2687,12 @@ def set_verdict(
                 "re-votes are free) or escalate to the human (wontfix requires "
                 "human_override)."
             )
+        # v2.12.0 (batch1 1.1a, #1177 §六): after the LAST reachable ERROR
+        # (budget gate above) and before the first verdict write — a rejected
+        # vote must not renew liveness (a bogus-token member used to stay
+        # "active" forever through failing set_verdict calls, masking
+        # token_invalid self-healing and blocking the floor/wake_ledger).
+        _touch(conn, author)
         conn.execute(
             "INSERT INTO verdicts(thread_id, author, verdict, note, updated_at)"
             " VALUES (?,?,?,?,?)"
@@ -2648,7 +2728,6 @@ def bump_revision(thread_id: int, author: str, token: str | None = None) -> str:
     """
     with db() as conn:
         _begin_write(conn)
-        _touch(conn, author)
         t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
         if t is None:
             return f"ERROR: thread #{thread_id} does not exist"
@@ -2657,6 +2736,8 @@ def bump_revision(thread_id: int, author: str, token: str | None = None) -> str:
         _tok_err = _token_gate(conn, author, token, thread_id)
         if _tok_err:
             return _tok_err
+        # v2.12.0 (batch1 1.1a): after the token gate — only success paths remain.
+        _touch(conn, author)
         new_rev = (t["revision"] or 1) + 1
         conn.execute("UPDATE threads SET revision=? WHERE id=?", (new_rev, thread_id))
         conn.execute("DELETE FROM verdicts WHERE thread_id=?", (thread_id,))
@@ -2712,7 +2793,7 @@ def set_quorum(
     """
     with db() as conn:
         _begin_write(conn)
-        _touch(conn, author)
+        exempt = None
         t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
         if t is None:
             return f"ERROR: thread #{thread_id} does not exist"
@@ -2750,21 +2831,33 @@ def set_quorum(
             # the same creator-cadence gate as create_thread — 单点瓶颈的义务
             # 不因入口不同而消失（封死"自由帖→set_quorum 增员"一步绕过）。
             if not names:
-                ok, ferr, _cold = _f6_creator_gate(conn, author)
+                ok, ferr, exempt = _f6_creator_gate(conn, author)
                 if not ok:
                     return ferr
         for q in (add or []):
             if q in names:
                 return f"ERROR: {q!r} already in quorum"
-            # batch 1 (thread #22): unseen names join as invitees instead of
-            # being rejected — the quorum list is the first-wake list.
-            _touch(conn, q)
         for q in (remove or []):
             if q not in names:
                 return f"ERROR: {q!r} not in current quorum"
         new_names = [n for n in names if n not in (remove or [])] + list(add or [])
+        # v2.12.0 (1.1a 附格, F-2): duplicate names pass the len>=2 check today
+        # and inflate len(active) downstream (_active_quorum appends, never
+        # dedupes) ⇒ ONE member can satisfy "active >= 2" and self-resolve.
+        if len(new_names) != len(set(new_names)):
+            return ("ERROR: resulting quorum contains duplicate names — a repeated "
+                    "name inflates the active count and enables self-judging (F-2)")
         if len(new_names) < 2:
             return "ERROR: resulting quorum would be < 2 (self-judging floor)"
+        # v2.12.0 (1.1a): heartbeats AFTER every reachable ERROR — a rejected
+        # amendment must not renew liveness nor register invitees.
+        _touch(conn, author)
+        if exempt:
+            _f6_record_exemption(conn, author, exempt)
+        for q in (add or []):
+            # batch 1 (thread #22): unseen names join as invitees instead of
+            # being rejected — the quorum list is the first-wake list.
+            _touch(conn, q)
         conn.execute("UPDATE threads SET quorum=? WHERE id=?",
                      (json.dumps(new_names, ensure_ascii=False), thread_id))
         _audit(conn, author, "set_quorum", thread_id=thread_id,
@@ -2801,7 +2894,6 @@ def request_form_b(
     import secrets as _secrets
     with db() as conn:
         _begin_write(conn)
-        _touch(conn, author)
         t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
         if t is None:
             return f"ERROR: thread #{thread_id} does not exist"
@@ -2813,6 +2905,9 @@ def request_form_b(
             return f"ERROR: thread is {t['status']} — (b) admission is open-thread-only"
         if not names or not all(isinstance(n, str) and n.strip() for n in names):
             return "ERROR: names must be a non-empty list of strings"
+        # v2.12.0 (1.1a): after the last reachable ERROR — a rejected nonce
+        # request must not renew liveness.
+        _touch(conn, author)
         clean = [n.strip() for n in names]
         nonce = _secrets.token_hex(16)
         now = datetime.now(timezone.utc)
@@ -2908,9 +3003,12 @@ def register_meta(
         return "ERROR: contract must be 'a' or 'b'"
     with db() as conn:
         _begin_write(conn)
-        _touch(conn, author)
         if not _token_ok(conn, author, token):
             return "ERROR: missing/invalid governance token — claim_token first"
+        # v2.12.0 (1.1a): after the token gate — a rejected declaration must not
+        # renew liveness. (This function has zero f-ERROR exits, so the old
+        # "last ERROR" criteria read green here no matter where _touch sat.)
+        _touch(conn, author)
         row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
         meta = json.loads(row["meta"]) if row and row["meta"] else {}
         meta["contract"] = contract
