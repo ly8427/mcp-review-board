@@ -270,8 +270,11 @@ def main():
     # v2.11.0 (thread #81) bumped the family further (floor×budget exits); the
     # gate keeps asserting "at least the 2.10 attention contract" — a regression
     # to 2.9.x still trips it.
-    check("契约: PROTOCOL_VERSION >= 2.10 (v2.11.0 #81 再 bump)",
-          srv.PROTOCOL_VERSION.startswith(("2.10", "2.11")), srv.PROTOCOL_VERSION)
+    # v2.12.0 (thread #88) bumped the family again; parse instead of enumerating
+    # prefixes so every future bump keeps the contract test meaningful.
+    _pv = tuple(int(x) for x in re.findall(r"\d+", srv.PROTOCOL_VERSION)[:2])
+    check("契约: PROTOCOL_VERSION >= 2.10 (v2.12.0 thread #88 再 bump)",
+          _pv >= (2, 10), srv.PROTOCOL_VERSION)
     h = header(srv, "brin")
     check("契约: needs_attention carries the three new keys",
           all(k in h for k in ("my_comment_due", "token_invalid", "token_blocked")),
