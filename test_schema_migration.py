@@ -11,6 +11,7 @@ Covers:
   f) schema.sql and the embedded _SCHEMA_FALLBACK create an IDENTICAL table
      set — the manual-sync debt is guarded by a test, not by hope
 """
+import json
 import os
 import sqlite3
 import subprocess
@@ -56,6 +57,13 @@ def main() -> None:
         m = _meta(db1)
         check("a1 fresh: schema_version stamped", m.get("schema_version") == str(server.SCHEMA_VERSION))
         check("a2 fresh: board_instance_id present", len(m.get("board_instance_id", "")) >= 16)
+        cn = sqlite3.connect(db1)
+        try:
+            fresh_cols = {r[1]: r[3] for r in cn.execute("PRAGMA table_info(participants)")}
+        finally:
+            cn.close()
+        check("a3 fresh (v2.12.0 1.1b/C2): participants.last_seen is nullable",
+              fresh_cols.get("last_seen") == 0)
 
         # b) legacy db with REAL data rows: a genuine pre-v2 threads table
         #    (no author/quorum/budget/revision) with a complete comments shape.
@@ -206,9 +214,9 @@ def main() -> None:
                 (1, 'h', 'same-sec-b', '2026-01-01 00:00:02');
             INSERT INTO comments(thread_id, author, body, created_at) VALUES
                 (1, 'h', 'after', '2026-01-01 00:00:03');
-            INSERT INTO participants(author, first_seen, last_seen, last_read)
+            INSERT INTO participants(author, first_seen, last_seen, last_read, meta)
                 VALUES ('reader', '2026-01-01 00:00:00', '2026-01-01 00:00:00',
-                        '2026-01-01 00:00:02');
+                        '2026-01-01 00:00:02', '{"token_hash":"deadbeef"}');
             INSERT INTO participants(author, first_seen, last_seen, last_read)
                 VALUES ('newbie', '2026-01-01 00:00:00', '2026-01-01 00:00:00',
                         NULL);
@@ -218,7 +226,8 @@ def main() -> None:
         server.BOARD_INSTANCE_ID = None
         server.init_db()
         c = sqlite3.connect(db5)
-        cols = {r[1] for r in c.execute("PRAGMA table_info(participants)")}
+        pinfo = {r[1]: r[3] for r in c.execute("PRAGMA table_info(participants)")}
+        cols = set(pinfo)
         got = dict(c.execute(
             "SELECT author, last_delivered_id FROM participants").fetchall())
         c.close()
@@ -231,6 +240,20 @@ def main() -> None:
               got.get("reader") == 1)
         check(f"g4 v5->v6: NULL last_read stays 0 / never-polled (got {got})",
               got.get("newbie") == 0)
+        # 1.1b/C2 rebuild: an old NOT NULL table is relaxed to nullable, rows kept
+        check("g5 v5 NOT NULL last_seen -> nullable after init_db "
+              "(v2.12.0 1.1b/C2 rebuild)", pinfo.get("last_seen") == 0)
+        # The rebuild copies a `keep` column list: if someone drops "meta" from
+        # it, every token_hash is silently wiped on first boot and all three
+        # suites stay green (dsh #1293 §五2).  The fixture now carries a payload
+        # ({"token_hash":"deadbeef"}) so the copy is asserted, not assumed.
+        c = sqlite3.connect(db5)
+        kept = json.loads(
+            c.execute("SELECT meta FROM participants WHERE author='reader'").fetchone()[0]
+            or "{}")
+        c.close()
+        check("g6 v5->v6 rebuild preserves meta payload (token_hash survives)",
+              kept.get("token_hash") == "deadbeef")
 
     print()
     if fails:

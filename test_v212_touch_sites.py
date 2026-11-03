@@ -12,8 +12,13 @@ Frozen shape (thread #88: #1177 §六 / #1183 §四 / #1184 §四 / #1186 §二 
   * F-2 (duplicate names in the resulting quorum) is rejected.
   * cold-start counter: a never-registered creator that succeeds gets
     f6_coldstart_count == 1 (kills the silent no-op regression, #1173 §三①).
-  * the mechanical gate (tools/check_touch_sites.py) prints 18 sites / 15 green
+  * 1.1b (C2): an invitee is registered but NOT present — new name gets
+    first_seen set, last_seen NULL, last_read NULL, meta.invited_at (and
+    invited_thread); an existing member's last_seen stays byte-identical when
+    invited; presence is earned by the invitee's own first poll.
+  * the mechanical gate (tools/check_touch_sites.py) prints 16 sites / 13 green
     / 3 documented out-of-scope red — numbers generated, never hand-written.
+    (1.1a's numbers were 18/15/3; 1.1b moved the two invite loops to `_invite`.)
 
 Baseline discipline (#1188 §二): before every "advanced" assertion the member's
 last_seen is back-dated via UPDATE (never "now vs now"), and every rejection
@@ -357,12 +362,90 @@ def main():
     out = srv.list_comments_since(author="b", since="now")
     check("I11 poll still advances last_seen (site unchanged)", ls(db, "b") > base)
 
+    # ================= K. 1.1b C2: invited != present
+    print("\n=== K. 1.1b C2: invite registration is not presence")
+    out = srv.create_thread(title="c2inv", author="a", quorum=["a", "k1", "k2"],
+                            context=fx.wi("a", "k1", "k2"))
+    check("K1 quorum create succeeds", "Created thread" in out, out)
+    tid_c2 = int(re.search(r"#(\d+)", out).group(1))
+    created = ro(db, "SELECT created_at FROM threads WHERE id=?", (tid_c2,))[0]
+    k1 = ro(db, "SELECT first_seen, last_seen, last_read, meta FROM participants WHERE author='k1'")
+    k1m = json.loads(k1[3] or "{}") if k1 else {}
+    check("K2 invitee row exists", bool(k1))
+    check("K3 invitee last_seen IS NULL (not stamped by the invite)", bool(k1) and k1[1] is None, k1)
+    check("K4 invitee first_seen is set", bool(k1) and bool(k1[0]), k1)
+    check("K5 invitee first_seen == threads.created_at (synthetic baseline shape)",
+          bool(k1) and k1[0] == created, (k1[0], created))
+    check("K6 invitee last_seen != threads.created_at (old C2 failure gone)",
+          bool(k1) and k1[1] != created, (k1[1], created))
+    check("K7 meta.invited_at recorded", k1m.get("invited_at") is not None, k1m)
+    check("K8 meta.invited_thread recorded", k1m.get("invited_thread") == tid_c2, k1m)
+    check("K9 invitee last_read IS NULL (first-wake semantics kept)",
+          bool(k1) and k1[2] is None, k1)
+    with srv.db() as conn:
+        active = srv._active_quorum(conn, ["a", "k1", "k2"])
+    check("K10 invitee is NOT counted active before showing up", "k1" not in active and "k2" not in active, active)
+
+    backdate(db, "b")
+    base, cnt = ls(db, "b"), n_rows(db)
+    out = srv.set_quorum(tid_c2, "a", token=tok["a"], add=["b"],
+                         wake_infra=fx.wi("a", "b"))
+    check("K11 set_quorum add succeeds", "Quorum updated" in out, out)
+    bm = meta(db, "b")
+    check("K12 existing member's last_seen byte-identical when invited", ls(db, "b") == base)
+    check("K13 existing member got meta.invited_at (no new row)", n_rows(db) == cnt and bm.get("invited_at") is not None, bm)
+    check("K14 existing member's invited_thread recorded", bm.get("invited_thread") == tid_c2, bm)
+
+    out = srv.set_quorum(tid_c2, "a", token=tok["a"], add=["k3"],
+                         wake_infra=fx.wi("a", "k3"))
+    k3 = ro(db, "SELECT first_seen, last_seen, last_read, meta FROM participants WHERE author='k3'")
+    k3m = json.loads(k3[3] or "{}") if k3 else {}
+    check("K15 set_quorum invite succeeds", "Quorum updated" in out, out)
+    check("K16 set_quorum invitee last_seen IS NULL / first_seen set",
+          bool(k3) and k3[1] is None and bool(k3[0]), k3)
+    check("K17 set_quorum invitee meta.invited_at + invited_thread",
+          k3m.get("invited_at") is not None and k3m.get("invited_thread") == tid_c2, k3m)
+
+    srv.list_comments_since(author="k1", since="now")
+    check("K18 presence is earned: first poll sets last_seen", ls(db, "k1") is not None, ls(db, "k1"))
+    with srv.db() as conn:
+        active2 = srv._active_quorum(conn, ["a", "k1", "k2"])
+    check("K19 polled invitee becomes active (k2 still not)", "k1" in active2 and "k2" not in active2, active2)
+
+    # ---- read faces: three states, not two (dsh #1293 §二) ----
+    # A never-present invitee must never be rendered as C1-suspended / “watcher
+    # broken”: the distinction is last_seen IS NULL ∧ meta.invited_at, and it is
+    # pinned here on the three read faces that used to fold it away.
+    roster = srv.list_participants()
+    check("K20 roster labels invitee 受邀未到场 (not ⚠️停摆)",
+          "k2 [受邀未到场]" in roster and "k2 [⚠️停摆]" not in roster, roster)
+    seats = srv.get_thread(tid_c2)
+    k2_lines = [l for l in seats.splitlines() if "k2" in l]
+    check("K21 seat list labels invitee invited(未到场), not suspended",
+          "[invited(未到场)]" in seats and "k2: — never voted [suspended]" not in seats,
+          k2_lines)
+    prof = json.loads(srv.reliability_profile("k2"))["participation"]["heartbeat"]
+    check("K22 profile: invited_now=True, suspended_now=False",
+          prof.get("invited_now") is True and prof.get("suspended_now") is False, prof)
+    check("K23 polled invitee reads 活跃, unbudged invitee still 受邀未到场",
+          "k1 [活跃]" in roster and "k2 [受邀未到场]" in roster, roster)
+
+    # dsh #1293 §五1: an unparsable meta belongs to someone else (token_hash /
+    # probe / hb_read).  Inviting must SKIP the mark, never "repair" the JSON by
+    # overwriting it — that would let an inviter destroy another member's token.
+    rw(db, "UPDATE participants SET meta='{broken' WHERE author='k2'")
+    with srv.db() as conn:
+        srv._invite(conn, "k2", tid_c2)
+    check("K24 invite over unparsable meta is skipped, not overwritten",
+          ro(db, "SELECT meta FROM participants WHERE author='k2'")[0] == "{broken",
+          ro(db, "SELECT meta FROM participants WHERE author='k2'"))
+
     # ================= J. mechanical gate
     print("\n=== J. mechanical gate (numbers generated by tools/check_touch_sites.py)")
     r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                     "tools", "check_touch_sites.py")],
                        capture_output=True, text=True)
-    check("J1 AST gate passes (18 sites / 15 green / 3 documented red)", r.returncode == 0,
+    check("J1 AST gate passes (16 sites / 13 green / 3 documented red; check-5 invite split)", r.returncode == 0,
           (r.stdout + r.stderr)[-600:])
     r2 = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                      "tools", "check_touch_sites.py"), "--self-test"],
