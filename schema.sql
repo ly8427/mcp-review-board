@@ -38,6 +38,8 @@ CREATE INDEX IF NOT EXISTS idx_comments_created ON comments(created_at);
 -- v2 A1: participant registry + heartbeat.
 -- last_seen  : any author-carrying call (or the /attention probe) upserts this —
 --              the "can participate" liveness signal (D1, see DESIGN-V2 备注 D).
+--              v2.12.0 (1.1b/C2): NULL = invited by create_thread/set_quorum but
+--              has never called yet (invitation writes meta.invited_at only).
 -- last_read  : legacy wall-clock face of the delivery watermark (v2.6, issue #3:
 --              second-resolution timestamps made it lose same-second comments;
 --              kept for old watcher kits, still written ONLY by list_comments_since).
@@ -50,7 +52,7 @@ CREATE INDEX IF NOT EXISTS idx_comments_created ON comments(created_at);
 CREATE TABLE IF NOT EXISTS participants (
     author            TEXT PRIMARY KEY,
     first_seen        TEXT NOT NULL,
-    last_seen         TEXT NOT NULL,
+    last_seen         TEXT,                   -- v2.12.0 (1.1b/C2): NULL = invited, never present
     last_read         TEXT,
     last_delivered_id INTEGER NOT NULL DEFAULT 0,
     meta              TEXT NOT NULL DEFAULT '{}'

@@ -143,7 +143,7 @@ CREATE INDEX IF NOT EXISTS idx_comments_created ON comments(created_at);
 CREATE TABLE IF NOT EXISTS participants (
     author            TEXT PRIMARY KEY,
     first_seen        TEXT NOT NULL,
-    last_seen         TEXT NOT NULL,
+    last_seen         TEXT,                          -- v2.12.0 (1.1b/C2): NULL = invited, never present
     last_read         TEXT,
     last_delivered_id INTEGER NOT NULL DEFAULT 0,
     meta              TEXT NOT NULL DEFAULT '{}'
@@ -234,8 +234,60 @@ def _touch(conn: sqlite3.Connection, author: str | None) -> None:
         # first-wake semantics unchanged).
 
 
-def _relative(utc: str) -> str:
-    """Duration-based display ('3 分钟前') — timezone-agnostic by construction."""
+def _invite(conn: sqlite3.Connection, author: str | None,
+            thread_id: int | None = None) -> None:
+    """Register an invitee WITHOUT making them look present (batch1 1.1b, C2).
+
+    Before v2.12.0 the two invite loops (`create_thread` / `set_quorum`) called
+    `_touch`, so pre-declaring a quorum stamped `last_seen = now` and the
+    invitee counted as an ACTIVE member before ever showing up — their
+    `last_seen` was byte-identical to `threads.created_at` (C2 反例判据).
+
+    Invitation now writes only `meta.invited_at` (+ `meta.invited_thread` when
+    known). A never-seen name is registered with `first_seen` set,
+    `last_seen` NULL and `last_read` NULL (probe still shows attention=1 → the
+    first-wake list is unchanged); an existing member's `last_seen` is left
+    byte-identical. Presence is earned by an actual call/poll (`_touch`).
+    """
+    if not author:
+        return
+    now = _now_iso()
+    row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
+    if row is None:
+        mark = {"invited_at": now}
+        if thread_id is not None:
+            mark["invited_thread"] = thread_id
+        conn.execute(
+            "INSERT INTO participants(author, first_seen, last_seen, last_read, meta)"
+            " VALUES(?,?,NULL,NULL,?)",
+            (author, now, json.dumps(mark, ensure_ascii=False)),
+        )
+        return
+    try:
+        mark = json.loads(row["meta"] or "{}")
+        if not isinstance(mark, dict):
+            raise ValueError("meta is not a JSON object")
+    except ValueError:
+        # dsh #1293 §五1: this meta belongs to SOMEONE ELSE (token_hash / probe /
+        # hb_read / f6_read_epoch).  A parse failure must not be "repaired" by
+        # overwriting it — the inviter would silently wipe the invitee's identity
+        # and token binding.  Skip the invite mark (fail-closed); a missed invite
+        # can be re-issued, a destroyed token_hash cannot be recovered by us.
+        return
+    mark["invited_at"] = now
+    if thread_id is not None:
+        mark["invited_thread"] = thread_id
+    conn.execute("UPDATE participants SET meta=? WHERE author=?",
+                 (json.dumps(mark, ensure_ascii=False), author))
+
+
+def _relative(utc: str | None) -> str:
+    """Duration-based display ('3 分钟前') — timezone-agnostic by construction.
+
+    NULL last_seen is a real state since v2.12.0 (1.1b/C2): an invitee that has
+    never made a call. It must render as such, not crash the roster."""
+    if not utc:
+        return "从未(受邀未到场)"
     try:
         then = datetime.strptime(utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
     except ValueError:
@@ -261,6 +313,26 @@ def _is_active(last_seen: str | None, now: datetime | None = None) -> bool:
         return False
     now = now or datetime.now(timezone.utc)
     return (now - then).total_seconds() < SUSPEND_AFTER_HOURS * 3600
+
+
+def _invited_never_present(last_seen: str | None, meta_json: str | None) -> bool:
+    """v2.12.0 (1.1b/C2): registered by an invite, never called since.
+
+    `_is_active(NULL)` is False for two very different states: a suspended
+    member (C1: heartbeat went stale) and an invitee that has not shown up yet.
+    Read faces must keep them apart — collapsing both into "suspended" prints
+    `[⚠️停摆]` (= the watcher is broken) for a member whose watcher was never
+    expected to run, and the quorum seat list shows `[suspended]` (dsh #1293
+    §二).  The single source of the distinction is (last_seen IS NULL) ∧
+    meta.invited_at, the same invariant `_invite` writes.
+    """
+    if last_seen is not None:
+        return False
+    try:
+        meta = json.loads(meta_json or "{}")
+    except (ValueError, TypeError):
+        return False
+    return isinstance(meta, dict) and bool(meta.get("invited_at"))
 
 
 def _oneline(s: str, limit: int) -> str:
@@ -724,7 +796,8 @@ def _revision_floor(conn: sqlite3.Connection, thread_id: int) -> tuple[int, bool
 PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 
 ## 成员
-- 开放成员制:首次带 author 的调用即注册(轮询即可,无需发帖)。v2.4(thread #22 批 1)增受邀制:create_thread / set_quorum 预声明的名单自动注册为受邀者(last_read=NULL——探针立刻可见 attention=1,watcher 可直接首唤,名单即首唤清单);受邀未到场者沉默不计超时,按 C1 冻结规则自然退出判定,决议门仍只认活跃成员。
+- 开放成员制:首次带 author 的调用即注册(轮询即可,无需发帖)。v2.4(thread #22 批 1)增受邀制:create_thread / set_quorum 预声明的名单自动注册为受邀者(last_read=NULL——探针立刻可见 attention=1,watcher 可直接首唤,名单即首唤清单);**受邀 ≠ 在场**(v2.12.0 C2):受邀只写 `meta.invited_at`,新名字 `first_seen` 有值而 `last_seen` 留 NULL——直到该成员真的调用/轮询一次才被算作活跃,受邀未到场者**从不进入活跃集合**(没有 24h 窗口可冻结),决议门只认活跃成员;自动关门仍须创建者在 wake_ledger 台账留痕(v2.12.0 增补末条)。
+- **在场 = 该次调用已通过全部门;被拒调用不续心跳、不登记**(v2.12.0 1.1a/1.1b 机械面,`_touch` 站点门见 `tools/check_touch_sites.py`)。
 - 身份分两层:展示层(发帖/回复)零仪式;治理层(判定/改 quorum)需 token。
 - **token 两段式(v2.1;v2.3 分层确认)**:claim_token 领取(明文一次,临时态)→
   **立即持久化(写文件并回读)**→ ack_token 确认。确认分两层:
@@ -911,14 +984,20 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
   才可发免费地板句**(GPT PR#7 复审 P3 补:摘要与判据同步,勿写成"预算耗尽+空 note
   即可直发";watcher 三载体同批)。
 
-## v2.12.0 增补(thread #88 批次1·1.1a 定稿,2026-11-03——被拒调用不再刷心跳)
+## v2.12.0 增补(thread #88 批次1·1.1a/1.1b 定稿,2026-11-03——被拒调用不再刷心跳;受邀不再冒标在线)
 - **心跳=一次成功调用,失败调用不写 last_seen**(备注 D 的机械面)。1.1a 把
   `_touch` 站点从函数入口移到「最后一个可达 ERROR 之后、第一次状态写入之前」,
   覆盖:claim_token(3:首发放/未 ack 重签/acked 重签)· ack_token(1)·
-  reset_token(1)· create_thread(创建者 + 受邀者)· set_verdict · bump_revision ·
-  set_quorum(创建者 + 新增名)· request_form_b · register_meta。落地站点数
-  **18**(机械门 `tools/check_touch_sites.py`,禁手写)。显式不在本条范围:
+  reset_token(1)· create_thread(创建者)· set_verdict · bump_revision ·
+  set_quorum(创建者)· request_form_b · register_meta。落地站点数
+  **16**(机械门 `tools/check_touch_sites.py`,禁手写)。显式不在本条范围:
   post_comment / reply_comment / set_status(预算/人工面,批次 4)。
+- **受邀注册不走 `_touch`(1.1b, C2)**:create_thread / set_quorum 的名单循环
+  改调 `_invite`:只写 `meta.invited_at`(+`meta.invited_thread`);新名字建行时
+  `first_seen` 有值、`last_seen` 留 NULL、`last_read` NULL(探针 attention=1
+  不变),已有成员的 `last_seen` 逐字节不变。⇒ 不变量:新受邀者
+  `last_seen IS NULL ∧ first_seen 有值 ∧ meta.invited_at 有值`(改前基线:受邀者
+  `last_seen` 与 `threads.created_at` 同秒 2/2 命中,即「受邀冒充活跃」)。
 - **claim_token 首发放支是唯一允许「建行」的站点**:`_set_meta` 是 UPDATE-only,
   首次发放必须先有 participants 行。被拒的 claim/ack/reset 不再建行、不再续
   `last_seen`——匿名伪造 liveness 的通道关闭。
@@ -929,9 +1008,19 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
   在 `_touch` 之后落库,被拒调用不再留状态。
 - **F-2(set_quorum 去重)**:结果名册里出现重复名 ⇒ 拒(`len(active)` 会长于
   不同成员数,一个人即可满足 active>=2 自评自关)。
-- 版本闸三件套(**结构/返回契约/参数语义**)本条**零变更**:无 schema 改动;返回
-  体只新增上述两条 ERROR 文案(枚举形状不变);参数语义不变。随
+- 版本闸三件套(**结构/返回契约/参数语义**):**1.1b 有结构变更**——
+  `participants.last_seen` 由 NOT NULL 放宽为可空(受邀未到场必须可表示);
+  `schema.sql` 与 `_SCHEMA_FALLBACK` 两处同改;旧库靠 `PRAGMA table_info` 的
+  notnull 旗标**结构探测**收敛(不加版本梯级:梯级封顶 CORE 6,v7 归 search
+  引导),首启会做一次 participants 整表重建(DROP+复制+RENAME),`schema_version`
+  仍为 7。返回体只新增上述两条 ERROR 文案(枚举形状不变);参数语义不变。随
   `PROTOCOL_VERSION` 2.11.0→2.12.0 由 `attention_contract` 审计落一行(枚举表不变)。
+- **受邀未到场不阻塞决议,但自动关门仍须台账**(dsh #1293 §四,定案①认):
+  受邀未到场者从不进入活跃集合 ⇒ 不再有「24h 冻结窗口」,其余活跃成员全 pass 后
+  当天即可收口;但 `recompute_thread` 把「名册内非活跃者」喂给 wake_ledger 门 ⇒
+  创建者仍须在本修订内留一条行首 `^wake_ledger:` 台账覆盖每个受邀幽灵
+  (`result: timeout|error`),即「不阻塞 ≠ 不留痕」。台账是自述,不校验真尝试
+  (改前既有性质)。
 """
 
 
@@ -946,10 +1035,12 @@ def get_protocol() -> str:
 def list_participants() -> str:
     """List registered participants with liveness status.
 
-    Returns one line per participant: author, status (活跃/空闲/⚠️停摆 — display
-    tier, 30min idle threshold), last heartbeat (relative time), and any
+    Returns one line per participant: author, status (活跃 / ⚠️停摆 / 受邀未到场 —
+    display tier, 30min idle threshold), last heartbeat (relative time), and any
     last_wake_error from meta (watcher failure gate, C1.2) so a human can tell
-    'waiting for the member' from 'fix its watcher'.
+    'waiting for the member' from 'fix its watcher'.  ⚠️停摆 must NOT be printed
+    for a never-present invitee: that member's watcher was never expected to
+    have run yet (dsh #1293 §二 — the three states are not interchangeable).
     """
     with _connect() as conn:
         rows = conn.execute(
@@ -967,9 +1058,10 @@ def list_participants() -> str:
         try:
             then = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             idle_secs = (datetime.now(timezone.utc) - then).total_seconds()
-        except ValueError:
+        except (TypeError, ValueError):
             idle_secs = float("inf")
-        status = "活跃" if idle_secs < DISPLAY_IDLE_MIN * 60 else "⚠️停摆"
+        status = ("受邀未到场" if _invited_never_present(last, r["meta"])
+                  else "活跃" if idle_secs < DISPLAY_IDLE_MIN * 60 else "⚠️停摆")
         extra = ""
         if meta.get("last_wake_error"):
             extra = f"  [wake-error: {meta['last_wake_error']}]"
@@ -1049,6 +1141,47 @@ def _floor_exempt_shape(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE comments ADD COLUMN floor_exempt INTEGER NOT NULL DEFAULT 0"
         )
+
+
+def _participants_nullable_last_seen(conn: sqlite3.Connection) -> None:
+    """v2.12.0 (1.1b/C2): participants.last_seen must be NULLABLE.
+
+    An invitee is registered but not present: `first_seen` set, `last_seen`
+    NULL. The pre-v2.12 table declared `last_seen TEXT NOT NULL`, which makes
+    that state unrepresentable — the old `_touch`-in-invite-loop behaviour was
+    the only way to satisfy the constraint.
+
+    SQLite cannot drop a NOT NULL in place, so this rebuilds the table
+    (idempotent + structurally detected, same family as `_floor_exempt_shape`).
+    It is NOT a version-ladder step: the ladder tops out at CORE (6) while v7
+    is owned by the capability-gated search bootstrap — a second claimant of
+    the same number would be the two-sources-of-truth bug this project keeps
+    killing.  The shape converges by detection instead of by stamp.
+
+    `DROP TABLE IF EXISTS` first: if a previous start died between CREATE and
+    the copy, the next start must converge, not crash on a leftover table.
+    """
+    info = {r[1]: r for r in conn.execute("PRAGMA table_info(participants)")}
+    col = info.get("last_seen")
+    if col is None or not col[3]:       # col[3] = notnull flag
+        return
+    keep = [c for c in ("author", "first_seen", "last_seen", "last_read",
+                        "last_delivered_id", "meta") if c in info]
+    conn.execute("DROP TABLE IF EXISTS participants_c2_rebuild")
+    conn.execute(
+        "CREATE TABLE participants_c2_rebuild ("
+        " author TEXT PRIMARY KEY,"
+        " first_seen TEXT NOT NULL,"
+        " last_seen TEXT,"
+        " last_read TEXT,"
+        " last_delivered_id INTEGER NOT NULL DEFAULT 0,"
+        " meta TEXT NOT NULL DEFAULT '{}')"
+    )
+    cols = ",".join(keep)
+    conn.execute(f"INSERT INTO participants_c2_rebuild({cols})"
+                 f" SELECT {cols} FROM participants")
+    conn.execute("DROP TABLE participants")
+    conn.execute("ALTER TABLE participants_c2_rebuild RENAME TO participants")
 
 
 def _v21_token_backfill(conn: sqlite3.Connection) -> None:
@@ -1136,6 +1269,8 @@ def init_db() -> None:
                     "UPDATE meta SET value=? WHERE key='schema_version'",
                     (str(CORE_SCHEMA_VERSION),),
                 )
+        # v2.12.0 (1.1b/C2): invited-but-never-present is a real state now.
+        _participants_nullable_last_seen(conn)
         # v2.8 (threads #39/#40): search layer bootstrap — capability check,
         # atomic 6 -> 7 apply (fts table + triggers + rebuild + ready marker +
         # version stamp, one transaction), or consistency verify/repair on an
@@ -1940,8 +2075,14 @@ def create_thread(
             name that has never been seen is registered with last_read=NULL,
             so its watcher probe returns attention=1 immediately (full
             backlog) — the invite list doubles as the first-wake list.
-            Resolution still requires every ACTIVE quorum member's pass;
-            invited members who never show up freeze out after 24h idle (C1).
+            v2.12.0 (1.1b, C2): the invitee's last_seen stays NULL (only
+            meta.invited_at is written) — being invited is not being present;
+            liveness starts with the invitee's own first call/poll.
+            Resolution still requires every ACTIVE quorum member's pass; an
+            invitee that never shows up is never in the active set (there is
+            no 24h window to freeze out of), so it cannot block resolution.
+            The auto-close path still requires the creator's `^wake_ledger:`
+            entry covering it (v2.12.0 addendum: not blocking != no trace).
             NULL/omitted = free thread (creator closes it manually, v1).
         per_author_budget: budget per author per thread (default 20; covers
             posts + replies + costed verdict flips).
@@ -2017,11 +2158,6 @@ def create_thread(
         _touch(conn, author)
         if exempt:
             _f6_record_exemption(conn, author, exempt)
-        for q in (names if quorum is not None else []):
-            # batch 1 (thread #22 #2+#7): pre-declared quorum auto-registers
-            # invitees (last_read=NULL → probe sees attention=1 → watchers
-            # can first-wake them without a manual poll).
-            _touch(conn, q)
         budget = per_author_budget if per_author_budget is not None else 20
         cur = conn.execute(
             "INSERT INTO threads(title, context, author, quorum, per_author_budget)"
@@ -2029,6 +2165,13 @@ def create_thread(
             (title, context, author, quorum_json, budget),
         )
         tid = cur.lastrowid
+        for q in (names if quorum is not None else []):
+            # batch 1 (thread #22 #2+#7): pre-declared quorum auto-registers
+            # invitees (last_read=NULL → probe sees attention=1 → watchers
+            # can first-wake them without a manual poll).
+            # v2.12.0 (1.1b, C2): registration is NOT presence — `_invite`
+            # writes meta.invited_at and leaves last_seen NULL for a new name.
+            _invite(conn, q, tid)
     return (
         f"Created thread #{tid}: {title}\n"
         f"Share this id with the other reviewers. New members: read get_protocol first."
@@ -2378,13 +2521,18 @@ def get_thread(thread_id: int) -> str:
             ).fetchall()
             for n in names:
                 row = conn.execute(
-                    "SELECT last_seen FROM participants WHERE author=?", (n,)
+                    "SELECT last_seen, meta FROM participants WHERE author=?", (n,)
                 ).fetchone()
-                liveness[n] = (
-                    "unregistered" if row is None
-                    else "active" if _is_active(row["last_seen"])
-                    else "suspended"
-                )
+                if row is None:
+                    liveness[n] = "unregistered"
+                elif _invited_never_present(row["last_seen"], row["meta"]):
+                    # three-state read face (dsh #1293 §二): an invitee that has
+                    # never called is NOT C1-suspended; it must not read as one.
+                    liveness[n] = "invited(未到场)"
+                elif _is_active(row["last_seen"]):
+                    liveness[n] = "active"
+                else:
+                    liveness[n] = "suspended"
             for ev in v_events:
                 if ev["action"] in ("verdict", "verdict_free"):
                     trails.setdefault(ev["author"], []).append(
@@ -2857,7 +3005,8 @@ def set_quorum(
         for q in (add or []):
             # batch 1 (thread #22): unseen names join as invitees instead of
             # being rejected — the quorum list is the first-wake list.
-            _touch(conn, q)
+            # v2.12.0 (1.1b, C2): invitation never renews presence (see _invite).
+            _invite(conn, q, thread_id)
         conn.execute("UPDATE threads SET quorum=? WHERE id=?",
                      (json.dumps(new_names, ensure_ascii=False), thread_id))
         _audit(conn, author, "set_quorum", thread_id=thread_id,
@@ -4037,7 +4186,8 @@ def _profile_numbers(conn: sqlite3.Connection, author: str) -> dict:
     thread_status = {t["id"]: t["status"] for t in threads}
 
     # ---- participation (observable facts, no endogenous ground truth) ----
-    suspended = not _is_active(p["last_seen"])
+    invited_now = _invited_never_present(p["last_seen"], p["meta"])
+    suspended = not _is_active(p["last_seen"]) and not invited_now
     wake_err = meta.get("last_wake_error") or None
 
     awaiting_threads: list[int] = []
@@ -4078,6 +4228,7 @@ def _profile_numbers(conn: sqlite3.Connection, author: str) -> dict:
     participation = {
         "heartbeat": {
             "suspended_now": suspended,
+            "invited_now": invited_now,
             "last_seen": _relative(p["last_seen"]),
             "first_seen": _relative(p["first_seen"]),
         },
@@ -4330,12 +4481,18 @@ def _board_html() -> str:
         except (ValueError, TypeError):
             meta = {}
         last = p["last_seen"]
-        try:
-            then = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            idle = (datetime.now(timezone.utc) - then).total_seconds()
-        except ValueError:
-            idle = float("inf")
-        mark = "🟢" if idle < DISPLAY_IDLE_MIN * 60 else "⚠️"
+        if _invited_never_present(last, p["meta"]):
+            # v2.12.0 (1.1b/C2, dsh #1296 §二): the fourth read face. An invitee
+            # has never run a watcher, so ⚠️ ("watcher broken") would be a lie;
+            # three states here match the roster / seat list / profile.
+            mark = "📨"
+        else:
+            try:
+                then = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                idle = (datetime.now(timezone.utc) - then).total_seconds()
+            except (TypeError, ValueError):
+                idle = float("inf")
+            mark = "🟢" if idle < DISPLAY_IDLE_MIN * 60 else "⚠️"
         err = ""
         if meta.get("last_wake_error"):
             err = f" <span title='watcher wake failures'>🔧</span>"
