@@ -91,8 +91,10 @@ def parents(tree: ast.AST) -> dict:
     return p
 
 
-DESCEND = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith,
-           ast.Try, ast.TryStar, ast.Match)
+# Statement lists a site can be a DIRECT child of.  Function/class bodies are
+# anchors in their own right (see owning_blocks); they are NOT descended into by
+# reachable_returns (a nested `def`'s `return` is not reachable from the site).
+OWN_BODY = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
 
 def block_children(stmt: ast.stmt) -> list[list[ast.stmt]]:
@@ -113,6 +115,35 @@ def block_children(stmt: ast.stmt) -> list[list[ast.stmt]]:
     elif isinstance(stmt, ast.Match):
         out += [c.body for c in stmt.cases]
     return out
+
+
+def owning_blocks(parent: ast.AST) -> list[list[ast.stmt]]:
+    """Statement lists in which `parent` directly owns a child statement.
+
+    Function/class bodies must be anchors of their own: a site sitting directly
+    in a function body has to be judged against THAT body.  Without them the
+    climb stops at `Module.body`, `idx` points at the `def`, and
+    `reachable_returns` scans module-level statements — where `return` is a
+    syntax error — so `bad` is forever empty and the site is structurally green
+    (thread #91 §二, P16-class false green).  The old `DESCEND` constant was
+    defined but never read, so editing it had zero effect (claude #1270).
+    """
+    if isinstance(parent, OWN_BODY):
+        return [parent.body]
+    return block_children(parent)
+
+
+def locate(site: ast.AST, par: dict) -> tuple[list[ast.stmt] | None, int | None]:
+    """The (statement list, index) that directly owns `site` — never ascending
+    past the innermost function/class/module body.  (None, None) if unplaceable."""
+    cur = site
+    while id(cur) in par:
+        parent = par[id(cur)]
+        for lst in owning_blocks(parent):
+            if any(s is cur for s in lst):
+                return lst, lst.index(cur)
+        cur = parent
+    return None, None
 
 
 def reachable_returns(stmts: list[ast.stmt], start: int) -> list[ast.Return]:
@@ -139,21 +170,78 @@ def gate4_failures(tree: ast.AST) -> list[tuple[str, int]]:
     return bad
 
 
+def red_by_function(tree: ast.AST) -> list[str]:
+    """Check-2 classification over a parsed tree: enclosing functions judged RED."""
+    par = parents(tree)
+    owner = enclosing_func(tree)
+    red = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_touch" and node.args
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "conn"):
+            continue
+        stmts, idx = locate(node, par)
+        if stmts is None:
+            red.append("<no enclosing block>")
+            continue
+        if any(head_is_error(r.value) for r in reachable_returns(stmts, idx + 1)):
+            red.append(owner.get(id(node), "?"))
+    return sorted(set(red))
+
+
 def self_test() -> int:
-    """Prove gate-4 can report red (a gate that never fires is not a gate)."""
-    cases = [
+    """Prove both gates can report red (a gate that never fires is not a gate)."""
+    ok = True
+    g4_cases = [
         ("def claim_token():\n    try:\n        return 'x'\n"
          "    except Exception:\n        return 'ERROR: x'\n", 1),
         ("def claim_token():\n    return 'x'\n", 0),
         ("def unrelated():\n    try:\n        return 'x'\n"
          "    except Exception:\n        return 'y'\n", 0),
     ]
-    ok = True
-    for src, want in cases:
+    for src, want in g4_cases:
         got = len(gate4_failures(ast.parse(src)))
         good = got == want
         ok = ok and good
         print(f"self-test gate-4 want={want} got={got} {'OK' if good else 'FAIL'}")
+
+    # check-2 self-test: a FUNCTION-BODY-level site must be judged against its own
+    # body.  Case 1 is the blind spot itself (green before the FunctionDef anchor,
+    # red after) — it proves both that the hole existed and that the fix closes it.
+    loc_cases = [
+        ("def heartbeat_and_recompute(conn):\n"
+         "    _touch(conn, 'a')\n"
+         "    return 'ERROR: x'\n", ["heartbeat_and_recompute"]),
+        ("def heartbeat_and_recompute(conn):\n"
+         "    _touch(conn, 'a')\n"
+         "    return 'ok'\n", []),
+        # nested def's ERROR return is NOT reachable from the site
+        ("def heartbeat_and_recompute(conn):\n"
+         "    _touch(conn, 'a')\n"
+         "    def inner():\n"
+         "        return 'ERROR: x'\n"
+         "    return 'ok'\n", []),
+        # an ERROR return BEFORE the site is not reachable
+        ("def heartbeat_and_recompute(conn):\n"
+         "    if conn:\n"
+         "        return 'ERROR: x'\n"
+         "    _touch(conn, 'a')\n"
+         "    return 'ok'\n", []),
+        # ERROR inside a `try` body after the site IS reachable (TryStar shape too)
+        ("def claim_token(conn):\n"
+         "    _touch(conn, 'a')\n"
+         "    try:\n"
+         "        return 'ERROR: x'\n"
+         "    except Exception:\n"
+         "        return 'ok'\n", ["claim_token"]),
+    ]
+    for src, want in loc_cases:
+        got = red_by_function(ast.parse(src))
+        good = got == want
+        ok = ok and good
+        print(f"self-test check-2 want={want} got={got} {'OK' if good else 'FAIL'}")
+
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
@@ -187,21 +275,7 @@ def main() -> int:
     # ---- check 2: per-site mirror classification ----
     red = []
     for site in sites:
-        stmts, idx = None, None
-        cur = site
-        while id(cur) in par:
-            parent = par[id(cur)]
-            for lst in ([parent.body] if isinstance(parent, ast.Module) else
-                        block_children(parent) + (
-                            [parent.body] if isinstance(parent, ast.If) or
-                            isinstance(parent, (ast.For, ast.AsyncFor, ast.While,
-                                                ast.With, ast.AsyncWith, ast.Try)) else [])):
-                if any(s is cur for s in lst):
-                    stmts, idx = lst, lst.index(cur)
-                    break
-            if stmts is not None:
-                break
-            cur = parent
+        stmts, idx = locate(site, par)
         if stmts is None:
             print(f"  ?? line {site.lineno}: no enclosing block")
             ok = False

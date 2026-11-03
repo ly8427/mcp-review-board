@@ -28,6 +28,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 
 import test_fixture as fx
 
@@ -48,11 +49,19 @@ def ro(db, q, a=()):
 
 
 def rw(db, q, a=()):
+    """Write helper; returns the affected row count.
+
+    Returns rowcount explicitly (not the cursor): the cursor dies with the
+    connection in `finally`, so callers could never read `cur.rowcount` — that
+    is exactly why the P15 fixture assert was impossible before (thread #91 §三).
+    """
     c = sqlite3.connect(db, timeout=10)
     try:
         c.execute("PRAGMA busy_timeout=5000")
-        c.execute(q, a)
+        cur = c.execute(q, a)
+        count = cur.rowcount
         c.commit()
+        return count
     finally:
         c.close()
 
@@ -76,7 +85,33 @@ def meta(db, n):
 
 
 def backdate(db, n):
-    rw(db, "UPDATE participants SET last_seen=datetime('now','-1 hour') WHERE author=?", (n,))
+    """P15 three-piece fixture: (1) row pre-built by the caller, (2) the backdate
+    ASSERTED (rowcount == 1 + sentinel read-back), (3) the sentinel legal.
+
+    Without the assert, B2/D2's `ls(...) == base` is a false green when the row is
+    missing: `ls()` returns None on both sides and "byte-identical" holds
+    vacuously (thread #91 §三; B5/D4 would raise TypeError instead, so only the
+    equality cases were silently green).  "Every case builds its row" is a
+    fixture convention, not a check.
+    """
+    updated = rw(db, "UPDATE participants SET last_seen=datetime('now','-1 hour') WHERE author=?", (n,))
+    assert updated == 1, (
+        f"fixture: backdate matched {updated} rows for {n!r} "
+        "(missing row => B2/D2 false green)")
+    sentinel = ls(db, n)
+    assert sentinel is not None, f"fixture: no last_seen read back for {n!r}"
+    # legal sentinel: same shape as server._now_iso() (`%Y-%m-%d %H:%M:%S`),
+    # parseable, and genuinely back-dated (~1h, not "now vs now")
+    try:
+        stamp = datetime.strptime(sentinel, "%Y-%m-%d %H:%M:%S")
+    except ValueError as exc:
+        raise AssertionError(
+            f"fixture: backdated last_seen {sentinel!r} is not _now_iso()-shaped") from exc
+    age_min = (datetime.now(timezone.utc).replace(tzinfo=None) - stamp).total_seconds() / 60
+    assert 30 <= age_min <= 90, (
+        f"fixture: backdated sentinel {sentinel!r} is {age_min:.1f} min old "
+        "(want 30..90; the UPDATE no longer moves the row?)")
+    return sentinel
 
 
 def tok_of(out):
