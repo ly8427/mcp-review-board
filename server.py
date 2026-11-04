@@ -1196,10 +1196,15 @@ def _v21_token_backfill(conn: sqlite3.Connection) -> None:
     for author, meta_raw in conn.execute(
         "SELECT author, meta FROM participants"
     ).fetchall():
-        try:
-            meta = json.loads(meta_raw or "{}")
-        except (ValueError, TypeError):
-            meta = {}
+        state, meta = _meta_obj(meta_raw)
+        if state in (META_INVALID_JSON, META_NON_OBJECT):
+            # v2.12.0 (batch1 票B, #1307 §二): one bad row must not abort the
+            # whole startup migration (today `meta.get` is outside the parse
+            # try, so this row kills `main()` and every restart).  Fail soft
+            # per row, leave the bytes untouched (repair belongs to the
+            # recovery routes) and audit a fingerprint for discoverability.
+            _audit_meta_unparsable(conn, author, meta_raw, state, "init_db")
+            continue
         if meta.get("token_hash") and "token_acked" not in meta:
             meta["token_acked"] = True
             meta["token_acked_at"] = _now_iso()
@@ -1693,14 +1698,51 @@ UNACKED_REISSUE_MIN = float(os.environ.get("REVIEWBOARD_UNACKED_REISSUE_MIN", "1
 # default to 'explicit' (conservative: no behavior change for existing ids).
 
 
-def _get_meta(conn: sqlite3.Connection, author: str) -> dict:
+# v2.12.0 (batch1 票B, #1307 §五 / #1309 §三 / #1315 §二): the four-state
+# reader.  The old two-state `_get_meta` collapsed "row missing" and "row has
+# garbage" into the same `{}`, which is exactly how the break-glass path came
+# to say "unknown author" for a row that exists (#1308 §三-1).  Callers that
+# need to distinguish the states use `_meta_obj` / `_meta_state`; `_get_meta`
+# keeps its historical return shape (dict for parsed dicts and for missing /
+# unparsable rows, the raw non-dict object for a parsed non-object) so that the
+# second batch can migrate read sites one at a time.
+META_DICT = "dict"
+META_MISSING = "missing"
+META_INVALID_JSON = "invalid_json"
+META_NON_OBJECT = "non_object"
+
+
+def _meta_obj(raw: str | None) -> tuple[str, object]:
+    """Parse a raw participants.meta value into one of four states.
+
+    missing (raw None / caller has no row) / invalid_json / non_object /
+    dict.  Never raises; never invents a dict for a non-dict payload.
+    """
+    if raw is None:
+        return META_MISSING, {}
+    try:
+        obj = json.loads(raw or "{}")
+    except (ValueError, TypeError):
+        return META_INVALID_JSON, {}
+    if not isinstance(obj, dict):
+        return META_NON_OBJECT, obj
+    return META_DICT, obj
+
+
+def _meta_state(conn: sqlite3.Connection, author: str) -> tuple[str, object, str | None]:
+    """Four-state lookup: (state, parsed object, raw text)."""
     row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
     if row is None:
-        return {}
-    try:
-        return json.loads(row["meta"] or "{}")
-    except (ValueError, TypeError):
-        return {}
+        return META_MISSING, {}, None
+    state, obj = _meta_obj(row["meta"])
+    return state, obj, row["meta"]
+
+
+def _get_meta(conn: sqlite3.Connection, author: str) -> dict:
+    state, obj, _raw = _meta_state(conn, author)
+    if state in (META_DICT, META_NON_OBJECT):
+        return obj
+    return {}
 
 
 def _set_meta(conn: sqlite3.Connection, author: str, meta: dict) -> None:
@@ -1735,6 +1777,31 @@ def _audit(conn, author: str, action: str, thread_id: int | None = None,
         " revision, costed, note) VALUES (?,?,?,?,?,?,?,?)",
         (thread_id, author, action, from_v, to_v, revision, costed, note),
     )
+
+
+def _meta_fingerprint(raw: str | None) -> tuple[str, int]:
+    """(sha256 prefix, byte length) of the ORIGINAL meta bytes — never the text."""
+    data = (raw or "").encode("utf-8", "surrogatepass")
+    return hashlib.sha256(data).hexdigest()[:16], len(data)
+
+
+def _audit_meta_unparsable(conn, author: str, raw: str | None,
+                           state: str, where: str) -> None:
+    """Audit a bad meta row by fingerprint only (author + sha256 prefix + len).
+
+    Deduplicated on the full note: repeated starts / polls of the same bad row
+    do not grow the audit log.  Raw content is deliberately NOT stored
+    (#1307 §五, #1308 §五).
+    """
+    fp, length = _meta_fingerprint(raw)
+    note = f"where={where} state={state} sha256={fp} len={length}"
+    prev = conn.execute(
+        "SELECT 1 FROM verdict_events WHERE author=? AND action='meta_unparsable'"
+        " AND note=? LIMIT 1", (author, note),
+    ).fetchone()
+    if prev is not None:
+        return
+    _audit(conn, author, "meta_unparsable", note=note)
 
 
 def _audit_blocked_once(conn, thread_id: int, revision: int, reason: str,
@@ -1788,7 +1855,14 @@ def claim_token(author: str) -> str:
     with db() as conn:
         if not author:
             return "ERROR: author required"
-        meta = _get_meta(conn, author)
+        meta_state, meta, meta_raw = _meta_state(conn, author)
+        if meta_state in (META_INVALID_JSON, META_NON_OBJECT):
+            # v2.12.0 (batch1 票B): `claim_token` already rebuilt this row
+            # silently for invalid JSON (and crashed for parsed non-objects).
+            # Make the repair explicit and leave a fingerprint before the
+            # overwrite; token issuance below is the intended self-heal path.
+            _audit_meta_unparsable(conn, author, meta_raw, meta_state, "claim_token")
+            meta = {}
         hint = ("persist it NOW (write file + read back), then ack_token — do NOT "
                 "go straight to governance: an auto-ack earns only the short lock")
         if not meta.get("token_hash"):
@@ -1870,7 +1944,16 @@ def ack_token(author: str, token: str) -> str:
     longer strands the identity.
     """
     with db() as conn:
-        meta = _get_meta(conn, author)
+        meta_state, meta, meta_raw = _meta_state(conn, author)
+        if meta_state in (META_INVALID_JSON, META_NON_OBJECT):
+            # Do NOT rewrite here: ack has no token to verify and the original
+            # bytes must survive until the designated break-glass (reset) or
+            # the self-heal claim runs.  Report the real cause instead of the
+            # old "no token issued" misdiagnosis (#1308 §三-1).
+            _audit_meta_unparsable(conn, author, meta_raw, meta_state, "ack_token")
+            return (f"ERROR: meta_unparsable for '{author}' — the row exists but its "
+                    f"meta is not a JSON object; run claim_token (self-heal) or "
+                    f"reset_token(human_override=True)")
         if not meta or not meta.get("token_hash"):
             return "ERROR: no token issued for this name — claim_token first"
         if meta.get("token_hash") != hashlib.sha256(token.encode()).hexdigest():
@@ -1903,9 +1986,17 @@ def reset_token(author: str, human_override: bool = False) -> str:
     if not human_override:
         return "ERROR: reset_token requires human_override=True (set it only when the human explicitly instructs)"
     with db() as conn:
-        meta = _get_meta(conn, author)
-        if not meta:
+        meta_state, meta, meta_raw = _meta_state(conn, author)
+        rebuilt = meta_state in (META_INVALID_JSON, META_NON_OBJECT)
+        if meta_state == META_MISSING or (not meta and not rebuilt):
             return "ERROR: unknown author"
+        if rebuilt:
+            # Break-glass must work on a bad row (#1307 §四): the row exists,
+            # so "unknown author" would be a lie.  Fingerprint the original
+            # bytes, then rebuild a clean dict; reset is the one route allowed
+            # to overwrite unparsable meta.
+            _audit_meta_unparsable(conn, author, meta_raw, meta_state, "reset_token")
+            meta = {}
         # v2.12.0 (1.1a): after the only reachable ERROR — a rejected reset must
         # not renew liveness (nor create a row for an unknown author).
         _touch(conn, author)
@@ -1918,7 +2009,9 @@ def reset_token(author: str, human_override: bool = False) -> str:
         _set_meta(conn, author, meta)
         _audit(conn, author, "token_reset_human", note="human_override reset; next claim issues fresh")
         return (f"Token cleared for '{author}' ({'had one' if had else 'had none'}). "
-                f"The identity's next claim_token issues a fresh token.")
+                f"The identity's next claim_token issues a fresh token."
+                + (" Original unparsable meta was fingerprinted in the audit log "
+                   "before the rebuild." if rebuilt else ""))
 
 
 def _hours_since(utc: str) -> float:
