@@ -267,7 +267,9 @@ def _invite(conn: sqlite3.Connection, author: str | None,
         mark = json.loads(row["meta"] or "{}")
         if not isinstance(mark, dict):
             raise ValueError("meta is not a JSON object")
-    except ValueError:
+    except (ValueError, TypeError):
+        # dsh #1302/#1305: json.loads(<non-str/bytes>) raises TypeError, which the
+        # ValueError-only guard let escape (same shape as _invited_never_present).
         # dsh #1293 §五1: this meta belongs to SOMEONE ELSE (token_hash / probe /
         # hb_read / f6_read_epoch).  A parse failure must not be "repaired" by
         # overwriting it — the inviter would silently wipe the invitee's identity
