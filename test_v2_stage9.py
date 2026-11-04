@@ -44,6 +44,9 @@ import urllib.request
 
 import test_fixture as fx  # v2.9.2 fixture: wake_infra ctx + F6 beat priming
 
+# dsh #1327 §三-1: 哨兵单源(a/c 两处暂缓都引用它)
+SENTINEL = '2026-01-01 00:00:00'
+
 PORT = 8779
 URL = f"http://localhost:{PORT}/mcp"
 DB = None
@@ -99,6 +102,7 @@ def main():
     proc = subprocess.Popen(
         [sys.executable, os.path.join(os.path.dirname(__file__) or ".", "server.py")],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    c_suspended = False   # dsh #1325 §一: flag 只在 §239-243 成功之后置位
     try:
         wait_port(PORT)
         fx.prime_beats(DB, ['a', 'b', 'c', 'h'])  # v2.9.2: F6 预热(合成心跳环)
@@ -190,8 +194,8 @@ def main():
 
         # --- 4. liveness face: stale heartbeat renders suspended -----------
         con = sqlite3.connect(DB)
-        con.execute("UPDATE participants SET last_seen='2026-01-01 00:00:00'"
-                    " WHERE author='a'")
+        con.execute("UPDATE participants SET last_seen=?"
+                    " WHERE author='a'", (SENTINEL,))
         con.commit()
         con.close()
         face = tool("get_thread", {"thread_id": tid})
@@ -237,27 +241,47 @@ def main():
             tool("post_comment", {"thread_id": gid, "author": m, "body": f"{m} asym note"})
         poll("h")
         con = sqlite3.connect(DB)   # c goes suspended; its object stands frozen
-        con.execute("UPDATE participants SET last_seen='2026-01-01 00:00:00'"
-                    " WHERE author='c'")
+        cur = con.execute("UPDATE participants SET last_seen=?"
+                          " WHERE author='c'", (SENTINEL,))
+        assert cur.rowcount == 1, \
+            f"fixture: suspension UPDATE matched {cur.rowcount} rows (row missing?)"
         con.commit()
         con.close()
+        readback = sqlite3.connect(DB).execute(
+            "SELECT last_seen FROM participants WHERE author='c'").fetchone()
+        assert readback is not None and readback[0] == SENTINEL, \
+            f"fixture: c 暂缓未落库 got={readback!r}"
+        c_suspended = True
+        # manual gate: FULL roster — c's missing pass rejects (stricter)
+        # 必须在台账入库之前：台账 post_comment 会当场触发 auto 门关帖
+        r = tool("set_status", {"thread_id": gid, "status": "resolved",
+                                "author": "h"})
+        assert "quorum-gated" in r and "verdicts from: ['c']." in r, r
         # v2.9 wake_ledger: 越过暂缓的 c 关门需创建者台账(timeout 过门)
         tool("post_comment", {"thread_id": gid, "author": "h",
                               "body": "wake_ledger:\n- name: c | result: timeout"})
-        # manual gate: FULL roster — c's missing pass rejects (stricter)
-        r = tool("set_status", {"thread_id": gid, "status": "resolved",
-                                "author": "h"})
-        assert "missing 'pass' verdicts from" in r and "'c'" in r, r
-        # auto gate: ACTIVE roster only — a's next heartbeat resolves
+        # auto gate: ACTIVE roster only — 台账入库即触发(auto), a 的轮询只是幂等复跑
         poll("a")
         face = tool("get_thread", {"thread_id": gid})
         assert "[resolved]" in face, face[:200]
         gate = face.split("gate:")[1]
         assert "active quorum unanimous: a pass · b pass" in gate, gate
     finally:
-        proc.send_signal(signal.SIGTERM)
-        proc.wait(timeout=10)
-        shutil.rmtree(tmp, ignore_errors=True)
+        # dsh #1327 §三-3: 外层也包 —— send_signal/wait 抛也要跑到断言与 rmtree
+        try:
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=10)
+        finally:
+            try:
+                if c_suspended:
+                    row = sqlite3.connect(DB).execute(
+                        "SELECT last_seen FROM participants WHERE author='c'"
+                    ).fetchone()
+                    # dsh #1327 §二: 现场已判"暂缓是否落库" ⇒ 终局只判复活
+                    assert row is not None and row[0] == SENTINEL, \
+                        f"c 复活了 => 本用例前提已破 got={row!r}"
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
     print("✅ STAGE9 TESTS PASSED: verdict read face — seats/never-voted, "
           "notes+trails, auto_resolve tally in gate, bump-cleared vs "
           "never-voted, C3 pure-read, suspended liveness, free-thread "

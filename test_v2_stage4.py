@@ -102,6 +102,10 @@ def main():
   })
         tid = int(out.split("#")[1].split(":")[0])
 
+        # v2.10 #77 档A: 无 token 的成员会落 token_invalid 族、抢在
+        # awaiting_verdict 前面 ⇒ 先 claim 再做 reason 断言（票 C 族一）
+        tok_w = tool("claim_token", {"author": "w"}).splitlines()[1].strip()
+
         # 1. probe heartbeats: w's last_seen advances via probe alone
         con = sqlite3.connect(db, timeout=10)
         s1 = con.execute("SELECT last_seen FROM participants WHERE author='w'").fetchone()[0]
@@ -129,14 +133,20 @@ def main():
 
         # 4. w delivers via list_comments_since -> awaiting cleared by voting;
         #    then probe for w goes idle only when nothing undelivered AND no awaiting
-        tok_w = tool("claim_token", {"author": "w"}).splitlines()[1].strip()
+        # v2.11 #81 floor: a leaves its own comment BEFORE w's poll (so w's
+        # cursor covers it and the final probe is idle, not new_comments).
+        tool("post_comment", {"thread_id": tid, "author": "a",
+                              "body": "a opening"})
         out = tool("list_comments_since", {"since": "now", "author": "w"})
         assert "hey @w look" in out, "cursor-authoritative poll must deliver backlog"
         tool("set_verdict", {"thread_id": tid, "verdict": "pass",
                              "author": "w", "token": tok_w})
+        # v2.11 #81 地板: 有预算的成员仍须真评论（否则 probe 会报
+        # awaiting_floor_comment，而非 idle）——这是契约，不是放宽断言
+        tool("post_comment", {"thread_id": tid, "author": "w",
+                              "body": "w floor note"})
         # v2.9.2 L1.5: creator votes LAST — w has voted, so a polls (delivery
-        # gate) then votes; the discussion floor keeps the thread open (w
-        # never comments), which step 5 relies on via a's verdict row.
+        # gate) then votes; a's floor comment is already in place above.
         tool("list_comments_since", {"since": "now", "author": "a"})
         tool("set_verdict", {"thread_id": tid, "verdict": "pass",
                              "author": "a", "token": tok_a})
