@@ -218,6 +218,9 @@ def main():
 
         # awaiting_my_verdict: fresh member d in quorum, never voted
         tool("list_comments_since", {"since": "now", "author": "d"})
+        # v2.10 #77 档A: 无 token 的成员会落 token_invalid 族、抢在
+        # awaiting_verdict 前面 ⇒ 先 claim 再做 awaiting 断言（票 C 族一）
+        tok["d"] = tool("claim_token", {"author": "d"}).splitlines()[1].strip()
         out = tool("create_thread", {"title": "aw", "author": "a",
                                      "quorum": ["a", "d"],
                                      "context": fx.wi('a', 'd'),
@@ -228,6 +231,22 @@ def main():
         out = tool("list_comments_since", {"since": "now", "author": "d"})
         assert str(tid3) in out.split("awaiting_my_verdict")[1].split("]")[0] + "]", \
             f"d must see awaiting thread: {out.splitlines()[0]}"
+
+        # token_invalid 族反向锁（票 C 验收 #1316 §三(c)-2）：无 token 的 e
+        # 必须进 token_invalid，且不得同时出现在 awaiting_my_verdict
+        tool("list_comments_since", {"since": "now", "author": "e"})
+        out = tool("create_thread", {"title": "ti", "author": "a",
+                                     "quorum": ["a", "e"],
+                                     "context": fx.wi('a', 'e'),
+  })
+        tid4 = int(out.split("#")[1].split(":")[0])
+        tool("set_verdict", {"thread_id": tid4, "verdict": "pass",
+                             "author": "a", "token": tok["a"]})
+        out = tool("list_comments_since", {"since": "now", "author": "e"})
+        head = out.splitlines()[0]
+        ti = json.loads(head.split("needs_attention: ", 1)[1])
+        assert tid4 in ti["token_invalid"], head
+        assert tid4 not in ti["awaiting_my_verdict"], head
 
         # budget exhaustion via flips: budget=6, a used 1 comment? none; flips on
         # tid: a flips pass->object->pass... rev2 first free, so flips billed:
