@@ -267,7 +267,7 @@ def _invite(conn: sqlite3.Connection, author: str | None,
         mark = json.loads(row["meta"] or "{}")
         if not isinstance(mark, dict):
             raise ValueError("meta is not a JSON object")
-    except (ValueError, TypeError):
+    except META_PARSE_ERRORS:
         # dsh #1302/#1305: json.loads(<non-str/bytes>) raises TypeError, which the
         # ValueError-only guard let escape (same shape as _invited_never_present).
         # dsh #1293 §五1: this meta belongs to SOMEONE ELSE (token_hash / probe /
@@ -332,7 +332,7 @@ def _invited_never_present(last_seen: str | None, meta_json: str | None) -> bool
         return False
     try:
         meta = json.loads(meta_json or "{}")
-    except (ValueError, TypeError):
+    except META_PARSE_ERRORS:
         return False
     return isinstance(meta, dict) and bool(meta.get("invited_at"))
 
@@ -1711,6 +1711,13 @@ META_MISSING = "missing"
 META_INVALID_JSON = "invalid_json"
 META_NON_OBJECT = "non_object"
 
+# dsh #1446: `json.loads` raises RecursionError (⊂ RuntimeError, NOT ValueError)
+# on deeply nested payloads, so ValueError/TypeError guards let a single row
+# abort startup.  RecursionError belongs in every participants.meta parse
+# guard.  Deliberately NOT `except Exception`: real implementation errors must
+# keep propagating (see the "NEVER raises into the core startup" note).
+META_PARSE_ERRORS = (ValueError, TypeError, RecursionError)
+
 
 def _meta_obj(raw: str | None) -> tuple[str, object]:
     """Parse a raw participants.meta value into one of four states.
@@ -1722,7 +1729,10 @@ def _meta_obj(raw: str | None) -> tuple[str, object]:
         return META_MISSING, {}
     try:
         obj = json.loads(raw or "{}")
-    except (ValueError, TypeError):
+    except META_PARSE_ERRORS:
+        # Includes RecursionError: a too-deep payload is unparsable for our
+        # purposes and must map to the same state (no fifth state ⇒ no
+        # attention-contract change; dsh #1446 §四 T-deep-2).
         return META_INVALID_JSON, {}
     if not isinstance(obj, dict):
         return META_NON_OBJECT, obj
@@ -1779,9 +1789,20 @@ def _audit(conn, author: str, action: str, thread_id: int | None = None,
     )
 
 
-def _meta_fingerprint(raw: str | None) -> tuple[str, int]:
-    """(sha256 prefix, byte length) of the ORIGINAL meta bytes — never the text."""
-    data = (raw or "").encode("utf-8", "surrogatepass")
+def _meta_fingerprint(raw: str | bytes | bytearray | None) -> tuple[str, int]:
+    """(sha256 prefix, byte length) of the ORIGINAL meta bytes — never the text.
+
+    SQLite TEXT columns may return BLOB values written outside the board
+    (GPT P2 via #1438/#1445).  A non-UTF-8 BLOB reaches the audit path because
+    `json.loads` raises UnicodeDecodeError (⊂ ValueError), and the old
+    str-only signature then raised AttributeError on `.encode()` — aborting
+    `init_db()`.  Bytes are hashed as-is: no decode/re-encode round trip, so
+    the fingerprint is of the exact stored bytes.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        data = bytes(raw)
+    else:
+        data = (raw or "").encode("utf-8", "surrogatepass")
     return hashlib.sha256(data).hexdigest()[:16], len(data)
 
 
