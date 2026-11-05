@@ -6,6 +6,9 @@
   T-deep-3 — 超深嵌套行在**热路径/读面**上不抛、字节原样（启动站已在
              第一批加固笔内钉住；`_meta_obj` 把它映射为 `invalid_json`，
              故 F6 门/读面走与 T3 完全相同的 fail-close 分支，不新增态）。
+  D1a'/D1g — `_ring_append` 的**返回值**（坏行 `return False`）也要断言，不只
+             "不抛"（opencode #1458 §4 留的那半格）；非 UTF-8 BLOB 行在热路径上
+             同样不抛/不改字节（dsh #1457 §三：base 即绿，改指纹函数时最易弄红）。
   note 原文 — `_beat` 删除 `:512` 重读后，`hb_read_migrate` 的 note 必须与
              重读版**逐字节相同**：`_ring_append(meta=...)` 就地改调用方
              dict（`meta[key] = ring`），所以下面的期望值就是 45f6ab6 实跑
@@ -27,6 +30,7 @@ PASS, FAIL = [], []
 DB = None
 SRV = None
 DEEP = "[" * 20000 + "]" * 20000
+BLOB_BAD = b"\xff\xfe\x00bad"   # non-UTF-8 bytes: RecursionError's neighbour族 (dsh #1457 §三)
 
 
 def check(name, cond, detail=""):
@@ -93,11 +97,14 @@ def main():
         calls.append(("_token_invalid_tids", lambda: SRV._token_invalid_tids(c, "deep")))
         calls.append(("_awaiting_split", lambda: SRV._awaiting_split(c, "deep")))
         calls.append(("_profile_numbers", lambda: SRV._profile_numbers(c, "deep")))
+        rets = {}
         for name, fn in calls:
             try:
-                fn(); check(f"D1a {name} no raise", True)
+                rets[name] = fn(); check(f"D1a {name} no raise", True)
             except BaseException as e:  # noqa: BLE001
                 check(f"D1a {name} no raise", False, type(e).__name__)
+        check("D1a' _ring_append returns False on deep row (self-parse branch early exit)",
+              rets.get("_ring_append") is False, rets.get("_ring_append"))
         check("D1b bytes untouched by hot paths", raw_meta("deep") == before)
         check("D1c no meta_unparsable audit on read paths (C3)",
               note_of("deep", "meta_unparsable") == [], note_of("deep", "meta_unparsable"))
@@ -114,6 +121,30 @@ def main():
         ok = type(e).__name__
     check("D1e /board render no raise", ok is True, ok)
     check("D1f bytes untouched after read faces", raw_meta("deep") == before)
+
+    print("\nD1g 非 UTF-8 BLOB 热路径（dsh #1457 §三：base 即绿，改指纹函数最易弄红）")
+    seed("blob-bad", BLOB_BAD)
+    bbefore = raw_meta("blob-bad")
+    c = conn()
+    try:
+        try:
+            rb = SRV._ring_append(c, "blob-bad", "hb")
+            check("D1g-1 _ring_append no raise", True)
+        except BaseException as e:  # noqa: BLE001
+            rb = type(e).__name__; check("D1g-1 _ring_append no raise", False, rb)
+        check("D1g-2 _ring_append returns False on bad-BLOB row", rb is False, rb)
+        for name, fn in (("_beat", lambda: SRV._beat(c, "blob-bad", delivered=1)),
+                         ("_probe", lambda: SRV._probe(c, "blob-bad")),
+                         ("_get_meta", lambda: SRV._get_meta(c, "blob-bad"))):
+            try:
+                fn(); check(f"D1g-3 {name} no raise on bad BLOB", True)
+            except BaseException as e:  # noqa: BLE001
+                check(f"D1g-3 {name} no raise on bad BLOB", False, type(e).__name__)
+        check("D1g-4 bad-BLOB bytes untouched", raw_meta("blob-bad") == bbefore)
+        check("D1g-5 no meta_unparsable audit on read paths (C3)",
+              note_of("blob-bad", "meta_unparsable") == [], note_of("blob-bad", "meta_unparsable"))
+    finally:
+        c.close()
 
     print("\nD2 hb_read_migrate note 原文 = 重读版逐字节（无 −1 口径变更）")
     meta = {"token_hash": "x", "f6_read_epoch": 1750000000,
