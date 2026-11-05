@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # pi-watcher.sh — review board 成员 pi 的宿主侧常驻 watcher（唤起契约 (a)）。
-# kit-version: 1.0.0 (2026-10-21, thread #45 rev2 L2 实施配套；结构同 claude-watcher.sh)
+# kit-version: 1.1.0 (2026-11-05: 投递判据升级为 kit 2.6.0 同款=游标/delivered_id 前进，
+#   fails 迁 ~/.rb-wake，闸门留痕 GATE-TRIP.log——当日"误闸 10h 无驱动"事故修复；
+#   原 1.0.0 2026-10-21 thread #45 rev2 L2 实施配套，结构同 claude-watcher.sh)
 #
 # pi 形态（onboarding.md 成员档案）: WSL 内 headless 单发，`pi -p --no-session`，
 # 无 MCP——操作看板唯一通道 = configs/rb.sh（裸 HTTP）。运行时前提（实跑踩坑归档）：
@@ -31,13 +33,19 @@ RB_SH_DIR_WSL="${RB_SH_DIR_WSL:-/mnt/c/Users/liu/ZCodeProject/mcp-review-board/c
 PROMPT_TEMPLATE="$RB_REPO/configs/task-template-pi.txt"
 TASK_FILE="${TASK_FILE:-/tmp/rb-pi-wake.txt}"
 LOCK="${LOCK:-/tmp/rb-pi-watcher.lock.d}"
-FAILS="${FAILS:-/tmp/rb-pi-watcher.fails}"
+# 2026-11-05 事故修复①：fails 从 /tmp 挪到 ~/.rb-wake（wake_guard STATE_DIR 同址）。
+# Git Bash 的 /tmp 实际是 Windows %TEMP%，重启不清空——11:30 三连败闸门留下的旧计数
+# 在 21:28 登录重启时仍在，watcher 启动即秒退，pi 无驱动约 10h。挪入 ~/.rb-wake 后
+# 闸门语义明确为「跨重启持久，恢复须显式删文件」，状态与 wake_guard 计数集中一处。
+FAILS="${FAILS:-$HOME/.rb-wake/pi-watcher.fails}"
 EV="${EV:-/tmp/rb-pi-events.log}"
 
+GATE_TRIP_LOG="${GATE_TRIP_LOG:-$HOME/.rb-wake/GATE-TRIP.log}"
 gate=$(cat "$FAILS" 2>/dev/null || echo 0)
 if [ "${gate:-0}" -ge 3 ]; then
-  echo "gate: >=3 consecutive wake failures; heartbeat stopped (C1.2)."
-  echo "remove $FAILS and restart this watcher to re-enable."
+  echo "$(date '+%F %T') gate: >=3 consecutive wake failures carried over ($gate in $FAILS); heartbeat stopped (C1.2)."
+  echo "$(date '+%F %T') recovery: remove $FAILS and restart this watcher."
+  printf '%s\n' "$(date '+%F %T') [pi-watcher] gate tripped at startup (carried $gate fails) — watcher NOT started; pi has no driver until recovery." >> "$GATE_TRIP_LOG" 2>/dev/null || true
   exit 1
 fi
 
@@ -69,6 +77,8 @@ cycle() {
   if [ "${att:-0}" != "1" ]; then echo "$(date +%T) idle"; return 0; fi
   reason=$(printf '%s' "$resp" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')
   threads=$(printf '%s' "$resp" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
+  pre_lr=$(printf '%s' "$resp" | sed -n 's/.*"last_read":"\([^"]*\)".*/\1/p')
+  pre_id=$(printf '%s' "$resp" | sed -n 's/.*"last_delivered_id":\([0-9]*\).*/\1/p')
   echo "$(date +%T) attention=1 ($reason) threads=[$threads] — waking pi"
   wg_count_wake pi-watcher                          # 票3：每日上限，超帽即停
 
@@ -103,22 +113,27 @@ cycle() {
       after=$(probe) || after=""
       aatt=$(printf '%s' "$after" | sed -n 's/.*"attention":\([0-9]\).*/\1/p')
     fi
-    areason=$(printf '%s' "$after" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')
-    athreads=$(printf '%s' "$after" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
-    if [ "${aatt:-0}" != "1" ] || [ "$areason" != "$reason" ] || [ "$athreads" != "$threads" ]; then
+    post_lr=$(printf '%s' "$after" | sed -n 's/.*"last_read":"\([^"]*\)".*/\1/p')
+    post_id=$(printf '%s' "$after" | sed -n 's/.*"last_delivered_id":\([0-9]*\).*/\1/p')
+    # 2026-11-05 事故修复②（kit 2.6.0 判据，host-watch 同款）：rc==0 时 delivered =
+    # last_read 字符串前进 或 delivered_id 数值前进。旧判据（attention/reason/threads
+    # 消费与否）在会话期间原帖继续进新评论时恒"不变"，把正常投递误判为空唤——当日
+    # 10:41/11:15 两次投递（游标实已前进到 #1436）被计失败，三连败闸门误触发。
+    if { [ -n "$post_lr" ] && [ "$post_lr" \> "${pre_lr:-0}" ]; } || \
+       { [ -n "$post_id" ] && [ "${pre_id:-0}" -lt "$post_id" ]; } then
       echo 0 > "$FAILS"
-      echo "$(date +%T) delivered (attention consumed — delivery, not task-completion)"
+      echo "$(date +%T) delivered (cursor last_read ${pre_lr:-∅}→${post_lr:-∅} delivered_id ${pre_id:-∅}→${post_id:-∅} — delivery, not task-completion)"
     else
       n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 ))
       echo "$n" > "$FAILS"
-      echo "$(date +%T) wake exited 0 but attention unchanged ($n/3) — counted as failure"
-      [ "$n" -ge 3 ] && { echo "gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."; exit 1; }
+      echo "$(date +%T) wake exited 0 but cursor unmoved (empty wake) ($n/3) — counted as failure"
+      [ "$n" -ge 3 ] && { echo "$(date '+%F %T') gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."; printf '%s\n' "$(date '+%F %T') [pi-watcher] gate tripped (3 consecutive wake failures) — watcher stopped; recovery: rm $FAILS && restart." >> "$GATE_TRIP_LOG" 2>/dev/null || true; exit 1; }
     fi
   else
     n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 ))
     echo "$n" > "$FAILS"
     echo "$(date +%T) wake FAILED ($n/3)"
-    [ "$n" -ge 3 ] && { echo "gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."; exit 1; }
+    [ "$n" -ge 3 ] && { echo "$(date '+%F %T') gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."; printf '%s\n' "$(date '+%F %T') [pi-watcher] gate tripped (3 consecutive wake failures) — watcher stopped; recovery: rm $FAILS && restart." >> "$GATE_TRIP_LOG" 2>/dev/null || true; exit 1; }
   fi
 }
 
