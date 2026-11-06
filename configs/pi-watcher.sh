@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # pi-watcher.sh — review board 成员 pi 的宿主侧常驻 watcher（唤起契约 (a)）。
-# kit-version: 1.1.0 (2026-11-05: 投递判据升级为 kit 2.6.0 同款=游标/delivered_id 前进，
-#   fails 迁 ~/.rb-wake，闸门留痕 GATE-TRIP.log——当日"误闸 10h 无驱动"事故修复；
+# kit-version: 1.2.0 (2026-11-06: 唤醒模型 deepseek/deepseek-flash → zai-coding-cn/glm-5.3-flash，
+#   钥匙改取 opencode 凭据库 zhipuai-coding-plan key、注入 ZAI_CODING_CN_API_KEY——切换前隔离实测
+#   auth ready + rb.sh 全链路 rc=0。原 1.1.0 2026-11-05: 投递判据升级 kit 2.6.0 同款=游标/
+#   delivered_id 前进，fails 迁 ~/.rb-wake，闸门留痕 GATE-TRIP.log——当日"误闸 10h 无驱动"事故修复；
 #   原 1.0.0 2026-10-21 thread #45 rev2 L2 实施配套，结构同 claude-watcher.sh)
 #
 # pi 形态（onboarding.md 成员档案）: WSL 内 headless 单发，`pi -p --no-session`，
@@ -92,13 +94,17 @@ cycle() {
   # WSL 内唤醒：node22 前置 + key 注入 + 180s 停滞看门狗（thread #24 事故修复形态）
   if wsl -e bash -c '
     export PATH=$HOME/opt/node22/bin:$PATH
-    KEY=$(grep -i "deepseek" /mnt/c/Users/liu/.dsh/.credentials.yaml | head -1 | sed "s/^.*[:=] *//" | tr -d "\"'"'"' ")
+    # 2026-11-06 换型：deepseek-flash → zai-coding-cn/glm-5.3-flash（用户指示；先隔离实测：
+    # auth check ready + 真实跑通 rb.sh get_protocol 全链路 4.5s rc=0，才落此处）。
+    # 钥匙取自 opencode 凭据库（同一把 zhipuai-coding-plan key，2026-11-05 对
+    # open.bigmodel.cn 双端点 HTTP 200 实证）；回退 = PI_WAKE_MODEL 环境变量或改回下行默认值。
+    KEY=$(python3 -c "import json;print(json.load(open(\"/home/liu/.local/share/opencode/auth.json\"))[\"zhipuai-coding-plan\"][\"key\"])" 2>/dev/null)
     [ -n "$KEY" ] || exit 1
-    export DEEPSEEK_API_KEY="$KEY"
+    export ZAI_CODING_CN_API_KEY="$KEY"
     EV='"$EV"'
     : > "$EV"
     cd ~ && timeout 900 ~/.npm-global/bin/pi -p --no-session --mode json \
-      --model ${PI_WAKE_MODEL:-deepseek/deepseek-flash} "$(cat /mnt/c/Users/liu/AppData/Local/Temp/rb-pi-wake.txt 2>/dev/null || cat /tmp/rb-pi-wake.txt 2>/dev/null)" > "$EV" 2>&1 &
+      --model ${PI_WAKE_MODEL:-zai-coding-cn/glm-5.3-flash} "$(cat /mnt/c/Users/liu/AppData/Local/Temp/rb-pi-wake.txt 2>/dev/null || cat /tmp/rb-pi-wake.txt 2>/dev/null)" > "$EV" 2>&1 &
     PID=$!
     while kill -0 $PID 2>/dev/null; do
       sleep 30
