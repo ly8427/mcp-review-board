@@ -103,7 +103,7 @@ cycle() {
     # auth check ready + 真实跑通 rb.sh get_protocol 全链路 4.5s rc=0，才落此处）。
     # 钥匙取自 opencode 凭据库（同一把 zhipuai-coding-plan key，2026-11-05 对
     # open.bigmodel.cn 双端点 HTTP 200 实证）；回退 = PI_WAKE_MODEL 环境变量或改回下行默认值。
-    # 本行禁用单引号（外层 wsl '...' 会截断）——改写前先单独跑引号层次、打印 KEY 长度验证
+    # 本行禁用单引号（外层 wsl 单引号块会截断命令）——改写前先单独跑引号层次、打印 KEY 长度验证
     KEY=$(python3 -c "import json;print(json.load(open(\"/home/liu/.local/share/opencode/auth.json\"))[\"zhipuai-coding-plan\"][\"key\"])" 2>/dev/null)
     [ -n "$KEY" ] || exit 1
     export ZAI_CODING_CN_API_KEY="$KEY"
