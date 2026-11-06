@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # pi-watcher.sh — review board 成员 pi 的宿主侧常驻 watcher（唤起契约 (a)）。
-# kit-version: 1.0.0 (2026-10-21, thread #45 rev2 L2 实施配套；结构同 claude-watcher.sh)
+# kit-version: 1.2.0 (2026-11-06: 唤醒模型 deepseek/deepseek-flash → zai-coding-cn/glm-5.3-flash，
+#   钥匙改取 opencode 凭据库 zhipuai-coding-plan key、注入 ZAI_CODING_CN_API_KEY——切换前隔离实测
+#   auth ready + rb.sh 全链路 rc=0。原 1.1.0 2026-11-05: 投递判据升级 kit 2.6.0 同款=游标/
+#   delivered_id 前进，fails 迁 ~/.rb-wake，闸门留痕 GATE-TRIP.log——当日"误闸 10h 无驱动"事故修复；
+#   原 1.0.0 2026-10-21 thread #45 rev2 L2 实施配套，结构同 claude-watcher.sh)
 #
 # pi 形态（onboarding.md 成员档案）: WSL 内 headless 单发，`pi -p --no-session`，
 # 无 MCP——操作看板唯一通道 = configs/rb.sh（裸 HTTP）。运行时前提（实跑踩坑归档）：
@@ -12,6 +16,11 @@
 #   openrouter / vercel-ai-gateway 的同名 id ⇒ "Model ... is ambiguous across providers"、
 #   启动即 rc=1，三次连败触发 C1.2 自锁（见 #628 一手复盘）。改 `deepseek-flash` 后 exit 0。
 #   rb.sh 用绝对路径（模板已按 kit R3 配置为 WSL 原生绝对路径，杜绝 find / 烧超时）
+#   2026-11-06 换型事故归档：KEY 提取的 python -c 里用了单引号，与 wsl -e bash -c '...'
+#   的外层单引号相撞 ⇒ 命令被截断、KEY 空、唤醒 1 秒即败（fails +1）。铁律：**wsl 单引号
+#   块内嵌 python/命令，一律只用 \" 转义双引号，禁用单引号**；且任何 KEY 提取改动上线前，
+#   必须先以同样引号层次单跑一次、只打印 KEY 长度验证非空（本日实证：引号层次单独测试
+#   通过后切换才安全）。
 # 任务文本 = configs/task-template-pi.txt 原文 + 尾部一行看板注入（reason/threads）——
 #   唤起者零代写（v2.3 peer-wake 收窄条款）。
 # 三保护（缺一不可，同 dsh/claude watcher）: mkdir 单飞锁 / ≥20min 节奏 / C1.2 失败闸门。
@@ -31,13 +40,19 @@ RB_SH_DIR_WSL="${RB_SH_DIR_WSL:-/mnt/c/Users/liu/ZCodeProject/mcp-review-board/c
 PROMPT_TEMPLATE="$RB_REPO/configs/task-template-pi.txt"
 TASK_FILE="${TASK_FILE:-/tmp/rb-pi-wake.txt}"
 LOCK="${LOCK:-/tmp/rb-pi-watcher.lock.d}"
-FAILS="${FAILS:-/tmp/rb-pi-watcher.fails}"
+# 2026-11-05 事故修复①：fails 从 /tmp 挪到 ~/.rb-wake（wake_guard STATE_DIR 同址）。
+# Git Bash 的 /tmp 实际是 Windows %TEMP%，重启不清空——11:30 三连败闸门留下的旧计数
+# 在 21:28 登录重启时仍在，watcher 启动即秒退，pi 无驱动约 10h。挪入 ~/.rb-wake 后
+# 闸门语义明确为「跨重启持久，恢复须显式删文件」，状态与 wake_guard 计数集中一处。
+FAILS="${FAILS:-$HOME/.rb-wake/pi-watcher.fails}"
 EV="${EV:-/tmp/rb-pi-events.log}"
 
+GATE_TRIP_LOG="${GATE_TRIP_LOG:-$HOME/.rb-wake/GATE-TRIP.log}"
 gate=$(cat "$FAILS" 2>/dev/null || echo 0)
 if [ "${gate:-0}" -ge 3 ]; then
-  echo "gate: >=3 consecutive wake failures; heartbeat stopped (C1.2)."
-  echo "remove $FAILS and restart this watcher to re-enable."
+  echo "$(date '+%F %T') gate: >=3 consecutive wake failures carried over ($gate in $FAILS); heartbeat stopped (C1.2)."
+  echo "$(date '+%F %T') recovery: remove $FAILS and restart this watcher."
+  printf '%s\n' "$(date '+%F %T') [pi-watcher] gate tripped at startup (carried $gate fails) — watcher NOT started; pi has no driver until recovery." >> "$GATE_TRIP_LOG" 2>/dev/null || true
   exit 1
 fi
 
@@ -69,6 +84,8 @@ cycle() {
   if [ "${att:-0}" != "1" ]; then echo "$(date +%T) idle"; return 0; fi
   reason=$(printf '%s' "$resp" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')
   threads=$(printf '%s' "$resp" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
+  pre_lr=$(printf '%s' "$resp" | sed -n 's/.*"last_read":"\([^"]*\)".*/\1/p')
+  pre_id=$(printf '%s' "$resp" | sed -n 's/.*"last_delivered_id":\([0-9]*\).*/\1/p')
   echo "$(date +%T) attention=1 ($reason) threads=[$threads] — waking pi"
   wg_count_wake pi-watcher                          # 票3：每日上限，超帽即停
 
@@ -82,13 +99,18 @@ cycle() {
   # WSL 内唤醒：node22 前置 + key 注入 + 180s 停滞看门狗（thread #24 事故修复形态）
   if wsl -e bash -c '
     export PATH=$HOME/opt/node22/bin:$PATH
-    KEY=$(grep -i "deepseek" /mnt/c/Users/liu/.dsh/.credentials.yaml | head -1 | sed "s/^.*[:=] *//" | tr -d "\"'"'"' ")
+    # 2026-11-06 换型：deepseek-flash → zai-coding-cn/glm-5.3-flash（用户指示；先隔离实测：
+    # auth check ready + 真实跑通 rb.sh get_protocol 全链路 4.5s rc=0，才落此处）。
+    # 钥匙取自 opencode 凭据库（同一把 zhipuai-coding-plan key，2026-11-05 对
+    # open.bigmodel.cn 双端点 HTTP 200 实证）；回退 = PI_WAKE_MODEL 环境变量或改回下行默认值。
+    # 本行禁用单引号（外层 wsl 单引号块会截断命令）——改写前先单独跑引号层次、打印 KEY 长度验证
+    KEY=$(python3 -c "import json;print(json.load(open(\"/home/liu/.local/share/opencode/auth.json\"))[\"zhipuai-coding-plan\"][\"key\"])" 2>/dev/null)
     [ -n "$KEY" ] || exit 1
-    export DEEPSEEK_API_KEY="$KEY"
+    export ZAI_CODING_CN_API_KEY="$KEY"
     EV='"$EV"'
     : > "$EV"
     cd ~ && timeout 900 ~/.npm-global/bin/pi -p --no-session --mode json \
-      --model ${PI_WAKE_MODEL:-deepseek/deepseek-flash} "$(cat /mnt/c/Users/liu/AppData/Local/Temp/rb-pi-wake.txt 2>/dev/null || cat /tmp/rb-pi-wake.txt 2>/dev/null)" > "$EV" 2>&1 &
+      --model ${PI_WAKE_MODEL:-zai-coding-cn/glm-5.3-flash} "$(cat /mnt/c/Users/liu/AppData/Local/Temp/rb-pi-wake.txt 2>/dev/null || cat /tmp/rb-pi-wake.txt 2>/dev/null)" > "$EV" 2>&1 &
     PID=$!
     while kill -0 $PID 2>/dev/null; do
       sleep 30
@@ -103,22 +125,27 @@ cycle() {
       after=$(probe) || after=""
       aatt=$(printf '%s' "$after" | sed -n 's/.*"attention":\([0-9]\).*/\1/p')
     fi
-    areason=$(printf '%s' "$after" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')
-    athreads=$(printf '%s' "$after" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
-    if [ "${aatt:-0}" != "1" ] || [ "$areason" != "$reason" ] || [ "$athreads" != "$threads" ]; then
+    post_lr=$(printf '%s' "$after" | sed -n 's/.*"last_read":"\([^"]*\)".*/\1/p')
+    post_id=$(printf '%s' "$after" | sed -n 's/.*"last_delivered_id":\([0-9]*\).*/\1/p')
+    # 2026-11-05 事故修复②（kit 2.6.0 判据，host-watch 同款）：rc==0 时 delivered =
+    # last_read 字符串前进 或 delivered_id 数值前进。旧判据（attention/reason/threads
+    # 消费与否）在会话期间原帖继续进新评论时恒"不变"，把正常投递误判为空唤——当日
+    # 10:41/11:15 两次投递（游标实已前进到 #1436）被计失败，三连败闸门误触发。
+    if { [ -n "$post_lr" ] && [ "$post_lr" \> "${pre_lr:-0}" ]; } || \
+       { [ -n "$post_id" ] && [ "${pre_id:-0}" -lt "$post_id" ]; } then
       echo 0 > "$FAILS"
-      echo "$(date +%T) delivered (attention consumed — delivery, not task-completion)"
+      echo "$(date +%T) delivered (cursor last_read ${pre_lr:-∅}→${post_lr:-∅} delivered_id ${pre_id:-∅}→${post_id:-∅} — delivery, not task-completion)"
     else
       n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 ))
       echo "$n" > "$FAILS"
-      echo "$(date +%T) wake exited 0 but attention unchanged ($n/3) — counted as failure"
-      [ "$n" -ge 3 ] && { echo "gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."; exit 1; }
+      echo "$(date +%T) wake exited 0 but cursor unmoved (empty wake) ($n/3) — counted as failure"
+      [ "$n" -ge 3 ] && { echo "$(date '+%F %T') gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."; printf '%s\n' "$(date '+%F %T') [pi-watcher] gate tripped (3 consecutive wake failures) — watcher stopped; recovery: rm $FAILS && restart." >> "$GATE_TRIP_LOG" 2>/dev/null || true; exit 1; }
     fi
   else
     n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 ))
     echo "$n" > "$FAILS"
     echo "$(date +%T) wake FAILED ($n/3)"
-    [ "$n" -ge 3 ] && { echo "gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."; exit 1; }
+    [ "$n" -ge 3 ] && { echo "$(date '+%F %T') gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."; printf '%s\n' "$(date '+%F %T') [pi-watcher] gate tripped (3 consecutive wake failures) — watcher stopped; recovery: rm $FAILS && restart." >> "$GATE_TRIP_LOG" 2>/dev/null || true; exit 1; }
   fi
 }
 
