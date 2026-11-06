@@ -16,6 +16,11 @@
 #   openrouter / vercel-ai-gateway 的同名 id ⇒ "Model ... is ambiguous across providers"、
 #   启动即 rc=1，三次连败触发 C1.2 自锁（见 #628 一手复盘）。改 `deepseek-flash` 后 exit 0。
 #   rb.sh 用绝对路径（模板已按 kit R3 配置为 WSL 原生绝对路径，杜绝 find / 烧超时）
+#   2026-11-06 换型事故归档：KEY 提取的 python -c 里用了单引号，与 wsl -e bash -c '...'
+#   的外层单引号相撞 ⇒ 命令被截断、KEY 空、唤醒 1 秒即败（fails +1）。铁律：**wsl 单引号
+#   块内嵌 python/命令，一律只用 \" 转义双引号，禁用单引号**；且任何 KEY 提取改动上线前，
+#   必须先以同样引号层次单跑一次、只打印 KEY 长度验证非空（本日实证：引号层次单独测试
+#   通过后切换才安全）。
 # 任务文本 = configs/task-template-pi.txt 原文 + 尾部一行看板注入（reason/threads）——
 #   唤起者零代写（v2.3 peer-wake 收窄条款）。
 # 三保护（缺一不可，同 dsh/claude watcher）: mkdir 单飞锁 / ≥20min 节奏 / C1.2 失败闸门。
@@ -98,6 +103,7 @@ cycle() {
     # auth check ready + 真实跑通 rb.sh get_protocol 全链路 4.5s rc=0，才落此处）。
     # 钥匙取自 opencode 凭据库（同一把 zhipuai-coding-plan key，2026-11-05 对
     # open.bigmodel.cn 双端点 HTTP 200 实证）；回退 = PI_WAKE_MODEL 环境变量或改回下行默认值。
+    # 本行禁用单引号（外层 wsl '...' 会截断）——改写前先单独跑引号层次、打印 KEY 长度验证
     KEY=$(python3 -c "import json;print(json.load(open(\"/home/liu/.local/share/opencode/auth.json\"))[\"zhipuai-coding-plan\"][\"key\"])" 2>/dev/null)
     [ -n "$KEY" ] || exit 1
     export ZAI_CODING_CN_API_KEY="$KEY"
