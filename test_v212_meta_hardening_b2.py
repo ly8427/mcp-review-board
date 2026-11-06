@@ -108,8 +108,16 @@ def main():
         check("D1a' _ring_append returns False on deep row (self-parse branch early exit)",
               rets.get("_ring_append") is False, rets.get("_ring_append"))
         check("D1b bytes untouched by hot paths", raw_meta("deep") == before)
-        check("D1c no meta_unparsable audit on read paths (C3)",
-              note_of("deep", "meta_unparsable") == [], note_of("deep", "meta_unparsable"))
+        c.commit()  # 修复批：审计是写面 —— 不提交则指纹行随连接关闭回滚
+        # β 修复批 (#1545 §三-3)：读路径不再静默 —— 每站一条去重的 meta_unparsable
+        # 指纹审计（取代 batch2 的「无审计」断言；C3 仍成立：写的是 verdict_events，
+        # 不是环，字节原样）。本序列触达两站：_beat 与 _ring_append(_probe 复用)。
+        notes_d1 = note_of("deep", "meta_unparsable")
+        wheres = sorted(n.split(" ")[0].split("=")[1] for n in notes_d1)
+        check("D1c per-station deduped meta_unparsable audit (#1545 §三-3)",
+              wheres == ["_beat", "_ring_append"]
+              and all("sha256=" in n and "len=" in n and "state=" in n
+                      for n in notes_d1), (wheres, notes_d1))
     finally:
         c.close()
     try:
@@ -143,8 +151,14 @@ def main():
             except BaseException as e:  # noqa: BLE001
                 check(f"D1g-3 {name} no raise on bad BLOB", False, type(e).__name__)
         check("D1g-4 bad-BLOB bytes untouched", raw_meta("blob-bad") == bbefore)
-        check("D1g-5 no meta_unparsable audit on read paths (C3)",
-              note_of("blob-bad", "meta_unparsable") == [], note_of("blob-bad", "meta_unparsable"))
+        c.commit()  # 同 D1b：审计是写面，先提交再读
+        # β 修复批 (#1545 §三-3)：BLOB 指纹审计照写（哈希的是原始字节，#1438/#1445）
+        notes_blob = note_of("blob-bad", "meta_unparsable")
+        wheres_blob = sorted(n.split(" ")[0].split("=")[1] for n in notes_blob)
+        fps = {n.split("sha256=")[1].split(" ")[0] for n in notes_blob}
+        check("D1g-5 per-station fingerprint audits, BLOB bytes hashed as-is",
+              wheres_blob == ["_beat", "_ring_append"] and len(fps) == 1
+              and all("len=6" in n for n in notes_blob), (wheres_blob, fps, notes_blob))
     finally:
         c.close()
 
@@ -220,8 +234,11 @@ def main():
           (prow["last_delivered_id"] if prow else None, maxid))
     check("D4c last_read written", prow is not None and prow["last_read"] is not None)
     check("D4d bad-row bytes untouched by the poll txn", raw_meta("polldeep") == pbefore)
-    check("D4e no hb_read_migrate / meta_unparsable audit from a read path (C3)",
-          audits_poll == [], audits_poll)
+    # β 修复批 (#1545 §三-3)：轮询站在同一事务里留一条去重指纹审计（where=_beat），
+    # hb_read_migrate 仍必须为 0（坏行不迁移）；审计不碰游标/字节。
+    check("D4e hb_read_migrate still zero; meta_unparsable one deduped _beat row",
+          [a for a in audits_poll if a == "hb_read_migrate"] == []
+          and audits_poll.count("meta_unparsable") == 1, audits_poll)
 
     print(f"\n{'='*60}\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

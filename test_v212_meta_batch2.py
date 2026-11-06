@@ -122,6 +122,7 @@ def main():
             SRV._beat(c, a, 1)
             SRV._probe(c, a)
             ra = SRV._ring_append(c, a, "hb")
+            c.commit()  # 审计是写面：先提交再验（修复批 #1545 §三-3）
         finally:
             c.close()
         check(f"T2a _beat/_probe/_ring_append never raise ({label})", True)
@@ -130,6 +131,13 @@ def main():
               repr(raw_meta(a)))
         check(f"T2d no hb_read_migrate audit ({label})",
               audits(a, "hb_read_migrate") == [])
+        # β 修复批 (#1545 §三-3)：读路径每站一条去重指纹审计 —— _beat 一条 +
+        # _ring_append 一条（_probe 与尾部直呼复用同站去重），重复轮询不增长。
+        mu = audits(a, "meta_unparsable")
+        wheres = sorted(n.split(" ")[0].split("=")[1] for n in mu)
+        check(f"T2e per-station deduped meta_unparsable audit ({label})",
+              wheres == ["_beat", "_ring_append"]
+              and all("state=" in n and "sha256=" in n for n in mu), (wheres, mu))
 
     print("T3 F6 门：坏行 fail-closed，不给冷启动快车道")
     for label, raw in BAD:
@@ -235,14 +243,108 @@ def main():
         check("T10c no claim_token substring (would rebuild the row)", "claim_token" not in out, out)
         check("T10d bytes untouched", raw_meta(a) == before)
 
-    print("T8 legacy shell unchanged (batch1 冻结面)")
+    print("T8 legacy shell: P3 收口后的 _get_meta（dict-total，#1562 §二）")
     seed("legacy", "[]")
     c = conn()
     try:
         legacy = SRV._get_meta(c, "legacy")
     finally:
         c.close()
-    check("T8a _get_meta still returns the raw non-object (S1g preserved)", legacy == [])
+    check("T8a _get_meta never returns a non-dict (P3 收口，取代 batch1 非对象透传)",
+          isinstance(legacy, dict) and legacy == {}, legacy)
+
+    print("T11 第五态 value_shape（dsh #1550 §二）：热路径不抛、不写、审计带 key=")
+    for label, raw in [("vs-str", '{"hb":"abc"}'),
+                       ("vs-obj", '{"hb":[{"a":1}]}'),
+                       ("vs-probe", '{"probe":5}'),
+                       ("vs-falsy", '{"hb":0}')]:
+        a = "v5-" + label
+        seed(a, raw)
+        before = raw_meta(a)
+        c = conn()
+        try:
+            SRV._beat(c, a, 0)
+            SRV._beat(c, a, 1)
+            SRV._probe(c, a)
+            ra = SRV._ring_append(c, a, "hb")
+            ok = SRV._token_ok(c, a, "deadbeef")
+            gate = SRV._token_gate(c, a, "deadbeef", thread_id=1)
+            ti = SRV._token_invalid_tids(c, a)
+            aw = SRV._awaiting_split(c, a)
+            fok, ferr, fex = SRV._f6_creator_gate(c, a)
+            c.commit()
+        finally:
+            c.close()
+        check(f"T11a hot paths no raise ({label})", True)
+        check(f"T11b _ring_append False ({label})", ra is False, ra)
+        check(f"T11c bytes byte-identical ({label})", raw_meta(a) == before,
+              repr(raw_meta(a)))
+        mu = audits(a, "meta_unparsable")
+        wheres = sorted(n.split(" ")[0].split("=")[1] for n in mu)
+        badkey = "probe" if "probe" in raw else "hb"
+        check(f"T11d audit names state=value_shape + key= ({label})",
+              wheres == ["_beat", "_ring_append"]
+              and all("state=value_shape" in n and f"key={badkey}" in n for n in mu),
+              (wheres, mu))
+        check(f"T11e token faces reject with named state ({label})",
+              ok is False and "meta_unparsable" in (gate or "")
+              and "value_shape" in (gate or "") and ti == [], (ok, gate, ti))
+        check(f"T11f awaiting_split intact ({label})",
+              isinstance(aw, tuple) and len(aw) == 2, aw)
+        check(f"T11g F6 fail-closed, no cold-start ({label})",
+              fok is False and fex is None and "value_shape" in (ferr or ""),
+              (fok, ferr, fex))
+        check(f"T11h read faces name value_shape ({label})",
+              "value_shape" in SRV.list_participants()
+              and json.loads(SRV.reliability_profile(a)).get("meta_unparsable") == "value_shape",
+              "")
+
+    print("T11 反真空 + 送达：好行环照涨、审计 0 行；坏行轮询不抛且游标前进")
+    seed("v5-good", json.dumps({"token_hash": "a" * 64}))
+    before = raw_meta("v5-good")
+    c = conn()
+    try:
+        SRV._beat(c, "v5-good", 0)
+        c.commit()
+    finally:
+        c.close()
+    check("T11i good row ring advances exactly +1",
+          len(json.loads(raw_meta("v5-good")).get("hb", []))
+          == len(json.loads(before).get("hb", [])) + 1,
+          (before, raw_meta("v5-good")))
+    check("T11j good row: zero meta_unparsable audits",
+          audits("v5-good", "meta_unparsable") == [], audits("v5-good"))
+    seed("v5-poll", '{"hb":"abc"}')
+    c = conn()
+    try:
+        c.execute("INSERT INTO threads(title, author, created_at)"
+                  " VALUES(?,?,datetime('now'))", ("v5-txn", "otherposter"))
+        tid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        c.execute("INSERT INTO comments(thread_id, author, body)"
+                  " VALUES(?,?,?)", (tid, "otherposter", "ping @v5-poll"))
+        maxid = c.execute("SELECT COALESCE(MAX(id), 0) FROM comments").fetchone()[0]
+        c.commit()
+    finally:
+        c.close()
+    vbefore = raw_meta("v5-poll")
+    poll_err = None
+    try:
+        SRV.list_comments_since(author="v5-poll", since="1h")
+    except BaseException as e:  # noqa: BLE001
+        poll_err = e
+    c = conn()
+    try:
+        prow = c.execute("SELECT last_delivered_id FROM participants"
+                         " WHERE author='v5-poll'").fetchone()
+    finally:
+        c.close()
+    check("T11k value_shape row: full poll no raise", poll_err is None,
+          type(poll_err).__name__ if poll_err else "")
+    check("T11l cursor advanced on value_shape row",
+          prow is not None and (prow["last_delivered_id"] or 0) >= maxid,
+          (prow[:] if prow else None, maxid))
+    check("T11m bytes untouched by the poll", raw_meta("v5-poll") == vbefore,
+          repr(raw_meta("v5-poll")))
 
     print("=" * 60)
     print(f"v2.12.0 batch2: {len(PASS)} passed, {len(FAIL)} failed")

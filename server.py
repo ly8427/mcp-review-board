@@ -407,13 +407,29 @@ def _ring_append(conn: sqlite3.Connection, author: str | None, key: str,
         return False
     if meta is None:
         row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
-        state, obj = _meta_obj(row["meta"] if row and row["meta"] else None)
-        if state in (META_INVALID_JSON, META_NON_OBJECT):
+        raw = row["meta"] if row and row["meta"] else None
+        state, obj = _meta_obj(raw)
+        if state in META_CORRUPT:
+            # v2.12.0 batch2 (dsh #1432 §二/§五 A5): never 500, never rewrite.
+            # 修复批 (#1545 §三-3): the station leaves ONE deduped
+            # meta_unparsable audit (fingerprint only) — batch2's silent skip
+            # is superseded; C3 still holds (verdict_events, not the ring).
+            _audit_meta_unparsable(
+                conn, author, raw, state, "_ring_append",
+                key=_ring_shape_defect(obj) if state == META_VALUE_SHAPE else None)
             return False  # corrupt row: keep bytes, surface via read faces
         meta = obj
         row_exists = row is not None
     elif row_exists is None:
         row_exists = True
+    # 修复批 第五态 per-key judgment at THE write point (#1550 §二-1): the
+    # caller-passed fast path bypasses the state check above, so the ring
+    # value itself is re-judged here.  Bad shape ⇒ whole-function no-write
+    # (the caller — _beat — owns the row-level audit for that path).
+    _v = meta.get(key)
+    if _v is not None and not (isinstance(_v, list)
+                               and all(isinstance(x, str) for x in _v)):
+        return False
     ring = [x for x in (meta.get(key) or []) if x]
     now = _now_iso()
     if ring:
@@ -506,11 +522,18 @@ def _beat(conn: sqlite3.Connection, author: str | None, delivered: int = 0) -> N
         return
     epoch = _read_epoch(conn)
     row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
-    state, obj = _meta_obj(row["meta"] if row and row["meta"] else None)
-    if state in (META_INVALID_JSON, META_NON_OBJECT):
+    raw = row["meta"] if row and row["meta"] else None
+    state, obj = _meta_obj(raw)
+    if state in META_CORRUPT:
         # v2.12.0 batch2 (dsh #1432 §二/§五 A5): polling must never 500 on a
         # corrupt row, and must never silently rewrite it.  Diagnostic faces
         # (list_participants / reliability_profile / attention) name the state.
+        # 修复批 (#1545 §三-3): one deduped fingerprint audit from THIS station
+        # (covers all four write points below — they never run on a bad row:
+        # #1549 §一 no-write ×4, now including value_shape rows, #1550 §二).
+        _audit_meta_unparsable(
+            conn, author, raw, state, "_beat",
+            key=_ring_shape_defect(obj) if state == META_VALUE_SHAPE else None)
         return
     meta = obj
     row_exists = row is not None
@@ -715,7 +738,7 @@ def _f6_creator_gate(conn: sqlite3.Connection, author: str,
     """
     if meta_state is None or pmeta is None:
         meta_state, pmeta, _raw = _meta_state(conn, author)
-    if meta_state in (META_INVALID_JSON, META_NON_OBJECT):
+    if meta_state in META_CORRUPT:
         # v2.12.0 batch2 (dsh #1433): FAIL CLOSED.  The cold-start exemption's
         # premise is "no heartbeat in the last 24h" — a corrupt row means the
         # heartbeat is UNREADABLE, not absent.  Treating "unknown" as
@@ -770,7 +793,7 @@ def _f6_record_exemption(conn: sqlite3.Connection, author: str,
     if action == "f6_coldstart":
         if meta_state is None or pmeta is None:
             meta_state, pmeta, _raw = _meta_state(conn, author)
-        if meta_state in (META_INVALID_JSON, META_NON_OBJECT):
+        if meta_state in META_CORRUPT:
             # Defensive: the gate above is fail-closed, so this is unreachable
             # for corrupt rows.  If it ever becomes reachable, keep the bytes
             # and audit instead of rebuilding (dsh #1433 A5 ④).
@@ -1043,6 +1066,17 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 - **claim_token 首发放支是唯一允许「建行」的站点**:`_set_meta` 是 UPDATE-only,
   首次发放必须先有 participants 行。被拒的 claim/ack/reset 不再建行、不再续
   `last_seen`——匿名伪造 liveness 的通道关闭。
+- **坏 meta 行 = 授权记录不可读(P2=方案A,#1478/#1479 裁定)**:`participants.meta`
+  为非法 JSON 或合法非对象、或 dict 但 hb/hb_read/probe 环值非「字符串列表」
+  (第五态 value_shape,#1550 §二)时,`claim_token` **一律拒绝**(四类 CORRUPT,
+  #1556 四走法;不重建、不替换、不 `_touch`,只落一条 `meta_unparsable` 指纹
+  审计,value_shape 另带 `key=`),`ack_token` 与治理门只指
+  `reset_token(human_override=True)`;唯一出口=人工 break-glass reset。理由:行内
+  已无可读 `token_hash`,任何人 claim 都无法出示持有证明;允许重建=无授权软 reset,
+  审计只记录接管、不阻止接管。reset 对四类 CORRUPT 是 **repair**:整份重置为
+  `{{}}`(仅移植值为合法 str 的 `contract`/`entry` 申报键,#1559 §二 (i)),审计带
+  `state=`+被丢键名(不落值)+指纹;不建行不删行(UPDATE-only,#1557 §三),
+  repair 后紧接 `claim_token` 出新 token(R1,#1556 §四)。
 - **幂等 ack 算到场**:站点在最后一个可达 ERROR 之后、幂等返回之前;语义仍是
   「一次成功调用」,不引入「只有状态变更才算」的第二语义。
 - **冷启动计数移出 F6 门**:`_f6_creator_gate` 不再写 `participants.meta`;冷启动
@@ -1093,7 +1127,7 @@ def list_participants() -> str:
     lines = ["Participants:"]
     for r in rows:
         state, meta = _meta_obj(r["meta"] if r["meta"] else None)
-        corrupt = state in (META_INVALID_JSON, META_NON_OBJECT)
+        corrupt = state in META_CORRUPT
         if state != META_DICT:
             meta = {}
         last = r["last_seen"]
@@ -1237,7 +1271,7 @@ def _v21_token_backfill(conn: sqlite3.Connection) -> None:
         "SELECT author, meta FROM participants"
     ).fetchall():
         state, meta = _meta_obj(meta_raw)
-        if state in (META_INVALID_JSON, META_NON_OBJECT):
+        if state in META_CORRUPT:
             # v2.12.0 (batch1 票B, #1307 §二): one bad row must not abort the
             # whole startup migration (today `meta.get` is outside the parse
             # try, so this row kills `main()` and every restart).  Fail soft
@@ -1750,6 +1784,34 @@ META_DICT = "dict"
 META_MISSING = "missing"
 META_INVALID_JSON = "invalid_json"
 META_NON_OBJECT = "non_object"
+# v2.12.0 修复批 第五态 (dsh #1550 §二, β 批): a dict whose RING values are not
+# lists of timestamp strings is corrupt too — top-level four states cannot see
+# it ("state=dict" ⇒ passthrough), yet it was both a silent data destroyer
+# (leg A: `"abc"` iterated char-by-char into a rebuilt ring, no audit) and a
+# 500 face (leg B: `[{'a':1}]` → strptime TypeError through the single-except
+# guard).  `value_shape` is a note/state-STRING extension only: no response key
+# changes, registered in this batch's board post + behavior assertions.
+META_VALUE_SHAPE = "value_shape"
+# The corrupt family every rejection/repair/skip face branches on (dsh #1556
+# 四走法 ①②③④): invalid JSON ∪ non-object ∪ dict-with-bad-ring-values.
+META_CORRUPT = (META_INVALID_JSON, META_NON_OBJECT, META_VALUE_SHAPE)
+
+
+def _ring_shape_defect(meta: object) -> str | None:
+    """First ring key whose stored value is not a list of strings (#1550 §二).
+
+    Judgment is per-key and literal: the key must be ABSENT, None, or a
+    list of str (`[]` passes — empty list of str).  A bare falsy non-list
+    (`0`/`""`) is a DEFECT: `or []` would swallow it into "empty ring" and
+    hand a cold-start exemption to a live row (#1567 §一 ④a 补格)."""
+    if not isinstance(meta, dict):
+        return None
+    for k in ("hb", BEAT_READ_KEY, BEAT_PROBE_KEY):
+        v = meta.get(k)
+        if v is not None and not (isinstance(v, list)
+                                  and all(isinstance(x, str) for x in v)):
+            return k
+    return None
 
 # dsh #1446: `json.loads` raises RecursionError (⊂ RuntimeError, NOT ValueError)
 # on deeply nested payloads, so ValueError/TypeError guards let a single row
@@ -1776,6 +1838,11 @@ def _meta_obj(raw: str | None) -> tuple[str, object]:
         return META_INVALID_JSON, {}
     if not isinstance(obj, dict):
         return META_NON_OBJECT, obj
+    # 修复批 第五态 (dsh #1550 §二): value shape is part of the ROW state, so
+    # every corrupt-branch face (claim/ack/reset rejection, ring skip, token
+    # reverse-lock, diagnostic labels) sees ④ without a second parse.
+    if _ring_shape_defect(obj) is not None:
+        return META_VALUE_SHAPE, obj
     return META_DICT, obj
 
 
@@ -1791,38 +1858,50 @@ def _meta_state(conn: sqlite3.Connection, author: str) -> tuple[str, object, str
 def _meta_unparsable_error(state: str, where: str) -> str:
     """Named diagnostic for a row whose meta exists but is not a JSON object.
 
-    v2.12.0 batch1 票B 第二批 (dsh #1432 §三 / #1433): a corrupt row must NOT
-    be routed to the normal issue path — that path rebuilds the row and
-    replaces the stored token.  The break-glass exit is reset_token.
+    v2.12.0 batch1 票B 第二批 (dsh #1432 §三 / #1433, P2 decided as option A
+    in #1478/#1479): a corrupt row must NOT be routed to the normal issue
+    path — that path rebuilds the row and replaces the stored credential.
+    `claim_token` therefore REJECTS a corrupt row (no possession proof is
+    possible once the hash is unreadable); the only exit is the audited
+    human break-glass `reset_token(human_override=True)`.
     """
     return (f"ERROR: meta_unparsable ({where}: state={state}) — participants.meta "
-            f"is not a JSON object; bytes left untouched. Exit: "
-            f"reset_token(author, human_override=True) (break-glass, audited). "
-            f"The normal token-issue path is NOT the exit: it would rebuild the "
-            f"row and replace the stored token.")
+            f"is not a JSON object; bytes left untouched. Token issuance is "
+            f"disabled for this row (no possession proof is possible and the "
+            f"stored credential must not be rebuilt). Exit: "
+            f"reset_token(author, human_override=True) (break-glass, audited).")
 
 
-def _token_err(conn: sqlite3.Connection, author: str, where: str = "token_gate") -> str:
+def _token_err(conn: sqlite3.Connection, author: str, where: str = "token_gate",
+               state: str | None = None) -> str:
     """THE single source for the governance-token rejection text.
 
     v2.12.0 batch2 (dsh #1435 §一): the literal `claim_token … first` used to be
     produced at 3 sites (request_form_b, register_meta, _token_gate).  A
-    corrupt row must never receive that instruction — it rebuilds the row and
-    replaces the stored token.  Keep one MISSING/DICT literal here and route
-    every token rejection through it; `ack_token` keeps its own (issue-path)
-    wording, so a grep for the literal must find exactly 2 lines.
+    corrupt row must never receive that instruction — that path would rebuild
+    the row and replace the stored credential.  Keep one MISSING/DICT literal
+    here and route every token rejection through it; `ack_token` keeps its own
+    (issue-path) wording, so a grep for the literal must find exactly 2 lines.
+
+    v2.12.0 P3 (#1478, dsh #1479 §三): pass the already-parsed state from
+    `_token_gate` so the decision and the text are derived from ONE parse
+    (no third read of participants.meta between decision and message).
     """
-    state, _obj, _raw = _meta_state(conn, author)
-    if state in (META_INVALID_JSON, META_NON_OBJECT):
+    if state is None:
+        state, _obj, _raw = _meta_state(conn, author)
+    if state in META_CORRUPT:
         return _meta_unparsable_error(state, where)
     return "ERROR: missing/invalid governance token — claim_token first"
 
 
 def _get_meta(conn: sqlite3.Connection, author: str) -> dict:
+    """Dict-TOTAL funnel (P3 收口, #1562 §二 / β 批): `_get_meta` NEVER returns
+    a non-dict.  The historical passthrough (`-> dict` lying for `5`/`"abc"`)
+    was the last raw `.get` crash face; callers needing the corrupt/missing
+    distinction read `_meta_state` directly.  Its one remaining caller (the
+    token-gate latch clear) runs only after `_token_ok` proved a dict row."""
     state, obj, _raw = _meta_state(conn, author)
-    if state in (META_DICT, META_NON_OBJECT):
-        return obj
-    return {}
+    return obj if state == META_DICT else {}
 
 
 def _set_meta(conn: sqlite3.Connection, author: str, meta: dict) -> None:
@@ -1882,15 +1961,20 @@ def _meta_fingerprint(raw: str | bytes | bytearray | None) -> tuple[str, int]:
 
 
 def _audit_meta_unparsable(conn, author: str, raw: str | None,
-                           state: str, where: str) -> None:
+                           state: str, where: str,
+                           key: str | None = None) -> None:
     """Audit a bad meta row by fingerprint only (author + sha256 prefix + len).
 
     Deduplicated on the full note: repeated starts / polls of the same bad row
     do not grow the audit log.  Raw content is deliberately NOT stored
-    (#1307 §五, #1308 §五).
+    (#1307 §五, #1308 §五).  修复批: `key=` names the offending ring key for
+    state=value_shape rows (#1550 §二) — note-VALUE extension only, still
+    fingerprint-only, dedup unchanged.
     """
     fp, length = _meta_fingerprint(raw)
-    note = f"where={where} state={state} sha256={fp} len={length}"
+    note = (f"where={where} state={state}"
+            + (f" key={key}" if key else "")
+            + f" sha256={fp} len={length}")
     prev = conn.execute(
         "SELECT 1 FROM verdict_events WHERE author=? AND action='meta_unparsable'"
         " AND note=? LIMIT 1", (author, note),
@@ -1952,13 +2036,16 @@ def claim_token(author: str) -> str:
         if not author:
             return "ERROR: author required"
         meta_state, meta, meta_raw = _meta_state(conn, author)
-        if meta_state in (META_INVALID_JSON, META_NON_OBJECT):
-            # v2.12.0 (batch1 票B): `claim_token` already rebuilt this row
-            # silently for invalid JSON (and crashed for parsed non-objects).
-            # Make the repair explicit and leave a fingerprint before the
-            # overwrite; token issuance below is the intended self-heal path.
+        if meta_state in META_CORRUPT:
+            # v2.12.0 票B P2 = option A (#1478, dsh #1479 §二.3, pi #1481):
+            # a corrupt row has no readable hash, so a claimant cannot prove
+            # possession.  Rebuilding here was a no-audit soft reset; keeping
+            # it even WITH an audit still hands any caller a working
+            # credential for an existing identity.  Fingerprint the bytes,
+            # reject, and leave the only exit to the audited human reset.
+            # Rejection must not call _touch( (v2.12.0 1.1a).
             _audit_meta_unparsable(conn, author, meta_raw, meta_state, "claim_token")
-            meta = {}
+            return _meta_unparsable_error(meta_state, "claim_token")
         hint = ("persist it NOW (write file + read back), then ack_token — do NOT "
                 "go straight to governance: an auto-ack earns only the short lock")
         if not meta.get("token_hash"):
@@ -2041,15 +2128,15 @@ def ack_token(author: str, token: str) -> str:
     """
     with db() as conn:
         meta_state, meta, meta_raw = _meta_state(conn, author)
-        if meta_state in (META_INVALID_JSON, META_NON_OBJECT):
+        if meta_state in META_CORRUPT:
             # Do NOT rewrite here: ack has no token to verify and the original
-            # bytes must survive until the designated break-glass (reset) or
-            # the self-heal claim runs.  Report the real cause instead of the
-            # old "no token issued" misdiagnosis (#1308 §三-1).
+            # bytes must survive until the designated break-glass (reset).
+            # Under P2 = option A (#1478/#1479) claim_token is rejected too,
+            # so the ONLY exit named here must be the human reset.  Report the
+            # real cause instead of the old "no token issued" misdiagnosis
+            # (#1308 §三-1).
             _audit_meta_unparsable(conn, author, meta_raw, meta_state, "ack_token")
-            return (f"ERROR: meta_unparsable for '{author}' — the row exists but its "
-                    f"meta is not a JSON object; run claim_token (self-heal) or "
-                    f"reset_token(human_override=True)")
+            return _meta_unparsable_error(meta_state, "ack_token")
         if not meta or not meta.get("token_hash"):
             return "ERROR: no token issued for this name — claim_token first"
         if meta.get("token_hash") != hashlib.sha256(token.encode()).hexdigest():
@@ -2082,17 +2169,41 @@ def reset_token(author: str, human_override: bool = False) -> str:
     if not human_override:
         return "ERROR: reset_token requires human_override=True (set it only when the human explicitly instructs)"
     with db() as conn:
-        meta_state, meta, meta_raw = _meta_state(conn, author)
-        rebuilt = meta_state in (META_INVALID_JSON, META_NON_OBJECT)
-        if meta_state == META_MISSING or (not meta and not rebuilt):
+        # P3/repair hard constraint (pi #1557 §二): row existence FIRST, then
+        # classify the RAW bytes — never an `if not _get_meta(...)` variant
+        # (that collapses missing/unparsable into one value again).
+        row = conn.execute(
+            "SELECT meta FROM participants WHERE author=?", (author,)
+        ).fetchone()
+        if row is None:
+            # R2 (#1556 §四-2): truly-absent stays the only "unknown author";
+            # reset never registers (no _touch after this ERROR — 1.1a) and
+            # never creates or deletes a row (#1557 §三 反向锁, UPDATE-only).
             return "ERROR: unknown author"
+        meta_state, meta, meta_raw = _meta_state(conn, author)
+        rebuilt = meta_state in META_CORRUPT
         if rebuilt:
-            # Break-glass must work on a bad row (#1307 §四): the row exists,
+            # Break-glass repair (P2, #1556 §四-1 + R1–R5): the row exists,
             # so "unknown author" would be a lie.  Fingerprint the original
             # bytes, then rebuild a clean dict; reset is the one route allowed
-            # to overwrite unparsable meta.
-            _audit_meta_unparsable(conn, author, meta_raw, meta_state, "reset_token")
-            meta = {}
+            # to overwrite corrupt meta.  修复批: a dict row whose RING values
+            # are shape-corrupt (④, dsh #1556 走法④ / #1550 第五态) is repaired
+            # too — pop-only left `hb:"abc"` alive so claim stayed rejected and
+            # the exit dead-ended (走法④, "出口白走一趟").
+            _audit_meta_unparsable(
+                conn, author, meta_raw, meta_state, "reset_token",
+                key=_ring_shape_defect(meta) if meta_state == META_VALUE_SHAPE else None)
+            preserved: dict = {}
+            if isinstance(meta, dict):
+                # (i) (#1559 §二 / #1560 §三, host 判定): transplant the two
+                # declaration keys ONLY when legally-typed strings — matches
+                # register_meta's own writer contract, never a salvage path;
+                # all other keys (telemetry rings, epoch, latch) are dropped.
+                preserved = {k: meta[k] for k in ("contract", "entry")
+                             if isinstance(meta.get(k), str)}
+            dropped = sorted(k for k in (meta if isinstance(meta, dict) else {})
+                             if k not in preserved)
+            meta = dict(preserved)
         # v2.12.0 (1.1a): after the only reachable ERROR — a rejected reset must
         # not renew liveness (nor create a row for an unknown author).
         _touch(conn, author)
@@ -2103,11 +2214,24 @@ def reset_token(author: str, human_override: bool = False) -> str:
         meta.pop("token_issued_at", None)
         meta.pop("token_blocked", None)  # v2.10 #77: a reset dissolves the latch
         _set_meta(conn, author, meta)
-        _audit(conn, author, "token_reset_human", note="human_override reset; next claim issues fresh")
+        if rebuilt:
+            # R5 微补 (pi #1557 §四): the repair audit note carries state=, the
+            # dropped/preserved key NAMES (never values), and stays non-empty;
+            # the good-row note below stays BYTE-IDENTICAL (R4 — 改出口不改语义).
+            _audit(conn, author, "token_reset_human",
+                   note=(f"human_override reset; state={meta_state};"
+                         f" dropped=[{','.join(dropped)}];"
+                         f" preserved=[{','.join(sorted(preserved))}];"
+                         " next claim issues fresh"))
+            suffix = (f" Corrupt meta repaired from state={meta_state}; original "
+                      "bytes were fingerprinted in the audit log (raw content "
+                      "not stored).")
+        else:
+            _audit(conn, author, "token_reset_human",
+                   note="human_override reset; next claim issues fresh")
+            suffix = ""
         return (f"Token cleared for '{author}' ({'had one' if had else 'had none'}). "
-                f"The identity's next claim_token issues a fresh token."
-                + (" Original unparsable meta was fingerprinted in the audit log "
-                   "before the rebuild." if rebuilt else ""))
+                f"The identity's next claim_token issues a fresh token." + suffix)
 
 
 def _hours_since(utc: str) -> float:
@@ -3366,7 +3490,7 @@ def register_meta(
         # already rejected corrupt rows, so this guard is defensive only.
         row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
         state, meta = _meta_obj(row["meta"] if row and row["meta"] else None)
-        if state in (META_INVALID_JSON, META_NON_OBJECT):
+        if state in META_CORRUPT:
             return _meta_unparsable_error(state, "register_meta")
         # v2.12.0 (1.1a): after the token gate — a rejected declaration must not
         # renew liveness. (This function has zero f-ERROR exits, so the old
@@ -3574,7 +3698,7 @@ def _token_invalid_tids(conn: sqlite3.Connection, author: str) -> list[int]:
     绑定③: blocked semantics unchanged), keeping the three families mutually
     exclusive with union = the old awaiting set (#77 ③)."""
     meta_state, meta, _raw = _meta_state(conn, author)
-    if meta_state in (META_INVALID_JSON, META_NON_OBJECT):
+    if meta_state in META_CORRUPT:
         # A corrupt row is not a normal tokenless member: do not carve its
         # votes into reason=token_invalid (that wake means "claim four steps"
         # and would rebuild the row).  The named gate error is the exit.
@@ -3658,11 +3782,12 @@ def _token_gate(conn: sqlite3.Connection, author: str, token: str | None,
             _set_meta(conn, author, meta)
         return None
     meta_state, meta, _raw = _meta_state(conn, author)
-    if meta_state in (META_INVALID_JSON, META_NON_OBJECT):
+    if meta_state in META_CORRUPT:
         # v2.12.0 batch2 (dsh #1432 §三): do NOT fall through to the normal
         # normal-issue text and do NOT latch 档B — a corrupt row has no
         # readable hash, so the only correct exit is the audited reset path.
-        return _token_err(conn, author, "token_gate")
+        # P3: reuse this parse for the text (no third participants.meta read).
+        return _meta_unparsable_error(meta_state, "token_gate")
     if meta and meta.get("token_hash") and thread_id is not None:
         rev = conn.execute(
             "SELECT revision FROM threads WHERE id=?", (thread_id,)
@@ -3679,7 +3804,7 @@ def _token_gate(conn: sqlite3.Connection, author: str, token: str | None,
                    revision=rev_n,
                    note=("reason=token_unusable: meta 有 hash 而出示失配; "
                          "出口=reset_token(human_override=True) | 正确 token 一次治理调用"))
-    return _token_err(conn, author, "token_gate")
+    return _token_err(conn, author, "token_gate", state=meta_state)
 
 
 def _token_blocked_face(conn: sqlite3.Connection, author: str) -> dict:
@@ -4403,7 +4528,7 @@ def _profile_numbers(conn: sqlite3.Connection, author: str) -> dict:
     if p is None:
         return {"author": author, "error": "not registered — any author-carrying call registers"}
     meta_state, meta = _meta_obj(p["meta"] if p["meta"] else None)
-    corrupt_meta = meta_state in (META_INVALID_JSON, META_NON_OBJECT)
+    corrupt_meta = meta_state in META_CORRUPT
     if meta_state != META_DICT:
         meta = {}
 
@@ -4709,7 +4834,7 @@ def _board_html() -> str:
     strip = []
     for p in participants:
         state, meta = _meta_obj(p["meta"] if p["meta"] else None)
-        corrupt = state in (META_INVALID_JSON, META_NON_OBJECT)
+        corrupt = state in META_CORRUPT
         if state != META_DICT:
             meta = {}
         last = p["last_seen"]
@@ -4945,7 +5070,7 @@ async def attention_probe(request: Request):
             floor_blocking = [e["thread_id"] for e in due_face if e["blocking"]]
             tb_face = _token_blocked_face(conn, author)
             mrow_state, _mrow, _mraw = _meta_state(conn, author)
-            corrupt_meta = mrow_state in (META_INVALID_JSON, META_NON_OBJECT)
+            corrupt_meta = mrow_state in META_CORRUPT
             token_fire = (not corrupt_meta
                           and not (_mrow and _mrow.get("token_hash"))
                           and (bool(ti_tids) or bool(_active_roster_tids(conn, author))))
