@@ -24,6 +24,10 @@
   dsh #1575 §二）。
 - **断言 6（来源谓词，dsh #1581 §三 T3）**：每个 excluded 成员必须能在**同一
   def 体内**找到来源形态——total 锚对「换标签」盲，只能由来源谓词补。
+- **断言 ③b（反向真空，dsh #1595 ②）**：GUARD_DEFS 每成员 ≥1 站 ∧ excluded
+  三类各至少一站——删掉整条守卫站后，③/⑥ 对空集 vacuous-true、④ 守恒仍
+  成立 ⇒ 门全绿而守卫消失；只有「枚举成员的命中存在」这一谓词（非数字）能
+  抓住「删除」。T4 = 删 `_invite` 的 load ⇒ 门必须红。
 - 文件范围：只扫 `server.py`；tests 显式豁免（stage1/stage6 种坏值是夹具职责，
   pi #1564 §三(2)）。
 - import 面（pi #1573 §三）：`from json import` ≡ 0 ∧ `import json as` ≡ 0，
@@ -116,6 +120,16 @@ def _def_body_forms(fdef):
                 and isinstance(n.args[1], ast.Name) and n.args[1].id == "dict"):
             has_isinstance_dict = True
     return has_q, has_v, has_m, has_isinstance_dict
+
+
+def _reverse_vacuum_ok(sites):
+    """断言 ③b（反向真空，dsh #1595 ②）：每个枚举成员至少命中一站 —— 删除型
+    漂移（guard/excluded 整站消失）不走 ①/③/④/⑥ 任何一条红灯：③/⑥ 对空集
+    vacuous-true、④ 守恒随 total 同步缩。谓词非数字（不破「数字不进门」）。"""
+    guard_names = {name for name, tag in sites if tag == "guard"}
+    excl_tags = {tag for _, tag in sites if tag.startswith("excluded:")}
+    return (GUARD_DEFS <= guard_names
+            and excl_tags == {"excluded:quorum", "excluded:value", "excluded:marker"})
 
 
 def _in_try(node, by_id, fdef):
@@ -214,6 +228,9 @@ def main():
           (total, counts))
     check("③ 守卫谓词：枚举的每站在 try 内 ∧ 体内有 isinstance(…, dict)",
           all(in_try and isdict for in_try, isdict in guard_flags.values()), guard_flags)
+    check("③b 反向真空：GUARD_DEFS 每成员 ≥1 站 ∧ excluded 三类各至少一站（删除必红；谓词非数字，dsh #1595 ②）",
+          _reverse_vacuum_ok(sites), {n: t for n, t in sites
+                                      if t == "guard" or t.startswith("excluded:")})
     check("⑥ 来源谓词：每个 excluded 成员的来源形态在同一 def 体内可查",
           all((has_q and tag.endswith("quorum")) or (has_v and tag.endswith("value"))
               or (has_m and tag.endswith("marker"))
@@ -254,11 +271,24 @@ def main():
     check("T3a 漂移站脱离排除形态 → unclassified ≡ 1（门会红，断言 6 同源）",
           len(u3) == 1, u3)
 
+    print("\nT4 删一条守卫站（删 `_invite` 的 load ⇒ 门必须红：③/⑥ 对空集 vacuous-true、"
+          "④ 守恒仍成立，唯 ③b 抓得住，dsh #1595 ②）")
+    src_t4 = src.replace('json.loads(row["meta"] or "{}")', '"{}"', 1)
+    s4, u4, d4, c4, df4, gf4, ef4, t4 = classify(src_t4)
+    check("T4a 盲区面实证：删站后 ①/④ 仍绿（unclassified ≡ 0 ∧ 守恒成立）",
+          len(u4) == 0 and t4 == c4["funnel"] + c4["guard"] + c4["meta"] + c4["excluded"],
+          (u4, t4, c4))
+    check("T4b 断言③ vacuous-true（guard_flags 变空集 ⇒ all() 为真，盲区坐实）",
+          all(in_try and isdict for in_try, isdict in gf4.values()), gf4)
+    check("T4c ③b 反向真空变红（门必拒：枚举成员零命中）",
+          not _reverse_vacuum_ok(s4), {n: t for n, t in s4
+                                       if t == "guard" or t.startswith("excluded:")})
+
     print(f"\n{'=' * 60}\nβ gate: {len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", ", ".join(FAIL))
         return 1
-    print("✅ β GATE PASSED: 单一分区+标签制 / funnel≡1 / 守卫谓词 / 守恒 / 来源谓词 / import 面 / T1·T2·T3")
+    print("✅ β GATE PASSED: 单一分区+标签制 / funnel≡1 / 守卫谓词+反向真空 / 守恒 / 来源谓词 / import 面 / T1·T2·T3·T4")
     return 0
 
 

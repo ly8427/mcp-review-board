@@ -791,14 +791,20 @@ def _f6_record_exemption(conn: sqlite3.Connection, author: str,
     """
     action, note = exemption
     if action == "f6_coldstart":
+        raw: str | None = None
         if meta_state is None or pmeta is None:
-            meta_state, pmeta, _raw = _meta_state(conn, author)
+            meta_state, pmeta, raw = _meta_state(conn, author)
         if meta_state in META_CORRUPT:
             # Defensive: the gate above is fail-closed, so this is unreachable
             # for corrupt rows.  If it ever becomes reachable, keep the bytes
-            # and audit instead of rebuilding (dsh #1433 A5 ④).
-            _audit(conn, author, "meta_unparsable",
-                   note=f"where=f6_record_exemption state={meta_state}; skipped (bytes kept)")
+            # and audit instead of rebuilding (dsh #1433 A5 ④).  Route through
+            # the SINGLE meta_unparsable writer — fingerprint + dedup, same
+            # note shape as every other station (dsh #1595 ④) — never a
+            # divergent second writer.
+            if raw is None:
+                _s, _p, raw = _meta_state(conn, author)
+            _audit_meta_unparsable(conn, author, raw, meta_state,
+                                   "f6_record_exemption")
             return
         if meta_state == META_MISSING:
             pmeta = {}
@@ -1089,8 +1095,10 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
   `schema.sql` 与 `_SCHEMA_FALLBACK` 两处同改;旧库靠 `PRAGMA table_info` 的
   notnull 旗标**结构探测**收敛(不加版本梯级:梯级封顶 CORE 6,v7 归 search
   引导),首启会做一次 participants 整表重建(DROP+复制+RENAME),`schema_version`
-  仍为 7。返回体只新增上述两条 ERROR 文案(枚举形状不变);参数语义不变。随
-  `PROTOCOL_VERSION` 2.11.0→2.12.0 由 `attention_contract` 审计落一行(枚举表不变)。
+  仍为 7。返回体新增上述两条 ERROR 文案;参数语义不变。返回契约的 header 键
+  枚举:1.1b 枚举不变,修复批追加 `meta_unparsable`/`errors_by_author` 两键
+  (见 `attention_contract` 审计的 keys= 行,dsh #1595 ①)。随
+  `PROTOCOL_VERSION` 2.11.0→2.12.0 由 `attention_contract` 审计落一行。
 - **受邀未到场不阻塞决议,但自动关门仍须台账**(dsh #1293 §四,定案①认):
   受邀未到场者从不进入活跃集合 ⇒ 不再有「24h 冻结窗口」,其余活跃成员全 pass 后
   当天即可收口;但 `recompute_thread` 把「名册内非活跃者」喂给 wake_ledger 门 ⇒
@@ -1372,6 +1380,9 @@ def init_db() -> None:
         # version-gated — ONE audit row per protocol version carrying the
         # FULL merged enum table (both tickets share one gate; per-ticket
         # rows would make the second deploy read as drift off the first).
+        # 修复批 (dsh #1595 ①): keys= must carry the batch-2 additions too —
+        # meta_unparsable + errors_by_author — or this enum table lies about
+        # what 2.12.0 actually added to the return body.
         acv = conn.execute(
             "SELECT value FROM meta WHERE key='attention_contract_ver'"
         ).fetchone()
@@ -1385,7 +1396,8 @@ def init_db() -> None:
                 " reasons=token_invalid|awaiting_verdict|verdict_stale"
                 "|awaiting_floor_comment|mentioned|new_comments|idle"
                 " keys=my_comment_due|token_invalid|token_blocked"
-                "|awaiting_my_verdict|blocked_my_verdict"))
+                "|awaiting_my_verdict|blocked_my_verdict"
+                "|meta_unparsable|errors_by_author"))
 
 
 # --- v2.8 (threads #39/#40): cross-thread full-text search read face ---------

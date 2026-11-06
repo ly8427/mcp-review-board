@@ -211,6 +211,12 @@ def main():
         c.close()
     check("T7a bytes untouched", raw_meta(a) == before)
     check("T7b audited meta_unparsable", len(audits(a, "meta_unparsable")) == 1)
+    t7n = audits(a, "meta_unparsable")[0]
+    check("T7c 单一写者面：note 带 where=f6_record_exemption + 指纹 sha256=/len=（dsh #1595 ④）",
+          t7n.startswith("where=f6_record_exemption state=")
+          and "sha256=" in t7n and "len=" in t7n, t7n)
+    check("T7d 分歧旧形无残留（skipped (bytes kept) 已废）",
+          "skipped (bytes kept)" not in t7n, t7n)
 
     print("T9 set_verdict: 坏行点名且不 latch（A2）")
     seed("goodc", json.dumps({"token_hash": "a" * 64}))
