@@ -27,7 +27,9 @@
 - **断言 ③b（反向真空，dsh #1595 ②）**：GUARD_DEFS 每成员 ≥1 站 ∧ excluded
   三类各至少一站——删掉整条守卫站后，③/⑥ 对空集 vacuous-true、④ 守恒仍
   成立 ⇒ 门全绿而守卫消失；只有「枚举成员的命中存在」这一谓词（非数字）能
-  抓住「删除」。T4 = 删 `_invite` 的 load ⇒ 门必须红。
+  抓住「删除」。T4 = 删守卫站的 load ⇒ 门必须红。（dsh #1624 §二后守卫桶缩为
+  `_invited_never_present` 单成员：`_invite` 已单源并入漏斗 `_meta_obj`，
+  本站零 `json.loads`——缩员由 ③b 谓词自证，非手改数字。）
 - 文件范围：只扫 `server.py`；tests 显式豁免（stage1/stage6 种坏值是夹具职责，
   pi #1564 §三(2)）。
 - import 面（pi #1573 §三）：`from json import` ≡ 0 ∧ `import json as` ≡ 0，
@@ -45,7 +47,8 @@ SERVER = os.path.join(HERE, "server.py")
 
 # ── 单点配置（唯一入口；枚举由读 def 手写，数字只作汇总行）────────────────
 FUNNEL_DEFS = {"_meta_obj", "_meta_state", "_get_meta"}   # 语义：恰一处 meta 解析
-GUARD_DEFS = {"_invite", "_invited_never_present"}        # 守卫白名单：try+isinstance
+GUARD_DEFS = {"_invited_never_present"}   # 守卫白名单：try+isinstance
+                                          # （_invite 单源入漏斗 dsh #1624 §二：本站已无 load 站）
 META_DEFS: set[str] = set()   # 其余 participants.meta 站（修复批后为空集：全并入漏斗）
 # 三类排除（不同构，见契约头）：①② 精确 DB 列名；③ 局部标识符
 QUORUM_COLUMN = "quorum"
@@ -271,9 +274,9 @@ def main():
     check("T3a 漂移站脱离排除形态 → unclassified ≡ 1（门会红，断言 6 同源）",
           len(u3) == 1, u3)
 
-    print("\nT4 删一条守卫站（删 `_invite` 的 load ⇒ 门必须红：③/⑥ 对空集 vacuous-true、"
-          "④ 守恒仍成立，唯 ③b 抓得住，dsh #1595 ②）")
-    src_t4 = src.replace('json.loads(row["meta"] or "{}")', '"{}"', 1)
+    print("\nT4 删一条守卫站（删 `_invited_never_present` 的 load ⇒ 门必须红：③/⑥ 对空集 vacuous-true、"
+          "④ 守恒仍成立，唯 ③b 抓得住，dsh #1595 ②；_invite 已单源入漏斗 #1624，本站是守卫桶末成员）")
+    src_t4 = src.replace('json.loads(meta_json or "{}")', '"{}"', 1)
     s4, u4, d4, c4, df4, gf4, ef4, t4 = classify(src_t4)
     check("T4a 盲区面实证：删站后 ①/④ 仍绿（unclassified ≡ 0 ∧ 守恒成立）",
           len(u4) == 0 and t4 == c4["funnel"] + c4["guard"] + c4["meta"] + c4["excluded"],

@@ -263,18 +263,18 @@ def _invite(conn: sqlite3.Connection, author: str | None,
             (author, now, json.dumps(mark, ensure_ascii=False)),
         )
         return
-    try:
-        mark = json.loads(row["meta"] or "{}")
-        if not isinstance(mark, dict):
-            raise ValueError("meta is not a JSON object")
-    except META_PARSE_ERRORS:
-        # dsh #1302/#1305: json.loads(<non-str/bytes>) raises TypeError, which the
-        # ValueError-only guard let escape (same shape as _invited_never_present).
-        # dsh #1293 §五1: this meta belongs to SOMEONE ELSE (token_hash / probe /
-        # hb_read / f6_read_epoch).  A parse failure must not be "repaired" by
-        # overwriting it — the inviter would silently wipe the invitee's identity
-        # and token binding.  Skip the invite mark (fail-closed); a missed invite
-        # can be re-issued, a destroyed token_hash cannot be recovered by us.
+    # dsh #1624 §二 (ii) 单源：本站不再自带第二份 `or "{}"` 手抄 — 直接走漏斗。
+    # 归一化语义随 _meta_obj 自动传播：b""（假值真字节）不再被 `or` 吞成 "{}"
+    # （旧写法会把坏行洗成健康行 ⇒ 无 token_hash ⇒ claim_token 自动重签越过
+    # P2=A break-glass 边界，且原始字节被覆盖、本站零审计 = 证据销毁）；
+    # value_shape（⑤态坏行）同样不洗 — 行状态模型里它就是 corrupt。
+    # dsh #1293 §五1: this meta belongs to SOMEONE ELSE (token_hash / probe /
+    # hb_read / f6_read_epoch).  A parse failure must not be "repaired" by
+    # overwriting it — the inviter would silently wipe the invitee's identity
+    # and token binding.  Skip the invite mark (fail-closed); a missed invite
+    # can be re-issued, a destroyed token_hash cannot be recovered by us.
+    _state, mark = _meta_obj(row["meta"])
+    if _state != META_DICT:
         return
     mark["invited_at"] = now
     if thread_id is not None:
