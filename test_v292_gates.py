@@ -497,14 +497,13 @@ def main():
           out.startswith("Verdict recorded"), out)
 
     # ---------- 8. nonce 流 ----------
+    # #1635 ③ 集成态回归发现: data/ 在 .gitignore ⇒ 新 checkout 无该目录,而
+    # request_form_b 的 nonce 文件写入是 fail-soft(except OSError: pass 静默吞
+    # FileNotFoundError)⇒ 夹具必须自备前置(同 prime_beats 的"夹具伪造前置"纪律),
+    # 否则读回 None、格8 红 —— 两侧共有、非合并引起;server 字节面不动(窄化批范围外)。
+    srv.DATA_DIR.mkdir(parents=True, exist_ok=True)
     tid3 = mk_thread(srv, "anna", ["anna", "brin"], ctx, tok)
     out = srv.request_form_b(thread_id=tid3, author="anna", names=["trae"], token=tok["anna"])
-    nonce = None
-    try:
-        with open(os.path.join(os.path.dirname(db), "..", "data", "form_b_nonce.txt"), encoding="utf-8") as fh:
-            pass
-    except OSError:
-        pass
     # stub 环境下 DATA_DIR 指向真实 data/ —— nonce 文件写在仓库 data/ 下,读回
     p = srv.DATA_DIR / "form_b_nonce.txt"
     nonce = p.read_text(encoding="utf-8").split("nonce=")[1].split(" ")[0] if p.exists() else None
