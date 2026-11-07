@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """v2.10 attention signals — threads #77 (token faces) + #79 (my_comment_due)
 + #1635 (user ruling 甲: errors_by_author narrowed to the subject; GPT round-3
-P2 via host #1634/#1635, five cells per dsh #1637 / claude #1638 / dsh #1639).
+P2 via host #1634/#1635, five cells per dsh #1637 / claude #1638 / dsh #1639,
+two read-side no-side-effect asserts per dsh #1641 §三).
 
 One file, one fixture (stubbed fastmcp, isolated temp DB — the dsh #496 /
 pi #499 pattern). Covers both tickets because they share one return contract
@@ -337,6 +338,9 @@ def main():
     #     但每格的「记一条」必须真注入,否则写入分支从未被执行。
     #   - claude A: 夹具双作者异值(anna=2/brin=3,真注入非播种),防「其他名缺席」
     #     退化成真空断言。
+    #   - dsh #1641 §三: 读点无副作用——读后 map 逐值原样不消费(§三.1)、零异常
+    #     作者读后不建条目(§三.2,防 setdefault 0 值同形绿);§三.3(128 格主语用
+    #     不在册新串 dana,与播种集字符串不等)由 GPT4 的 not-in assert 自证。
     _orig_hb = srv.heartbeat_and_recompute
 
     def _hb_raises(conn, who):
@@ -362,6 +366,12 @@ def main():
         check("#1635 格5(+GPT1): 已记录作者恰返 {anna: 2}(真注入非播种,n 逐值相等)",
               body["errors_by_author"] == {"anna": 2},
               f"got={body.get('errors_by_author')} map={srv._PROBE_ERRORS_BY_AUTHOR}")
+        # dsh #1641 §三.1: 读点不消费/不复位 —— anna 读后 map 逐值原样(anna=2
+        # ∧ brin=3),防「pop 完再返回」或「先 clear 再构造」的写法(那类写法下
+        # 格5/GPT2 也可能绿)。
+        check("#1641 §三.1: 读点不消费/不复位(读后 map 逐值与长度原样)",
+              srv._PROBE_ERRORS_BY_AUTHOR == {"anna": 2, "brin": 3},
+              f"map={srv._PROBE_ERRORS_BY_AUTHOR}")
         # GPT2: 请求 B 不可见 A —— brin 只见自己(相异计数使「anna 缺席」非真空)。
         body = probe(srv, "brin")
         check("#1635 GPT2: 请求 B 只见 B(=3),anna 缺席",
@@ -373,6 +383,12 @@ def main():
         check("#1635 GPT3: 在册零异常作者返 {}(直接取键,非 .get 兜底)",
               body["errors_by_author"] == {},
               f"got={body.get('errors_by_author')}")
+        # dsh #1641 §三.2: 读点不建条目 —— 零异常作者 dana 读后不得被 setdefault
+        # 建 0 值条目(0 值恰与 {} 同形会使该格因错的原因绿),长度仍 2(anna/brin)。
+        check("#1641 §三.2: 读点不建条目(dana 不入 map ∧ 长度不变)",
+              "dana" not in srv._PROBE_ERRORS_BY_AUTHOR
+              and len(srv._PROBE_ERRORS_BY_AUTHOR) == 2,
+              f"map={srv._PROBE_ERRORS_BY_AUTHOR}")
         # GPT4(dsh #1637 §三.4): 128 上限 —— 播种至满(2+126=128,dana 不在册),
         # 真注入 dana 一条 ⇒ 满表拒记;主语读数返 {} ∧ 长度仍 128(不现第 129 键)。
         srv._PROBE_ERRORS_BY_AUTHOR.update({f"x{i}": 1 for i in range(126)})

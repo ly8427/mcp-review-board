@@ -35,6 +35,12 @@
   红、门拒——方向 fail-closed 没错，但**诊断会误指「守卫站被删」，实为改名**
   （与 marker_row ③ 同类：改名会红、属设计如此，处理法=同步改本注记并评审；
   T1 的「改名不改计数」自测适用域=标签组，对 T4 针【不】适用）。
+- **版本闸载体注记（dsh #1641 §一）**：`server.py` `init_db` 的
+  `attention_contract` 审计行 `keys=` 尾项（…`|meta_unparsable|errors_by_author`，
+  本仓坐标 ：1408 一带）是**版本闸载体**——#1635 窄化改的是**值**不是键 ⇒ 对它
+  零审计行、零版本触发（bump 也与重新部署不可分），收口证据=五格+DEBT 行，
+  **不得**在 PR 描述写「版本闸已覆盖」；反过来说**键名与该行文本本批不得动**——
+  谁改 keys= 尾项即静默触发版本闸三件套，超出本批范围。
 - 文件范围：只扫 `server.py`；tests 显式豁免（stage1/stage6 种坏值是夹具职责，
   pi #1564 §三(2)）。
 - import 面（pi #1573 §三）：`from json import` ≡ 0 ∧ `import json as` ≡ 0，
