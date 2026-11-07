@@ -93,6 +93,9 @@ def main():
           (fp_s, ln_s))
     fp_n, ln_n = SRV._meta_fingerprint(None)
     check("P1d None path unchanged", (fp_n, ln_n) == (hashlib.sha256(b"").hexdigest()[:16], 0))
+    fp_z, ln_z = SRV._meta_fingerprint("")
+    check("P1e empty-BLOB fingerprint == sha256(b'')[:16], len=0 (#1622 P2)",
+          (fp_z, ln_z) == ("e3b0c44298fc1c14", 0), (fp_z, ln_z))
 
     print("\nP2 启动站 + 非 UTF-8 BLOB：init_db 不抛、字节原样、审计按原字节")
     seed("blob-bad", BLOB_BAD)
@@ -112,6 +115,23 @@ def main():
           bool(notes) and hashlib.sha256(BLOB_BAD).hexdigest()[:16] in notes[0], notes)
     SRV.init_db()
     check("P2f audit dedup on repeated init_db", len(audits("blob-bad")) == 1, audits("blob-bad"))
+
+    print("\nP2g 空 BLOB b''：init_db 不塌缩不覆盖、指纹=空字节 sha256、len=0 (#1622 P2)")
+    seed("blob-empty", b"")
+    before_e = raw_meta("blob-empty")
+    SRV.init_db()
+    check("P2h stored bytes byte-identical (typeof blob)",
+          before_e == (b"", "blob") and raw_meta("blob-empty") == before_e,
+          (before_e, raw_meta("blob-empty")))
+    notes_e = audits("blob-empty")
+    check("P2i exactly one audit, state=invalid_json",
+          len(notes_e) == 1 and "state=invalid_json" in notes_e[0], notes_e)
+    check("P2j fingerprint = sha256(b'')[:16] prefix, len=0",
+          bool(notes_e) and "sha256=e3b0c44298fc1c14" in notes_e[0] and "len=0" in notes_e[0],
+          notes_e)
+    SRV.init_db()
+    check("P2k audit dedup on repeated init_db", len(audits("blob-empty")) == 1,
+          audits("blob-empty"))
 
     print("\nP3 合法 UTF-8 BLOB：当正常行（不审计 / 不崩 / 正常回填）")
     seed("blob-ok", BLOB_OK)
@@ -155,7 +175,7 @@ def main():
 
     print("\nP5 完整 init_db()：5 类坏行 + 1 条好行同库，坏行全原样、好行照常")
     rows = [("mix-invalid", '{"token_hash": '), ("mix-list", "[]"), ("mix-int", "5"),
-            ("mix-blob", BLOB_BAD), ("mix-deep", DEEP)]
+            ("mix-blob", BLOB_BAD), ("mix-empty", b""), ("mix-deep", DEEP)]
     for a, raw in rows:
         seed(a, raw)
     seed("mix-good", '{"token_hash": "deadbeef"}')

@@ -39,6 +39,8 @@ BAD_INPUTS = [
     ("value_shape_str", '{"hb":"abc"}'),          # 腿A：今天被静默重建写回
     ("value_shape_list", '{"hb":[{"a":1}]}'),      # 腿B：今天 TypeError ≠ ValueError
     ("value_shape_probe", '{"probe":5}'),             # ④b：另两环同判（探针环）
+    # 空 BLOB 归一化 (GPT 外审 P2 via #1622): falsy b"" 不得塌缩成健康空 dict
+    ("blob-empty", b""),
 ]
 
 
@@ -120,6 +122,21 @@ def main():
           SRV._meta_obj("5") == (SRV.META_NON_OBJECT, 5))
     check("S1e dict", SRV._meta_obj('{"a": 1}') == (SRV.META_DICT, {"a": 1}))
     check("S1f empty text is an empty dict", SRV._meta_obj("") == (SRV.META_DICT, {}))
+    # 空 BLOB 归一化 (#1622 P2)：b"" 塌缩洞主体；合法 JSON BLOB 仍走正常路；
+    # 空 TEXT 保持旧行为（S1f）——三格一起钉死归一化边界
+    check("S1i empty BLOB is invalid_json, NOT collapsed to {}",
+          SRV._meta_obj(b"") == (SRV.META_INVALID_JSON, {}))
+    check("S1j non-empty valid-JSON BLOB still a dict",
+          SRV._meta_obj(b'{"a": 1}') == (SRV.META_DICT, {"a": 1}))
+    seed("blob-empty", b"")
+    c = conn()
+    try:
+        st_e, obj_e, raw_e = SRV._meta_state(c, "blob-empty")
+    finally:
+        c.close()
+    check("S1k empty-BLOB row -> invalid_json via _meta_state (DB round-trip, typeof blob)",
+          st_e == SRV.META_INVALID_JSON and raw_e == b"" and obj_e == {},
+          (st_e, raw_e, type(raw_e).__name__))
     seed("s1f", "[]")
     c = conn()
     try:
@@ -355,7 +372,7 @@ def main():
         check(f"R5a meta_unparsable audit with state+fingerprint ({label})",
               len(mu) == 1 and "state=" in mu[0]
               and re.search(r"sha256=[0-9a-f]{16}", mu[0])
-              and f"len={len(raw.encode())}" in mu[0], mu)
+              and f"len={len(raw.encode() if isinstance(raw, str) else raw)}" in mu[0], mu)
         if label.startswith("value_shape"):
             bad_key = "probe" if "probe" in raw else "hb"
             check(f"R5b value_shape audit names key= ({label})",
@@ -367,6 +384,14 @@ def main():
         check(f"R5d no raw payload in any audit ({label})",
               all((raw[:12] not in n) for n in mu + trh) if len(raw) >= 12 else True,
               (raw, mu + trh))
+
+    # #1622 P2 空 BLOB 指纹专格：sha256(空字节) 前缀 + len=0
+    seed("r5-empty", b"")
+    SRV.reset_token("r5-empty", human_override=True)
+    mu_e = [r["note"] for r in events("r5-empty") if r["action"] == "meta_unparsable"]
+    check("R5e empty-BLOB audit: state=invalid_json + sha256(b'')[:16] + len=0",
+          len(mu_e) == 1 and "state=invalid_json" in mu_e[0]
+          and "sha256=e3b0c44298fc1c14" in mu_e[0] and "len=0" in mu_e[0], mu_e)
 
     print("S10 P3 漏斗收口：_get_meta 永不返回非 dict（#1562 §二）")
     for label, raw in BAD_INPUTS + [("empty", "{}"), ("nulltext", "null")]:

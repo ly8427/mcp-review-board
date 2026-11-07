@@ -29,7 +29,8 @@ DB = None
 SRV = None
 BAD = [("invalid_json", '{"token_hash": '),
        ("non_object_falsy", "[]"),
-       ("non_object_truthy", "5")]
+       ("non_object_truthy", "5"),
+       ("blob-empty", b"")]  # 空 BLOB 归一化 (#1622 P2): falsy b"" 不塌缩
 
 
 def check(name, cond, detail=""):
@@ -194,6 +195,15 @@ def main():
     check("T6c reliability_profile names state", prof.get("meta_unparsable") == "non_object", prof)
     prof_good = json.loads(SRV.reliability_profile("face-good"))
     check("T6d good row meta_unparsable is null", prof_good.get("meta_unparsable") is None)
+    # #1622 P2 空 BLOB 读面：点名 meta_unparsable/invalid_json、行仍列出；
+    # 反真空由 face-good（T6d null）与 T11i/j（好行环照涨）承担
+    seed("face-empty", b"")
+    lp_e = SRV.list_participants()
+    check("T6e empty-BLOB row named meta_unparsable, still listed (#1622 P2)",
+          "meta_unparsable" in lp_e and "face-empty" in lp_e, lp_e)
+    prof_e = json.loads(SRV.reliability_profile("face-empty"))
+    check("T6f empty-BLOB reliability_profile names invalid_json (#1622 P2)",
+          prof_e.get("meta_unparsable") == "invalid_json", prof_e)
     html = SRV._board_html()
     check("T6e /board renders 200-shaped HTML with corrupt row", "<!doctype html>" in html and "face-bad" in html)
     check("T6f /board carries the marker", "meta_unparsable" in html)

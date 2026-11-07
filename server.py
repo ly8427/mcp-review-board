@@ -407,7 +407,7 @@ def _ring_append(conn: sqlite3.Connection, author: str | None, key: str,
         return False
     if meta is None:
         row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
-        raw = row["meta"] if row and row["meta"] else None
+        raw = row["meta"] if row is not None else None  # 空 BLOB 不塌缩 (#1622 P2)
         state, obj = _meta_obj(raw)
         if state in META_CORRUPT:
             # v2.12.0 batch2 (dsh #1432 §二/§五 A5): never 500, never rewrite.
@@ -522,7 +522,7 @@ def _beat(conn: sqlite3.Connection, author: str | None, delivered: int = 0) -> N
         return
     epoch = _read_epoch(conn)
     row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
-    raw = row["meta"] if row and row["meta"] else None
+    raw = row["meta"] if row is not None else None  # 空 BLOB 不塌缩 (#1622 P2)
     state, obj = _meta_obj(raw)
     if state in META_CORRUPT:
         # v2.12.0 batch2 (dsh #1432 §二/§五 A5): polling must never 500 on a
@@ -1134,7 +1134,7 @@ def list_participants() -> str:
         return "No participants registered yet. Any author-carrying call registers."
     lines = ["Participants:"]
     for r in rows:
-        state, meta = _meta_obj(r["meta"] if r["meta"] else None)
+        state, meta = _meta_obj(r["meta"])  # 空 BLOB 不塌缩 (#1622 P2)
         corrupt = state in META_CORRUPT
         if state != META_DICT:
             meta = {}
@@ -1838,11 +1838,19 @@ def _meta_obj(raw: str | None) -> tuple[str, object]:
 
     missing (raw None / caller has no row) / invalid_json / non_object /
     dict.  Never raises; never invents a dict for a non-dict payload.
+
+    空 BLOB 归一化（GPT 外审 P2，host #1622 分工令）: an EMPTY BLOB (b"") is
+    falsy and used to collapse into "{}" — a corrupt row disguised as a
+    healthy empty dict (no readable token_hash ⇒ claim_token auto-reissues
+    across the P2=A break-glass boundary).  Normalization: None=missing,
+    empty TEXT keeps legacy behavior ("{}"), b""=invalid_json.  Callers
+    must not truthy-collapse before this funnel — all 7 former
+    `row and row["meta"]` guards now pass the raw value through.
     """
     if raw is None:
         return META_MISSING, {}
     try:
-        obj = json.loads(raw or "{}")
+        obj = json.loads("{}" if raw == "" else raw)
     except META_PARSE_ERRORS:
         # Includes RecursionError: a too-deep payload is unparsable for our
         # purposes and must map to the same state (no fifth state ⇒ no
@@ -1868,7 +1876,7 @@ def _meta_state(conn: sqlite3.Connection, author: str) -> tuple[str, object, str
 
 
 def _meta_unparsable_error(state: str, where: str) -> str:
-    """Named diagnostic for a row whose meta exists but is not a JSON object.
+    """Named diagnostic for a row whose meta exists but is unparsable.
 
     v2.12.0 batch1 票B 第二批 (dsh #1432 §三 / #1433, P2 decided as option A
     in #1478/#1479): a corrupt row must NOT be routed to the normal issue
@@ -1878,7 +1886,7 @@ def _meta_unparsable_error(state: str, where: str) -> str:
     human break-glass `reset_token(human_override=True)`.
     """
     return (f"ERROR: meta_unparsable ({where}: state={state}) — participants.meta "
-            f"is not a JSON object; bytes left untouched. Token issuance is "
+            f"is not a valid metadata object; bytes left untouched. Token issuance is "  # P3 (#1622): value_shape 行是合法 JSON 对象、环值形状坏——旧句对它说谎
             f"disabled for this row (no possession proof is possible and the "
             f"stored credential must not be rebuilt). Exit: "
             f"reset_token(author, human_override=True) (break-glass, audited).")
@@ -2451,7 +2459,7 @@ def create_thread(
             for n in check_names:
                 mrow = conn.execute("SELECT meta FROM participants WHERE author=?", (n,)).fetchone()
                 state_n, obj_n = _meta_obj(
-                    mrow["meta"] if mrow and mrow["meta"] else None)
+                    mrow["meta"] if mrow is not None else None)  # #1622 P2
                 parsed_meta[n] = (state_n, obj_n)
                 if state_n == META_DICT:
                     c = obj_n.get("contract")
@@ -3501,7 +3509,7 @@ def register_meta(
         # ("no ERROR exit after _touch") is unchanged.  _token_gate has
         # already rejected corrupt rows, so this guard is defensive only.
         row = conn.execute("SELECT meta FROM participants WHERE author=?", (author,)).fetchone()
-        state, meta = _meta_obj(row["meta"] if row and row["meta"] else None)
+        state, meta = _meta_obj(row["meta"] if row is not None else None)  # #1622 P2
         if state in META_CORRUPT:
             return _meta_unparsable_error(state, "register_meta")
         # v2.12.0 (1.1a): after the token gate — a rejected declaration must not
@@ -4539,7 +4547,7 @@ def _profile_numbers(conn: sqlite3.Connection, author: str) -> dict:
     ).fetchone()
     if p is None:
         return {"author": author, "error": "not registered — any author-carrying call registers"}
-    meta_state, meta = _meta_obj(p["meta"] if p["meta"] else None)
+    meta_state, meta = _meta_obj(p["meta"])  # 空 BLOB 不塌缩 (#1622 P2)
     corrupt_meta = meta_state in META_CORRUPT
     if meta_state != META_DICT:
         meta = {}
@@ -4845,7 +4853,7 @@ def _board_html() -> str:
 
     strip = []
     for p in participants:
-        state, meta = _meta_obj(p["meta"] if p["meta"] else None)
+        state, meta = _meta_obj(p["meta"])  # 空 BLOB 不塌缩 (#1622 P2)
         corrupt = state in META_CORRUPT
         if state != META_DICT:
             meta = {}
