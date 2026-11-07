@@ -5196,7 +5196,13 @@ async def attention_probe(request: Request):
             # serves a DIFFERENT board and refuse to wake members against it.
             "uptime_secs": int(time.time() - _STARTED_AT),
             "errors": _PROBE_ERRORS,
-            "errors_by_author": dict(_PROBE_ERRORS_BY_AUTHOR),
+            # #1635 (user ruling 甲): narrowed to the subject's own entry —
+            # /attention is unauthenticated, so a roster-wide face would let
+            # anyone enumerate every member's probe-failure counts (GPT round-3
+            # P2). Key name is the version-gate carrier and must not change
+            # (dsh #1637 §三.5); the scalar `errors` face is out of scope.
+            "errors_by_author": ({author: _PROBE_ERRORS_BY_AUTHOR[author]}
+                                 if author in _PROBE_ERRORS_BY_AUTHOR else {}),
         })
     except Exception:
         _PROBE_ERRORS += 1

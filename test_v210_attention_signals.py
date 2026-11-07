@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""v2.10 attention signals — threads #77 (token faces) + #79 (my_comment_due).
+"""v2.10 attention signals — threads #77 (token faces) + #79 (my_comment_due)
++ #1635 (user ruling 甲: errors_by_author narrowed to the subject; GPT round-3
+P2 via host #1634/#1635, five cells per dsh #1637 / claude #1638 / dsh #1639).
 
 One file, one fixture (stubbed fastmcp, isolated temp DB — the dsh #496 /
 pi #499 pattern). Covers both tickets because they share one return contract
@@ -322,6 +324,73 @@ def main():
         ch._PRIORITY_CHAIN, "优先级 awaiting_my_verdict > mentions_me > new_comments")
     check("负向: old v2.9 priority line (pre-v2.10 form) trips the assertion",
           ch.check_watcher_texts(mut) > 0)
+
+    # ---------- #1635 (user ruling 甲): errors_by_author narrowed to subject ----------
+    # GPT 第三轮 P2(host #1634/#1635 转达)+ dsh #1637 六条验收前置 + claude #1638
+    # A/B 增补 + dsh #1639 三条实现陷阱 —— 五格全部函数面直调(probe harness),
+    # 不进 fastmcp 缺席组(claude B)。夹具纪律:
+    #   - dsh #1639 §一: author 校验在 try 之前(空→400),格5/格128 不能由输入触发
+    #     ⇒ monkeypatch 最靠前的 heartbeat_and_recompute 注入故障;except 尾是
+    #     re-raise ⇒ harness 自吞,否则一次未捕获会中断整份文件(#859 同型)。
+    #   - dsh #1639 §二: 全局 map 全文件无复位点 ⇒ 整块 try/finally clear()
+    #     (不 importlib.reload,那会废掉夹具);128 格排最后;播种省 128 次注入,
+    #     但每格的「记一条」必须真注入,否则写入分支从未被执行。
+    #   - claude A: 夹具双作者异值(anna=2/brin=3,真注入非播种),防「其他名缺席」
+    #     退化成真空断言。
+    _orig_hb = srv.heartbeat_and_recompute
+
+    def _hb_raises(conn, who):
+        raise RuntimeError("injected fault (#1635 narrowing fixture)")
+
+    def _inject_error(subject, times=1):
+        srv.heartbeat_and_recompute = _hb_raises
+        try:
+            for _ in range(times):
+                try:
+                    probe(srv, subject)
+                except Exception:
+                    pass  # except 尾 re-raise;harness 自吞(dsh #1639 §一)
+        finally:
+            srv.heartbeat_and_recompute = _orig_hb
+
+    try:
+        # 格5(正面格,dsh #1637 §三.2): 真注入两条 ⇒ anna=2;已记录作者恰返
+        # {anna: 2}(n 逐值相等)且 brin=3 在场(非真空,claude A)。
+        _inject_error("anna", 2)
+        _inject_error("brin", 3)
+        body = probe(srv, "anna")
+        check("#1635 格5(+GPT1): 已记录作者恰返 {anna: 2}(真注入非播种,n 逐值相等)",
+              body["errors_by_author"] == {"anna": 2},
+              f"got={body.get('errors_by_author')} map={srv._PROBE_ERRORS_BY_AUTHOR}")
+        # GPT2: 请求 B 不可见 A —— brin 只见自己(相异计数使「anna 缺席」非真空)。
+        body = probe(srv, "brin")
+        check("#1635 GPT2: 请求 B 只见 B(=3),anna 缺席",
+              body["errors_by_author"] == {"brin": 3},
+              f"got={body.get('errors_by_author')}")
+        # GPT3(dsh #1637 §三.3): 未记录作者 = 在册且零异常的 dana(不是缺 author
+        # 的 400 路径);直接取键断言 —— 缺键即 KeyError,不用 .get 兜底(#859 指纹)。
+        body = probe(srv, "dana")
+        check("#1635 GPT3: 在册零异常作者返 {}(直接取键,非 .get 兜底)",
+              body["errors_by_author"] == {},
+              f"got={body.get('errors_by_author')}")
+        # GPT4(dsh #1637 §三.4): 128 上限 —— 播种至满(2+126=128,dana 不在册),
+        # 真注入 dana 一条 ⇒ 满表拒记;主语读数返 {} ∧ 长度仍 128(不现第 129 键)。
+        srv._PROBE_ERRORS_BY_AUTHOR.update({f"x{i}": 1 for i in range(126)})
+        assert "dana" not in srv._PROBE_ERRORS_BY_AUTHOR
+        assert len(srv._PROBE_ERRORS_BY_AUTHOR) == 128
+        _inject_error("dana", 1)
+        check("#1635 GPT4(前半): 满表拒记新作者(dana 不入 map,无第 129 键)",
+              "dana" not in srv._PROBE_ERRORS_BY_AUTHOR
+              and len(srv._PROBE_ERRORS_BY_AUTHOR) == 128,
+              f"len={len(srv._PROBE_ERRORS_BY_AUTHOR)}")
+        body = probe(srv, "dana")
+        check("#1635 GPT4(后半): 满表主语读数返 {} ∧ map 仍 128",
+              body["errors_by_author"] == {}
+              and len(srv._PROBE_ERRORS_BY_AUTHOR) == 128,
+              f"got={body.get('errors_by_author')} "
+              f"len={len(srv._PROBE_ERRORS_BY_AUTHOR)}")
+    finally:
+        srv._PROBE_ERRORS_BY_AUTHOR.clear()  # 模块级全局,finally 还原(dsh #1639 §二)
 
     print(f"\n{'='*60}\nv2.10 attention signals: {len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
