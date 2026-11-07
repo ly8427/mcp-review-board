@@ -30,6 +30,11 @@
   抓住「删除」。T4 = 删守卫站的 load ⇒ 门必须红。（dsh #1624 §二后守卫桶缩为
   `_invited_never_present` 单成员：`_invite` 已单源并入漏斗 `_meta_obj`，
   本站零 `json.loads`——缩员由 ③b 谓词自证，非手改数字。）
+- **T4 针锚 = 形参标识符 `meta_json`**（dsh #1632 §四）：针已从 DB 列名锚换成
+  守卫站唯一 load 的形参名。形参一改名，T4 的 `replace` 变 no-op ⇒ T4b/T4c
+  红、门拒——方向 fail-closed 没错，但**诊断会误指「守卫站被删」，实为改名**
+  （与 marker_row ③ 同类：改名会红、属设计如此，处理法=同步改本注记并评审；
+  T1 的「改名不改计数」自测适用域=标签组，对 T4 针【不】适用）。
 - 文件范围：只扫 `server.py`；tests 显式豁免（stage1/stage6 种坏值是夹具职责，
   pi #1564 §三(2)）。
 - import 面（pi #1573 §三）：`from json import` ≡ 0 ∧ `import json as` ≡ 0，

@@ -273,8 +273,16 @@ def _invite(conn: sqlite3.Connection, author: str | None,
     # overwriting it — the inviter would silently wipe the invitee's identity
     # and token binding.  Skip the invite mark (fail-closed); a missed invite
     # can be re-issued, a destroyed token_hash cannot be recovered by us.
+    # Predicate = `in META_CORRUPT`, not `!= META_DICT` (dsh #1628 §一/claude
+    # #1631 §3/dsh #1632 §二, 甲): this site is a WRITE-POINT SKIP — the only
+    # reason to skip is "these bytes are not mine to touch" (corrupt family).
+    # META_MISSING is not corrupt (cf. _f6_creator_gate :747 passing it as {}),
+    # so keep today's behavior (write mark).  Structurally unreachable today:
+    # meta is TEXT NOT NULL DEFAULT '{}' and row-existence was handled above,
+    # but the predicate must not silently swallow MISSING if that ever changes
+    # (dsh #1632 §三: NOT NULL makes it DDL-unreachable, not accidentally so).
     _state, mark = _meta_obj(row["meta"])
-    if _state != META_DICT:
+    if _state in META_CORRUPT:
         return
     mark["invited_at"] = now
     if thread_id is not None:
