@@ -290,20 +290,28 @@ def main():
     check("#77 档B扩展: corrupt 行不被 token_invalid 唤醒(档A 文案对坏行是假),meta_unparsable 面在",
           _body.get("reason") != "token_invalid" and _body.get("meta_unparsable") is not None,
           f"reason={_body.get('reason')} mu={_body.get('meta_unparsable')}")
-    # tier 原样取用两格: 未知 tier 原样透传(读面不改写,fail-safe 归轮询侧白名单);
-    # 无 tier 存项=前代写入 ⇒ 迁移默认 manual(前代单写者事实,非反推)。
+    # tier 原样取用两格((甲) 归一 #1702;期望已翻,翻格理由就地写明 = 简报 #1699 ④):
+    # 原注记「未知 tier 原样透传(读面不改写,fail-safe 归轮询侧白名单)」已作废 ——
+    # 三载体判据按字面 tier=manual 匹配,未知值透传后不匹配 = 不禁 = fail-open
+    # (#1691/#1692/#1694 推翻原设计理由)。归一=成员判定(dsh #1694 §一): 已知值
+    # manual/break_glass 原样上 wire;未知值/显式 null/缺键一律落迁移默认 manual。
+    # 无 tier 存项=前代写入 ⇒ 同默认(前代单写者事实,非反推)。
     with srv.db() as conn:
         srv._begin_write(conn)
         conn.execute("UPDATE participants SET meta=? WHERE author='anna'",
                      (json.dumps({"token_hash": "h", "token_blocked": {
                          "91": {"since": "2026-11-08 00:00:00", "revision": 1},
                          "92": {"since": "2026-11-08 00:00:00", "revision": 2,
-                                "tier": "future_tier"}}}),))
+                                "tier": "future_tier"},
+                         "93": {"since": "2026-11-08 00:00:00", "revision": 3,
+                                "tier": None}}}),))
     with srv._connect() as conn:
         tb = srv._token_blocked_face(conn, "anna")
-    check("#77 档B扩展: 无 tier 存项迁移默认 manual ∧ 未知 tier 原样透传(读面不改写)",
-          tb.get("91", {}).get("tier") == "manual" and tb.get("92", {}).get("tier") == "future_tier",
+    check("#77 档B扩展: 无 tier 存项迁移默认 manual ∧ 未知 tier 落迁移默认 manual((甲) 归一,期望已翻,理由见上注)",
+          tb.get("91", {}).get("tier") == "manual" and tb.get("92", {}).get("tier") == "manual",
           f"tb={tb}")
+    check("#99 (jia) acceptance 3: explicit null tier lands on the migration default manual",
+          tb.get("93", {}).get("tier") == "manual", f"tb={tb}")
     with srv.db() as conn:
         srv._begin_write(conn)
         conn.execute("UPDATE participants SET meta=? WHERE author='anna'", (_anna_raw,))

@@ -1412,7 +1412,8 @@ def init_db() -> None:
                 "|awaiting_floor_comment|mentioned|new_comments|idle"
                 " keys=my_comment_due|token_invalid|token_blocked"
                 "|awaiting_my_verdict|blocked_my_verdict"
-                "|meta_unparsable|errors_by_author"))
+                "|meta_unparsable|errors_by_author"
+                " token_blocked.value=manual|break_glass"))
 
 
 # --- v2.8 (threads #39/#40): cross-thread full-text search read face ---------
@@ -3847,6 +3848,12 @@ def _token_gate(conn: sqlite3.Connection, author: str, token: str | None,
     return _token_err(conn, author, "token_gate", state=meta_state)
 
 
+def _tier_out(e: dict) -> str:
+    """(甲) 只让已知 tier 上 wire;未知值/null/缺键一律落迁移默认 manual."""
+    t = e.get("tier") if isinstance(e, dict) else None
+    return t if t in ("manual", "break_glass") else "manual"
+
+
 def _token_blocked_face(conn: sqlite3.Connection, author: str) -> dict:
     """档B (#77 ②): READ-ONLY latch face — never raises attention, never
     counts as a wake failure. Two tiers (batch3 #77 档B扩展, #1552 §五→
@@ -3886,7 +3893,7 @@ def _token_blocked_face(conn: sqlite3.Connection, author: str) -> dict:
         # Pre-batch3 entries carry no tier field; the mismatch branch was their
         # only writer, so "manual" is the migration default (not an inference —
         # a stored tier is always taken as-is).
-        tid: {"tier": e.get("tier", "manual"), "since": e.get("since"),
+        tid: {"tier": _tier_out(e), "since": e.get("since"),
               "exit": f"reset_token(human_override=True){window}"}
         for tid, e in latch.items()
     }

@@ -367,6 +367,18 @@ def main():
     check("T11m bytes untouched by the poll", raw_meta("v5-poll") == vbefore,
           repr(raw_meta("v5-poll")))
 
+    # --- #99 ②(#1690 §3 登记,#1700 §二 三根针;方向=交付态 #1686/#1687 四计数口径) ---
+    # 三串均为 server.py 字节精确字面;第三根含反引号(#1703 拼写课: 拼错即不绑定)。
+    # b7ab86b 基线计数: RET1=0 / POS=1 / KEEP4=1 ⇒ 本闸钉住交付态;#28 注记若回卷
+    # (旧话回魂/主张被删) ⇒ RET1/POS 翻红。收窄主张见 server.py #1635 块。
+    _srv_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "server.py"), encoding="utf-8").read()
+    check("② RET1 退役针: roster-wide face 措辞不得回魂(同行含 unauthenticated, so 亦不得回魂)",
+          "roster-wide face would let" not in _srv_src)
+    check("② POS 正针: errors_by_author 收窄主张在位",
+          "errors_by_author returns ONE name per" in _srv_src)
+    check("② KEEP4 保留针(源码拼写带反引号): scalar errors 句在位",
+          "the scalar `errors` face is out of scope" in _srv_src)
     print("=" * 60)
     print(f"v2.12.0 batch2: {len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
