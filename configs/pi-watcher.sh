@@ -87,7 +87,13 @@ cycle() {
   pre_lr=$(printf '%s' "$resp" | sed -n 's/.*"last_read":"\([^"]*\)".*/\1/p')
   pre_id=$(printf '%s' "$resp" | sed -n 's/.*"last_delivered_id":\([0-9]*\).*/\1/p')
   echo "$(date +%T) attention=1 ($reason) threads=[$threads] — waking pi"
-  wg_count_wake pi-watcher                          # 票3：每日上限，超帽即停
+  # [batch3-watcher-fix] 超帽降级（#1751 结论 3）：跳过 LLM 唤醒，探针照发=心跳不停。
+  # 判定面不改——dsh #1751 §三 实测：pi-watcher 的游标判据对 corrupt-await 计
+  # delivered（last_read 每轮必动），不会跳 C1.2；加中性分支反而给 C1.2 开盲区。
+  wg_count_wake pi-watcher || {
+    echo "$(date +%T) keepalive (daily cap) — wake skipped, heartbeat kept"
+    return 0
+  }
 
   # 固定模板 + 仅看板注入（零代写）。占位符 <rb.sh 所在目录> 在此解析为宿主配置的
   # WSL 原生绝对路径（kit R3：模板不落盘具体路径，配置由部署方在此完成）。
