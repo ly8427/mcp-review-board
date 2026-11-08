@@ -90,10 +90,10 @@ wg_count_wake() {
 # [batch3-watcher-fix] 中性轮判定两件（GPT 第五轮 P2：watcher 失败计数须识别
 # 「等待人工 reset」态，board #103 #1747/#1749/#1751 定稿）：
 #
-#   （含花括号本体）。禁全响应 substring（dsh T6：break_glass 出现在别处不得命中）、
+# wg__tb_obj <response> — 从紧凑 JSON 响应里括号配对提取 token_blocked 对象（含花括号本体）。禁全响应 substring
 #   禁右邻锚定 sed（dsh #1751 §二.2：右邻从 last_read 换代 meta_unparsable 会静默失效）。
 #   已知限界：不做引号内花括号跳过——现行 wire 的 since/exit 值不含花括号
-#   （#1751 §二.1 两例原文），fixture T2/T6 亦不含；若未来值引入花括号，本函数
+#   （#1751 §二.1 两例原文），fixture T2/T6 亦不含；若未来值引入花括号，本函数须先升级再上量。
 # wg__tb_obj <response> — 括号配对提取 token_blocked 对象（含花括号本体）。
 #   返回：0=提取成功（对象打 stdout）；1=键在但括号不闭合（截断/代理改写）；
 #        2=键不存在（fixture 失真/键前截断；≠健康行常态——健康行恒有该键）。紧凑 JSON 观测形态收进本函数
@@ -101,6 +101,7 @@ wg_count_wake() {
 #        调用方按对象判定，不靠右锚）。
 wg__tb_obj() {
   _s="$1"
+#   不与表面比较统一（conservative 方向是现行为，统一=C1.2 新洞）——理由句恢复（dsh #1809 §5 同族第三例）。
   # B5 (dsh #1757 §一): shortest-prefix strip instead of grep -b byte offset used
   # as a character index — the byte/char mismatch class is deleted, not documented.
   case "$_s" in

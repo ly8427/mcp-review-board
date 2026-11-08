@@ -135,11 +135,13 @@ expect_rc "C1 健康行三连第 3 轮跳闸" "$t4b_rc" "1"
 expect_eq "C1 FAILS=3" "$(cat "$STATE_DIR/t4b.fails")" "3"
 
 echo
-echo "== T5：同态 + token_blocked 空 / tier=manual / 缺档 → failed（检测力不变） =="
+echo "== T5：同态 + token_blocked 无该键 / tier=manual / 缺档 → failed（检测力不变） =="
 v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_NOKEY")
 expect_eq "T5 空 token_blocked" "$v" "failed"
 v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_MANUAL")
 expect_eq "T5 tier=manual" "$v" "failed"
+v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" '{"attention":1,"reason":"awaiting_verdict","threads":[104],"token_blocked":{},"last_read":"x"}')
+expect_eq "T5-R_EMPTY 真·空对象（键在、无档）" "$v" "failed"
 
 echo
 echo "== T6 + T6b（B5）：域外不命中；多字节前缀不改变提取结果 =="
