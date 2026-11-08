@@ -96,11 +96,17 @@ wg_count_wake() {
 #   已知限界：不做引号内花括号跳过——现行 wire 的 since/exit 值不含花括号
 #   （#1751 §二.1 两例原文），fixture T2/T6 亦不含；若未来值引入花括号，本函数
 #   须先升级再上量。rc 0=提取成功（对象打到 stdout）；1=键不存在/未闭合。
+# wg__tb_obj <response> — 括号配对提取 token_blocked 对象（含花括号本体）。
+#   返回：0=提取成功（对象打 stdout）；1=键在但括号不闭合（截断/代理改写）；
+#        2=键不存在（健康行常态/键前截断）。紧凑 JSON 观测形态收进本函数
+#        （dsh #1756 §三：wire 上该键之前全 ASCII——#1751 §二.2 的右邻换代由
+#        调用方按对象判定，不靠右锚）。
 wg__tb_obj() {
   _s="$1"
   # B5 (dsh #1757 §一): shortest-prefix strip instead of grep -b byte offset used
   # as a character index — the byte/char mismatch class is deleted, not documented.
-  case "$_s" in *'"token_blocked":{'*) ;; *) return 1 ;; esac
+  case "$_s" in
+    *'"token_blocked":{'*) ;; *) return 2 ;; esac
   _tail=${_s#*'"token_blocked":{'}
   _depth=1; _out="{"
   while [ -n "$_tail" ]; do
@@ -116,12 +122,14 @@ wg__tb_obj() {
 }
 
 # wg_judge_surface <rc> <pre_att> <pre_reason> <pre_threads> <post_response>
-#   → stdout: delivered | neutral | failed
+#   → stdout: delivered | neutral | unknown | failed
 # 语序写死（dsh #1751 结论 2，中性不得吞 delivered）：
 #   1) rc!=0 → failed（crash/hang 计费不豁免，T3）
 #   2) 表面动了（attention 掉 0 或 reason/threads 变）→ delivered（T2b）
 #   3) 表面未动 且 post 响应含本 author 的 break_glass latch → neutral（等待人工，
 #      T1；latch 键=字面 corrupt 非成员名，#1751 §二.1；提取走 wg__tb_obj 括号配对）
+#   3.5) 表面未动 且 post 无 token_blocked 键（fixture 失真/键前截断）→ failed；
+#        键在但括号不闭合 → unknown（T-140）——边界显式化 dsh #1776 §四.1/§四.2。
 #   4) 其余（含 token_blocked 空/tier=manual/缺 tier——服务端已归一 manual，T5 是
 #      谓词级防御）→ failed（检测力不变）
 wg_judge_surface() {
@@ -136,10 +144,14 @@ wg_judge_surface() {
   if [ "${_aatt:-0}" != "1" ] || [ "$_areason" != "$_p_reason" ] || [ "$_athreads" != "$_p_threads" ]; then
     printf 'delivered'; return 0
   fi
-  case "$_post" in
-    *'"token_blocked":{'*) ;;                                      # 键在：截断/换版/代理改写 ⇒ unknown（显式）
-    *) printf 'failed'; return 0 ;; esac                            # 键不在：健康行常态 ⇒ C1.2 本义 failed（T4/T5 保持）
-  _tb=$(wg__tb_obj "$_post") || { printf 'unknown'; return 0; }    # 提取失败 ⇒ unknown（#1766 §一 表 :140 行）
+  case "$_post" in *'"token_blocked":{'*) ;; *) printf 'failed'; return 0 ;; esac   # 键不在=fixture 失真或键前截断（≠健康行常态——服务端健康行恒有该键，dsh #1776 §四.1）；键前截断仍 failed=有意接受（#1776 §四.1 覆盖面明写）
+  _tb=$(wg__tb_obj "$_post"); _tb_rc=$?   # 单次提取（对象接住，不漏进 stdout）
+  case "$_tb_rc" in
+    2) printf 'failed'; return 0 ;;    # 键不在（#1776 §四.2 单源）
+    1) printf 'unknown'; return 0 ;;   # 键在但括号不闭合（T-140）
+    0) : ;;
+    *) printf 'failed'; return 0 ;;
+  esac
   wg__is_neutral "$_tb" && { printf 'neutral'; return 0; }
   printf 'failed'
 }
@@ -159,7 +171,7 @@ wg__is_neutral() {
 #   3 连败 → 日志 gate tripped 并 exit 1（T3：crash/hang 计费不豁免）。
 # wg_judge_cursor <rc> <pre_lr> <pre_id> <post_lr> <post_id> → delivered|failed
 #   pi-watcher 游标判据逐字搬入（C4，dsh #1757 §3：载体只能落本库——source
-   #   pi-watcher 原两腿逐字同（含空串守卫）；rc 门=签名防御、生产恒 0（唯一调用点传字面 0）、勿删——#1766 §4。
+#   #   pi-watcher 原两腿逐字同（含空串守卫）；rc 门=签名防御、生产恒 0（唯一调用点传字面 0）、勿删——#1766 §4。
 #   （含空串守卫），不与表面比较统一（conservative 方向是现行为，统一=C1.2 新洞）。
 wg_judge_cursor() {
   case "${1:-}" in ''|*[!0-9]*) printf 'failed'; return 0 ;; esac

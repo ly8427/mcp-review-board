@@ -147,6 +147,10 @@ R_CJK='{"reason":"中文中文中文","token_blocked":{"corrupt":{"tier":"break_
 R_ASCII='{"reason":"ascii","token_blocked":{"corrupt":{"tier":"break_glass"}},"last_read":"x"}'
 expect_eq "T6b CJK/ASCII 提取逐字相等" "$(wg__tb_obj "$R_CJK")" "$(wg__tb_obj "$R_ASCII")"
 expect_eq "T6b 提取对象本体" "$(wg__tb_obj "$R_CJK")" '{"corrupt":{"tier":"break_glass"}}'
+R_TRUNC='{"attention":1,"reason":"awaiting_verdict","threads":[104],"token_blocked":{"104":{"tier":"man'
+v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_TRUNC")
+expect_eq "T-140 键在括号不闭合 → unknown" "$v" "unknown"
+expect_eq "T-140 unknown 三支仍在(结构格)" "$(grep -c "printf 'unknown'" "$HERE/wake_guard.sh")" "3"
 
 echo
 echo "== T7：中性态 + 日帽用尽 → 不 exit、探针照发、keepalive 日志 =="
@@ -196,8 +200,11 @@ case "$(cat "$NS" 2>/dev/null)" in *Z) say "哨兵时间戳 Z 结尾(UTC)" OK PA
 date -u +%FT%TZ > "$NS"   # 重建哨兵（dsh #1773 五行：否则 failed 支的 rm 无事可做，恒绿）
 ( . "$HERE/wake_guard.sh"; FAILS="$STATE_DIR/ns.fails"; echo 0 > "$FAILS"; wg_apply_verdict failed "t-ns" "rc-nonzero" 2>/dev/null; true )
 [ -f "$NS" ] && { say "failed 后哨兵删" "still there" FAIL; fails=$((fails+1)); } || say "failed 后哨兵删" "removed" PASS
-date -u +%FT%TZ > "$NS"   # 重建哨兵（pi #1774 备选形：否则 preflight 的 rm 无物可删）
-( . "$HERE/wake_guard.sh"; wg_preflight t-ns 1200 >/dev/null 2>&1 || true )   # tag 修正：删的是 neutral_since.t-ns
+date -u +%FT%TZ > "$NS"
+pf_out=$( . "$HERE/wake_guard.sh"; STATE_DIR="$STATE_DIR"; wg_preflight t-ns 1200 2>&1 ); pf_rc=$?
+expect_rc "preflight 未被拒启动" "$pf_rc" "0"
+expect_eq "preflight 在岗行(rm 之前的门全过)" "$(printf '%s' "$pf_out" | grep -c '在岗')" "1"
+[ -f "$NS" ] && { say "preflight 清哨兵（新进程≠旧 latch）" "still there" FAIL; fails=$((fails+1)); } || say "preflight 清哨兵（新进程≠旧 latch）" "removed" PASS
 
 echo
 echo "== T10：真 server（需隔离服务；无环境则 SKIP） =="
