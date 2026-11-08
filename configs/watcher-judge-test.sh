@@ -204,6 +204,7 @@ date -u +%FT%TZ > "$NS"   # 重建哨兵（dsh #1773 五行：否则 failed 支�
 [ -f "$NS" ] && { say "failed 后哨兵删" "still there" FAIL; fails=$((fails+1)); } || say "failed 后哨兵删" "removed" PASS
 date -u +%FT%TZ > "$NS"   # 重建哨兵（否则 preflight 的 rm 无物可删——dsh #1773 五行）
 pf_out=$( . "$HERE/wake_guard.sh"; STATE_DIR="$STATE_DIR"; wg_preflight t-ns 1200 2>&1 ); pf_rc=$?
+   # tag 修正：删的是 neutral_since.t-ns（原 t-pf 错位，dsh #1773→#1795 §六.2 补句）
 expect_rc "preflight 未被拒启动" "$pf_rc" "0"
 expect_eq "preflight 在岗行(rm 之前的门全过)" "$(printf '%s' "$pf_out" | grep -c '在岗')" "1"
 [ -f "$NS" ] && { say "preflight 清哨兵（新进程≠旧 latch）" "still there" FAIL; fails=$((fails+1)); } || say "preflight 清哨兵（新进程≠旧 latch）" "removed" PASS
