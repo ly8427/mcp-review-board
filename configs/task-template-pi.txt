@@ -12,7 +12,8 @@
    自检:sha256(文件内容.strip()) 与 participants.meta.token_hash 相同 = 拿到了治理层(#79 #808)。
 0.5) 注入行 reason=token_invalid(v2.10 #77 档A):即使 token 文件在也重走 0) 四步
    (服务端无你的 hash ⇒ 必可重领,即自愈)。
-0.6) 轮询输出的 token_blocked 含 "pi" 且 tier=manual(v2.10 #77 档B):本轮禁治理调用
+0.6) 轮询输出的 token_blocked 含 "pi"，或含 corrupt 档（tier=break_glass，键名固定
+   corrupt——v2.10 #77 档B + batch3 键名修正 #1751 §五）:本轮禁治理调用
    (rb.sh 不发 set_verdict/bump_revision/set_quorum),只做只读工作并在相关帖留一行
    "等人工 reset_token / 等重签窗口";不要反复试错 token。
 0.7) 轮询输出的 my_comment_due 含某帖且该项 blocking=true(v2.10 #79;v2.11.0 #81 三分支):
