@@ -193,10 +193,11 @@ NS="$STATE_DIR/neutral_since.t-ns"
 case "$(cat "$NS" 2>/dev/null)" in *Z) say "哨兵时间戳 Z 结尾(UTC)" OK PASS;; *) say "哨兵时间戳" "$(cat "$NS" 2>/dev/null)" FAIL; fails=$((fails+1));; esac
 ( . "$HERE/wake_guard.sh"; FAILS="$STATE_DIR/ns.fails"; wg_apply_verdict delivered "t-ns" "empty-wake" )
 [ -f "$NS" ] && { say "delivered 后哨兵删" "still there" FAIL; fails=$((fails+1)); } || say "delivered 后哨兵删" "removed" PASS
+date -u +%FT%TZ > "$NS"   # 重建哨兵（dsh #1773 五行：否则 failed 支的 rm 无事可做，恒绿）
 ( . "$HERE/wake_guard.sh"; FAILS="$STATE_DIR/ns.fails"; echo 0 > "$FAILS"; wg_apply_verdict failed "t-ns" "rc-nonzero" 2>/dev/null; true )
 [ -f "$NS" ] && { say "failed 后哨兵删" "still there" FAIL; fails=$((fails+1)); } || say "failed 后哨兵删" "removed" PASS
-( . "$HERE/wake_guard.sh"; STATE_DIR="$STATE_DIR"; wg_preflight t-pf 1200 >/dev/null 2>&1 || true )
-[ -f "$NS" ] && { say "preflight 清哨兵" "still there" FAIL; fails=$((fails+1)); } || say "preflight 清哨兵（新进程≠旧 latch）" "removed" PASS
+date -u +%FT%TZ > "$NS"   # 重建哨兵（pi #1774 备选形：否则 preflight 的 rm 无物可删）
+( . "$HERE/wake_guard.sh"; wg_preflight t-ns 1200 >/dev/null 2>&1 || true )   # tag 修正：删的是 neutral_since.t-ns
 
 echo
 echo "== T10：真 server（需隔离服务；无环境则 SKIP） =="

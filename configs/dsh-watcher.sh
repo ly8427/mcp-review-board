@@ -114,10 +114,10 @@ cycle() {
    先落盘再使用(v2.3:治理调用自动确认只值 1h 短锁,显式落盘+ack 才享 24h)。
 0.5) 注入行 reason=token_invalid(v2.10 #77 档A):即使 token 文件在也重走 0) 四步
    (服务端无你的 hash ⇒ 必可重领,即自愈)。
-0.6) 轮询 header 的 token_blocked 含 "dsh"，或含 corrupt 档（tier=break_glass，键名固定
-   corrupt——v2.10 #77 档B + batch3 键名修正 #1751 §五）:本轮禁一切治理调用(不
-   set_verdict/不 bump_revision/不 set_quorum),只做只读工作并在相关帖
-   留一行"等人工 reset_token / 等重签窗口";不要反复试错 token。
+0.6) 轮询 header 的 token_blocked 非空，且其任一刀 tier 属 {manual, break_glass}
+   （键=线程号或字面 corrupt；含成员名的旧判据是死文字——dsh #1754 §五 更正）:本轮禁一切治理调用
+   (不 set_verdict/不 bump_revision/不 set_quorum),只做只读工作并在相关帖留一行
+   "等人工 reset_token / 等重签窗口";不要反复试错 token。
 0.7) 轮询 header 的 my_comment_due 含某帖且该项 blocking=true(v2.10 #79;v2.11.0 #81 三分支):
    ① 有预算(header budget 面 used<cap)→先在该帖 post_comment 留一行(一句话即可)再投票
    ——先评论后投票,一次唤醒同时清两族(trae #791 增量2);

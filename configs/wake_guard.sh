@@ -103,7 +103,6 @@ wg__tb_obj() {
   case "$_s" in *'"token_blocked":{'*) ;; *) return 1 ;; esac
   _tail=${_s#*'"token_blocked":{'}
   _depth=1; _out="{"
-  _depth=1; _out="{"
   while [ -n "$_tail" ]; do
     _c=${_tail:0:1}; _tail=${_tail:1}
     case "$_c" in
@@ -137,7 +136,10 @@ wg_judge_surface() {
   if [ "${_aatt:-0}" != "1" ] || [ "$_areason" != "$_p_reason" ] || [ "$_athreads" != "$_p_threads" ]; then
     printf 'delivered'; return 0
   fi
-  _tb=$(wg__tb_obj "$_post") || { printf 'failed'; return 0; }
+  case "$_post" in
+    *'"token_blocked":{'*) ;;                                      # 键在：截断/换版/代理改写 ⇒ unknown（显式）
+    *) printf 'failed'; return 0 ;; esac                            # 键不在：健康行常态 ⇒ C1.2 本义 failed（T4/T5 保持）
+  _tb=$(wg__tb_obj "$_post") || { printf 'unknown'; return 0; }    # 提取失败 ⇒ unknown（#1766 §一 表 :140 行）
   wg__is_neutral "$_tb" && { printf 'neutral'; return 0; }
   printf 'failed'
 }
@@ -157,7 +159,7 @@ wg__is_neutral() {
 #   3 连败 → 日志 gate tripped 并 exit 1（T3：crash/hang 计费不豁免）。
 # wg_judge_cursor <rc> <pre_lr> <pre_id> <post_lr> <post_id> → delivered|failed
 #   pi-watcher 游标判据逐字搬入（C4，dsh #1757 §3：载体只能落本库——source
-#   pi-watcher.sh 会自杀/真唤醒/永不返回）。判据与 pi-watcher 原两腿逐字同
+   #   pi-watcher 原两腿逐字同（含空串守卫）；rc 门=签名防御、生产恒 0（唯一调用点传字面 0）、勿删——#1766 §4。
 #   （含空串守卫），不与表面比较统一（conservative 方向是现行为，统一=C1.2 新洞）。
 wg_judge_cursor() {
   case "${1:-}" in ''|*[!0-9]*) printf 'failed'; return 0 ;; esac
