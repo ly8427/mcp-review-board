@@ -44,6 +44,11 @@ expect_eq "pi-watcher 无表面判定(劈叉钉死)" "$(grep -c 'wg_judge_surfac
 expect_eq "pi-watcher 无 break_glass 字面" "$(grep -c '"tier":"break_glass"' "$HERE/pi-watcher.sh")" "0"
 expect_eq "wg_judge_cursor 定义数" "$(grep -c 'wg_judge_cursor()' "$HERE/wake_guard.sh")" "1"
 expect_eq "pi-watcher 游标判定调用" "$(grep -c 'wg_judge_cursor ' "$HERE/pi-watcher.sh")" "1"
+expect_eq "C2 接线: dsh 超帽降级" "$(grep -cE 'wg_count_wake .*\|\|' "$HERE/dsh-watcher.sh")" "1"
+expect_eq "C2 接线: claude 超帽降级" "$(grep -cE 'wg_count_wake .*\|\|' "$HERE/claude-watcher.sh")" "1"
+expect_eq "C2 接线: pi 超帽降级" "$(grep -cE 'wg_count_wake .*\|\|' "$HERE/pi-watcher.sh")" "1"
+expect_eq "C2 接线: host-watch 超帽降级" "$(grep -cE 'wg_count_wake .*\|\|' "$HERE/host-watch.sh")" "1"
+expect_eq "unknown 支存在(wg_apply_verdict)" "$(grep -c 'unknown)' "$HERE/wake_guard.sh")" "1"
 for f in wake_guard.sh dsh-watcher.sh claude-watcher.sh pi-watcher.sh host-watch.sh; do
   bash -n "$HERE/$f" && say "bash -n $f" OK PASS || { say "bash -n $f" OK FAIL; fails=$((fails+1)); }
 done
@@ -79,9 +84,23 @@ expect_eq "T2b reason 变" "$v" "delivered"
 echo
 echo "== T2c（B2）：探针失败/缺 attention 字段 → failed 不得 delivered =="
 v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "")
-expect_eq "T2c 空响应" "$v" "failed"
+expect_eq "T2c 空响应 → unknown（B2 翻转）" "$v" "unknown"
 v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" '{"reason":"x"}')
-expect_eq "T2c 缺 attention 字段" "$v" "failed"
+expect_eq "T2c 缺 attention 字段 → unknown" "$v" "unknown"
+# unknown 无记账三格（dsh #1760 §一 修法）：FAILS 原值保持、rc=0 不跳闸
+: > "$FAILS"; echo 2 > "$FAILS"
+( . "$HERE/wake_guard.sh"; FAILS="$STATE_DIR/u.fails"; echo 2 > "$FAILS"
+  for i in 1 2 3; do v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" ""); wg_apply_verdict "$v" "u" "probe-unknown"; done
+) ; u_rc=$?
+expect_rc "T2c 三连 unknown 后 rc=0（不跳闸）" "$u_rc" "0"
+expect_eq "T2c FAILS 保持 2（unknown 不记账）" "$(cat "$STATE_DIR/u.fails")" "2"
+# 中性态 + 空 post ⇒ unknown 且 neutral_since 仍在（dsh #1760 §一 末格）
+rm -f "$STATE_DIR/neutral_since.u2"
+( . "$HERE/wake_guard.sh"; FAILS="$STATE_DIR/u2.fails"; : > "$FAILS"
+  v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_CORRUPT_2120"); wg_apply_verdict "$v" "u2" "empty-wake"
+  v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" ""); wg_apply_verdict "$v" "u2" "probe-unknown"
+)
+[ -f "$STATE_DIR/neutral_since.u2" ] && say "T2c 中性态+空 post 哨兵仍在" "exists" PASS || { say "T2c 哨兵" "missing" FAIL; fails=$((fails+1)); }
 
 echo
 echo "== T3：break_glass 且 rc!=0 → failed；3 轮跳闸 =="
@@ -161,6 +180,8 @@ v=$(wg_judge_cursor 0 "2026-11-08T04:16:01" 1750 "" "")
 expect_eq "T-pi 空 post → failed（保守向，claude #1756 细化①）" "$v" "failed"
 v=$(wg_judge_cursor 0 "2026-11-08T04:16:01" 1750 "2026-11-08T04:36:06" 1751)
 expect_eq "T-pi delivered_id 前进 → delivered" "$v" "delivered"
+v=$(wg_judge_cursor 2 "2026-11-08T04:16:01" 1750 "2026-11-08T04:36:06" 1750)
+expect_eq "T-pi5 rc≠0+两腿真 → failed（判别格：红前绿后）" "$v" "failed"
 
 echo
 echo "== neutral_since 哨兵（dsh #1757 §三 三纪律） =="

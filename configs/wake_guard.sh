@@ -129,9 +129,9 @@ wg_judge_surface() {
   case "${1:-}" in ''|*[!0-9]*) printf 'failed'; return 0 ;; esac   # B3: 非数字 rc 不当 0
   [ "$1" -ne 0 ] && { printf 'failed'; return 0; }                 # rc!=0 → failed（语序 1：crash/hang 计费不豁免，T3）
   _p_att="${2:-}"; _p_reason="${3:-}"; _p_threads="${4:-}"; _post="${5:-}"
-  [ -z "$_post" ] && { printf 'failed'; return 0; }                 # B2：探针失败=不可判，不记 delivered
+  [ -z "$_post" ] && { printf 'unknown'; return 0; }                # B2→unknown（dsh #1760 §一）：中性态里探针失败判 failed 会把 C1.2 从网络面重开
   _aatt=$(printf '%s' "$_post" | sed -n 's/.*"attention":\([0-9]\).*/\1/p')
-  [ -z "$_aatt" ] && { printf 'failed'; return 0; }                 # B2: 缺 attention 字段同判（T2c）
+  [ -z "$_aatt" ] && { printf 'unknown'; return 0; }                # B2：缺 attention 字段同判（T2c 同 commit 翻转，N2）
   _areason=$(printf '%s' "$_post" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')
   _athreads=$(printf '%s' "$_post" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
   if [ "${_aatt:-0}" != "1" ] || [ "$_areason" != "$_p_reason" ] || [ "$_athreads" != "$_p_threads" ]; then
@@ -161,6 +161,7 @@ wg__is_neutral() {
 #   （含空串守卫），不与表面比较统一（conservative 方向是现行为，统一=C1.2 新洞）。
 wg_judge_cursor() {
   case "${1:-}" in ''|*[!0-9]*) printf 'failed'; return 0 ;; esac
+  [ "$1" -ne 0 ] && { printf 'failed'; return 0; }   # rc≠0 ⇒ failed（pi #1761 §四；判别格 T-pi ⑤ 钉红前绿后）
   _pre_lr="${2:-}"; _pre_id="${3:-}"; _post_lr="${4:-}"; _post_id="${5:-}"
   if { [ -n "$_post_lr" ] && [ "$_post_lr" \> "${_pre_lr:-0}" ]; } || \
      { [ -n "$_post_id" ] && [ "${_pre_id:-0}" -lt "$_post_id" ]; }; then
@@ -183,11 +184,19 @@ wg_apply_verdict() {
       echo 0 > "$FAILS"
       date -u +%FT%TZ > "$_ns" 2>/dev/null        # neutral_since 哨兵（UTC，#1757 §三.3）
       echo "$(date +%T) corrupt-await neutral (break_glass latch) — heartbeat kept, awaiting human reset (prior_fails=$_pf)" ;;
+    unknown)
+      echo "$(date +%T) probe unknown — no bookkeeping (FAILS/neutral_since unchanged) (($_vtag/$_vdetail))" ;;
     *)
       rm -f "$_ns"                                 # neutral_since 纪律 1：failed 支同样删
       _n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 ))
       echo "$_n" > "$FAILS"
       echo "$(date +%T) wake counted as failure ($_vdetail) ($_n/3)"
-      [ "$_n" -ge 3 ] && { echo "gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."; exit 1; } ;;
+      [ "$_n" -ge 3 ] && {
+        echo "gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."
+        # C4（dsh #1763 §三 直读形）：GATE_TRIP_LOG 仅 pi-watcher 定义（普通变量同 shell 可见）；
+        # 另三支展开为空=零行为变化。恢复 pi-watcher 主路径（游标不动）跳闸的持久记录。
+        [ -n "${GATE_TRIP_LOG:-}" ] && printf '%s\n' "$(date '+%F %T') [$_vtag] gate tripped (C1.2) — $_vdetail; watcher stopped; recovery: rm $FAILS && restart." >> "$GATE_TRIP_LOG" 2>/dev/null || true
+        exit 1
+      } ;;
   esac
 }
