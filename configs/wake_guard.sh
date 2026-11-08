@@ -144,7 +144,6 @@ wg_judge_surface() {
   if [ "${_aatt:-0}" != "1" ] || [ "$_areason" != "$_p_reason" ] || [ "$_athreads" != "$_p_threads" ]; then
     printf 'delivered'; return 0
   fi
-  case "$_post" in *'"token_blocked":{'*) ;; *) printf 'failed'; return 0 ;; esac   # 键不在=fixture 失真或键前截断（≠健康行常态——服务端健康行恒有该键，dsh #1776 §四.1）；键前截断仍 failed=有意接受（#1776 §四.1 覆盖面明写）
   _tb=$(wg__tb_obj "$_post"); _tb_rc=$?   # 单次提取（对象接住，不漏进 stdout）
   case "$_tb_rc" in
     2) printf 'failed'; return 0 ;;    # 键不在（#1776 §四.2 单源）
@@ -170,9 +169,9 @@ wg__is_neutral() {
 #   failed 时 $_n 计数走 $FAILS（调用方已指向 STATE_DIR 持久面，T8 禁 /tmp）；
 #   3 连败 → 日志 gate tripped 并 exit 1（T3：crash/hang 计费不豁免）。
 # wg_judge_cursor <rc> <pre_lr> <pre_id> <post_lr> <post_id> → delivered|failed
-#   pi-watcher 游标判据逐字搬入（C4，dsh #1757 §3：载体只能落本库——source
-#   #   pi-watcher 原两腿逐字同（含空串守卫）；rc 门=签名防御、生产恒 0（唯一调用点传字面 0）、勿删——#1766 §4。
-#   （含空串守卫），不与表面比较统一（conservative 方向是现行为，统一=C1.2 新洞）。
+#   [batch3-watcher-fix] 判据逐字搬入 wg_judge_cursor（C4，dsh #1757 §3：载体只能落
+#   本库——source pi-watcher.sh 会自杀/真唤醒/永不返回）。判据与 pi-watcher 原两腿
+#   逐字同（含空串守卫）；rc 门=签名防御、生产恒 0（唯一调用点传字面 0）、勿删——#1766 §4。
 wg_judge_cursor() {
   case "${1:-}" in ''|*[!0-9]*) printf 'failed'; return 0 ;; esac
   [ "$1" -ne 0 ] && { printf 'failed'; return 0; }   # rc≠0 ⇒ failed（pi #1761 §四；判别格 T-pi ⑤ 钉红前绿后）

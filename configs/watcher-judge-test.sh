@@ -25,10 +25,12 @@ p_reason()  { printf '%s' "$1" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p'; }
 p_threads() { printf '%s' "$1" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p'; }
 
 # —— fixture（wire 原文级；dsh #1751 §二.1 两代形态）——
+# fixture 形态注（dsh #1790 §二）：R_NOKEY 无 token_blocked 键 = 「fixture 失真/键前截断」形；
+# 服务端健康行恒有该键（dsh #1786 §四 一手：310B/偏移 154）。真空对象 {} 形见 R_OUTSIDE。
 R_CORRUPT_2120='{"attention":1,"reason":"awaiting_verdict","threads":[104],"token_blocked":{"corrupt":{"tier":"break_glass","exit":"reset_token(human_override=True) (break-glass, audited)."}},"last_read":"2026-11-08T04:16:01"}'
 R_CORRUPT_2121='{"attention":1,"reason":"awaiting_verdict","threads":[104],"token_blocked":{"corrupt":{"tier":"break_glass","exit":"reset_token(human_override=True) (break-glass, audited)."}},"meta_unparsable":1}'
 R_MANUAL='{"attention":1,"reason":"awaiting_verdict","threads":[104],"token_blocked":{"104":{"tier":"manual","since":"x","exit":"reset_token(human_override=True) | window_ends_at=..."}},"last_read":"x"}'
-R_HEALTHY='{"attention":1,"reason":"awaiting_verdict","threads":[104],"last_read":"x"}'
+R_NOKEY='{"attention":1,"reason":"awaiting_verdict","threads":[104],"last_read":"x"}'
 R_OUTSIDE='{"attention":1,"reason":"awaiting_verdict","threads":[104],"other":{"tier":"break_glass"},"token_blocked":{},"last_read":"x"}'
 PRE='{"attention":1,"reason":"awaiting_verdict","threads":[104]}'
 PRE_ATT=$(p_att "$PRE"); PRE_REASON=$(p_reason "$PRE"); PRE_THREADS=$(p_threads "$PRE")
@@ -119,13 +121,13 @@ echo
 echo "== T4 + C1 后半：re-arm 单轮 failed；rc=0 无 latch 三连 → 第 3 轮跳闸（端到端） =="
 v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_MANUAL")
 expect_eq "T4 post=manual 档" "$v" "failed"
-v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_HEALTHY")
+v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_NOKEY")
 expect_eq "T4 post=无档" "$v" "failed"
 : > "$FAILS"
 ( . "$HERE/wake_guard.sh"
   FAILS="$STATE_DIR/t4b.fails"; : > "$FAILS"
   for i in 1 2 3; do
-    v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_HEALTHY")
+    v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_NOKEY")
     wg_apply_verdict "$v" "t4b" "empty-wake"
   done
 ) ; t4b_rc=$?
@@ -134,7 +136,7 @@ expect_eq "C1 FAILS=3" "$(cat "$STATE_DIR/t4b.fails")" "3"
 
 echo
 echo "== T5：同态 + token_blocked 空 / tier=manual / 缺档 → failed（检测力不变） =="
-v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_HEALTHY")
+v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_NOKEY")
 expect_eq "T5 空 token_blocked" "$v" "failed"
 v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_MANUAL")
 expect_eq "T5 tier=manual" "$v" "failed"
@@ -200,7 +202,7 @@ case "$(cat "$NS" 2>/dev/null)" in *Z) say "哨兵时间戳 Z 结尾(UTC)" OK PA
 date -u +%FT%TZ > "$NS"   # 重建哨兵（dsh #1773 五行：否则 failed 支的 rm 无事可做，恒绿）
 ( . "$HERE/wake_guard.sh"; FAILS="$STATE_DIR/ns.fails"; echo 0 > "$FAILS"; wg_apply_verdict failed "t-ns" "rc-nonzero" 2>/dev/null; true )
 [ -f "$NS" ] && { say "failed 后哨兵删" "still there" FAIL; fails=$((fails+1)); } || say "failed 后哨兵删" "removed" PASS
-date -u +%FT%TZ > "$NS"
+date -u +%FT%TZ > "$NS"   # 重建哨兵（否则 preflight 的 rm 无物可删——dsh #1773 五行）
 pf_out=$( . "$HERE/wake_guard.sh"; STATE_DIR="$STATE_DIR"; wg_preflight t-ns 1200 2>&1 ); pf_rc=$?
 expect_rc "preflight 未被拒启动" "$pf_rc" "0"
 expect_eq "preflight 在岗行(rm 之前的门全过)" "$(printf '%s' "$pf_out" | grep -c '在岗')" "1"
