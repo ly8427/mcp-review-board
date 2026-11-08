@@ -205,7 +205,7 @@ SUSPEND_AFTER_HOURS = 24
 # --- v2 A1: participant registry / heartbeat --------------------------------
 # Single source of truth for the served version (v2.9.3 #55: was duplicated in
 # three literals — FastMCP serverInfo, /ping, PROTOCOL header — and drifted).
-PROTOCOL_VERSION = "2.12.0"
+PROTOCOL_VERSION = "2.12.1"
 mcp = FastMCP("ReviewBoard", version=PROTOCOL_VERSION)  # align serverInfo with pyproject
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -1113,7 +1113,8 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
   仍为 7。返回体新增上述两条 ERROR 文案;参数语义不变。返回契约的 header 键
   枚举:1.1b 枚举不变,修复批追加 `meta_unparsable`/`errors_by_author` 两键
   (见 `attention_contract` 审计的 keys= 行,dsh #1595 ①)。随
-  `PROTOCOL_VERSION` 2.11.0→2.12.0 由 `attention_contract` 审计落一行。
+  每次 `PROTOCOL_VERSION` 变更(含降级重写,`!=` 双向)由 `attention_contract`
+  审计落一行。
 - **受邀未到场不阻塞决议,但自动关门仍须台账**(dsh #1293 §四,定案①认):
   受邀未到场者从不进入活跃集合 ⇒ 不再有「24h 冻结窗口」,其余活跃成员全 pass 后
   当天即可收口;但 `recompute_thread` 把「名册内非活跃者」喂给 wake_ledger 门 ⇒
@@ -1401,6 +1402,9 @@ def init_db() -> None:
         acv = conn.execute(
             "SELECT value FROM meta WHERE key='attention_contract_ver'"
         ).fetchone()
+        # `!=` 刻意双向:库内存有更新的契约版本(二进制降级/回滚)同样重写
+        # marker 并落一行审计 —— 留痕、不静默(dsh #1731 §一 降级格;本批
+        # 语义不变,专用测试格归下一批在版本闸下走)。
         if acv is None or acv[0] != PROTOCOL_VERSION:
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('attention_contract_ver', ?)",
