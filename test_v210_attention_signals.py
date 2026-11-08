@@ -237,6 +237,12 @@ def main():
           body.get("attention") == 0 and str(t2) in tb and tb[str(t2)].get("tier") == "manual"
           and "since" in tb[str(t2)] and "exit" in tb[str(t2)],
           f"att={body.get('attention')} tb={tb}")
+    # #77 档B扩展(batch3, #1552 §五→#1553 §三/dsh #1664 §三①): tier 在「知道成因」的
+    # 写入点落盘(可读 hash ∧ 出示失配 ⇒ manual),读面原样取用、不按 since/revision 反推。
+    with srv._connect() as conn:
+        _mlatch = srv._get_meta(conn, "anna").get("token_blocked") or {}
+    check("#77 档B扩展: tier 在写入点落盘(存项自带 tier=manual,非读面硬编码)",
+          _mlatch.get(str(t2), {}).get("tier") == "manual", f"stored={_mlatch}")
     n1 = len(audit_rows(db, "token_blocked_latched"))
     srv.set_verdict(thread_id=t2, verdict="pass", author="anna", token="deadbeef" * 4)
     check("#77 D: repeat rejection does not add a second latched row",
@@ -253,6 +259,77 @@ def main():
     check("#77 D(副作用边界): latch clear preserves token_hash/acked",
           bool(m.get("token_hash")) and bool(m.get("token_acked")),
           f"meta-keys={sorted(m)}")
+
+    # ---------- #77 档B扩展(batch3, #1552 §五→#1553 §三): corrupt 行的 break_glass 家 ----------
+    # corrupt 行字节不可读也不可写(reset 是唯一授权覆写,P2=A 边界)⇒ 其条目由
+    # _meta_state 派生(同 meta_unparsable 面,dsh #1432 §三): 成因即状态本身,哨兵键
+    # corrupt 不与 str(tid) 相撞;轮询侧白名单=仅 break_glass 不禁(manual 及未知 tier
+    # 默认禁,claude #1666)。face 始终只读:零写、零审计、不动 attention。
+    with srv._connect() as conn:
+        _anna_raw = conn.execute(
+            "SELECT meta FROM participants WHERE author='anna'").fetchone()[0]
+    n_tb_latched = len(audit_rows(db, "token_blocked_latched"))
+    with srv.db() as conn:
+        srv._begin_write(conn)
+        conn.execute("UPDATE participants SET meta=? WHERE author='anna'",
+                     (b"corrupt-bytes #77B-extension",))
+    with srv._connect() as conn:
+        tb = srv._token_blocked_face(conn, "anna")
+        _raw_after = conn.execute(
+            "SELECT meta FROM participants WHERE author='anna'").fetchone()[0]
+    _body = probe(srv, "anna")
+    check("#77 档B扩展: corrupt 行得 break_glass 只读家(哨兵键 corrupt,tier=break_glass)",
+          set(tb) == {"corrupt"} and tb["corrupt"].get("tier") == "break_glass"
+          and "reset_token" in tb["corrupt"].get("exit", ""), f"tb={tb}")
+    check("#77 档B扩展: face 只读 —— corrupt 字节零改动、零 latch 审计(不置 attention 不计失败)",
+          _raw_after == b"corrupt-bytes #77B-extension"
+          and len(audit_rows(db, "token_blocked_latched")) == n_tb_latched,
+          f"raw={_raw_after!r} audits={audit_rows(db, 'token_blocked_latched')}")
+    check("#77 档B扩展(claude #1666 白名单): break_glass 面不含任何 manual 档(脚本字面 tier=manual 不误触)",
+          all(e.get("tier") != "manual" for e in tb.values()), f"tb={tb}")
+    check("#77 档B扩展: corrupt 行不被 token_invalid 唤醒(档A 文案对坏行是假),meta_unparsable 面在",
+          _body.get("reason") != "token_invalid" and _body.get("meta_unparsable") is not None,
+          f"reason={_body.get('reason')} mu={_body.get('meta_unparsable')}")
+    # tier 原样取用两格: 未知 tier 原样透传(读面不改写,fail-safe 归轮询侧白名单);
+    # 无 tier 存项=前代写入 ⇒ 迁移默认 manual(前代单写者事实,非反推)。
+    with srv.db() as conn:
+        srv._begin_write(conn)
+        conn.execute("UPDATE participants SET meta=? WHERE author='anna'",
+                     (json.dumps({"token_hash": "h", "token_blocked": {
+                         "91": {"since": "2026-11-08 00:00:00", "revision": 1},
+                         "92": {"since": "2026-11-08 00:00:00", "revision": 2,
+                                "tier": "future_tier"}}}),))
+    with srv._connect() as conn:
+        tb = srv._token_blocked_face(conn, "anna")
+    check("#77 档B扩展: 无 tier 存项迁移默认 manual ∧ 未知 tier 原样透传(读面不改写)",
+          tb.get("91", {}).get("tier") == "manual" and tb.get("92", {}).get("tier") == "future_tier",
+          f"tb={tb}")
+    with srv.db() as conn:
+        srv._begin_write(conn)
+        conn.execute("UPDATE participants SET meta=? WHERE author='anna'", (_anna_raw,))
+
+    # ---------- #77 ②(batch3, #1552 §五→#1553 §三): _awaiting_split 排除按 state ----------
+    # 弃 ti 集合差(同一判据的第二份算术): carve 前置(dict 行 ∧ 无 hash)恰是
+    # _token_invalid_tids 早返守卫的取反,且帖循环谓词与 actionable 相同 ⇒ 旧差集恒等
+    # 全族。早退判据同站校正 in META_CORRUPT(注释写 Corrupt、判据却是 != 的错位,
+    # pi #1659 §二.1③): MISSING 行不再被顺吞 —— 无行成员=无 hash=tokenless,按 state
+    # 整族收 carve(DDL meta TEXT NOT NULL ⇒ 今天不可达,本格钉判据面语义,旧码此格红)。
+    with srv.db() as conn:
+        srv._begin_write(conn)
+        srv._touch(conn, "ghost")
+    out = srv.create_thread(title="T-ghost", author="anna",
+                            quorum=["anna", "ghost"], context=fx.wi("anna", "ghost"))
+    assert out.startswith("Created thread #"), out
+    t_ghost = int(out.split("#")[1].split(":")[0])
+    with srv.db() as conn:
+        srv._begin_write(conn)
+        conn.execute("DELETE FROM participants WHERE author='ghost'")
+    with srv._connect() as conn:
+        _act, _blk = srv._awaiting_split(conn, "ghost")
+        _ti_ghost = srv._token_invalid_tids(conn, "ghost")
+    check("#77 ②(batch3): MISSING 行按 state 收 carve — actionable 整族让位,并集不变",
+          _act == [] and _blk == [] and _ti_ghost == [t_ghost],
+          f"actionable={_act} blocked={_blk} ti={_ti_ghost}")
 
     # ---------- #79 A3b/A4 (deferred so dana stays active through 档B) ----------
     # Suspend dana NOW: age her heartbeat past 24h on the TEST db. A suspended
@@ -356,12 +433,21 @@ def main():
                     pass  # except 尾 re-raise;harness 自吞(dsh #1639 §一)
         finally:
             srv.heartbeat_and_recompute = _orig_hb
+        return times
 
+    # #29(DEBT, dsh #1675 §三 变体 A): 标量快照取在 try 之前;复原写 finally;
+    # 复原断言放块外(finally 内「先断言后复原」易写成半绿)。
+    _saved_scalar = srv._PROBE_ERRORS
+    _injected_total = 0
     try:
         # 格5(正面格,dsh #1637 §三.2): 真注入两条 ⇒ anna=2;已记录作者恰返
-        # {anna: 2}(n 逐值相等)且 brin=3 在场(非真空,claude A)。
-        _inject_error("anna", 2)
-        _inject_error("brin", 3)
+        # {anna: 2}(n 逐值相等)且 brin=3 在场(非真空,claude A)。brin=3 载荷
+        # 不得删(dsh #1644 §二.2/#1650 §三/DEBT #30): brin 与 anna 异值才让
+        # 「返回整表」与「只返主语」可分 —— 同值(或只注 anna)时两态都等于
+        # {anna: 2},该格假绿;删 brin 注入即退化为真空格,后人不得为省一次
+        # 注入删此载荷。
+        _injected_total += _inject_error("anna", 2)
+        _injected_total += _inject_error("brin", 3)
         body = probe(srv, "anna")
         check("#1635 格5(+GPT1): 已记录作者恰返 {anna: 2}(真注入非播种,n 逐值相等)",
               body["errors_by_author"] == {"anna": 2},
@@ -392,9 +478,14 @@ def main():
         # GPT4(dsh #1637 §三.4): 128 上限 —— 播种至满(2+126=128,dana 不在册),
         # 真注入 dana 一条 ⇒ 满表拒记;主语读数返 {} ∧ 长度仍 128(不现第 129 键)。
         srv._PROBE_ERRORS_BY_AUTHOR.update({f"x{i}": 1 for i in range(126)})
-        assert "dana" not in srv._PROBE_ERRORS_BY_AUTHOR
-        assert len(srv._PROBE_ERRORS_BY_AUTHOR) == 128
-        _inject_error("dana", 1)
+        # #26(DEBT): 前置两条带名 check —— 前置不成立要留行不崩(裸 assert 抛
+        # AssertionError 会越过 finally 吃掉汇总行,#859 同族;仅动这 2 条,
+        # 全文件其余裸 assert 不在本项范围)。
+        check("#26 GPT4 前置: 播种后 dana 不在册(前置不成立留行,不崩)",
+              "dana" not in srv._PROBE_ERRORS_BY_AUTHOR)
+        check("#26 GPT4 前置: 播种后 map 恰 128(2+126)",
+              len(srv._PROBE_ERRORS_BY_AUTHOR) == 128)
+        _injected_total += _inject_error("dana", 1)
         check("#1635 GPT4(前半): 满表拒记新作者(dana 不入 map,无第 129 键)",
               "dana" not in srv._PROBE_ERRORS_BY_AUTHOR
               and len(srv._PROBE_ERRORS_BY_AUTHOR) == 128,
@@ -405,8 +496,19 @@ def main():
               and len(srv._PROBE_ERRORS_BY_AUTHOR) == 128,
               f"got={body.get('errors_by_author')} "
               f"len={len(srv._PROBE_ERRORS_BY_AUTHOR)}")
+        # #29 派生量灯(dsh #1675 §三.2): 标量净增恰=注入调用数 —— 派生量非冻结数;
+        # 将来若有人清掉标量面,只有这条红(复原灯会静默空转,同变体 C 实测)。
+        # 放块尾: 覆盖全部注入(anna 2 + brin 3 + dana 1),不冻结 6。
+        check("#29 派生量灯: 标量净增恰=注入调用数(delta==INJECTED,非冻结数)",
+              srv._PROBE_ERRORS - _saved_scalar == _injected_total,
+              f"delta={srv._PROBE_ERRORS - _saved_scalar} injected={_injected_total}")
     finally:
         srv._PROBE_ERRORS_BY_AUTHOR.clear()  # 模块级全局,finally 还原(dsh #1639 §二)
+        srv._PROBE_ERRORS = _saved_scalar   # #29: 标量复原(夹具不留净泄漏,#1675 §三.1)
+    # #29 复原灯(dsh #1675 §三.1): 断言放块外 —— 复原行被删时此灯红
+    # (变体 B: now=泄漏值/saved=快照);标量面被清时派生量灯红(变体 C)。
+    check("#29 标量复原(块进出相等)", srv._PROBE_ERRORS == _saved_scalar,
+          f"now={srv._PROBE_ERRORS} saved={_saved_scalar}")
 
     print(f"\n{'='*60}\nv2.10 attention signals: {len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

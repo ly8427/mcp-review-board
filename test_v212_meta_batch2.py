@@ -106,7 +106,12 @@ def main():
         check(f"T1c gate does NOT say claim_token ({label})",
               "claim_token" not in (gate or ""), gate)
         check(f"T1d token_invalid_tids empty for corrupt row ({label})", ti == [])
-        check(f"T1e token_blocked face empty, no raise ({label})", tb == {})
+        # batch3(#1552 §五→#1553 §三): corrupt 行的 token_blocked 面不再是空 dict ——
+        # 它得到 break_glass 只读家(哨兵键 corrupt、tier=break_glass;坏行字节不可写,
+        # reset 是唯一授权覆写,条目由 _meta_state 派生)。
+        check(f"T1e corrupt row gets the break_glass home, no raise ({label})",
+              set(tb) == {"corrupt"} and tb["corrupt"].get("tier") == "break_glass"
+              and "reset_token" in tb["corrupt"].get("exit", ""), tb)
         check(f"T1f awaiting_split no raise ({label})", isinstance(aw, tuple) and len(aw) == 2)
         check(f"T1g bytes untouched through all token faces ({label})", raw_meta(a) == before)
         check(f"T1h no token_blocked_latched audit ({label})",
