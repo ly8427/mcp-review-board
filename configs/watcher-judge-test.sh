@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# watcher-judge-test.sh — GPT 第五轮 P2 处置的判定逻辑测试（board #103 #1751 T1–T10 规格）。
+# watcher-judge-test.sh — GPT 第五轮 P2 处置的判定逻辑测试（board #103 #1751 T1–T10 规格
+# + #1754/#1756/#1757/#1758 修正包：B1–B5/C1–C4/neutral_since/结构断言）。
 # 载体纪律（dsh #1751 结论 1）：source 真 wake_guard.sh，判据不抄进本文件；
 # 无看板、无 LLM——探针/响应全部用 fixture 字面量；pre 值一律经与 watcher 相同的
 # sed 提取路径产生（防夹具形态与实现口径漂移）。
@@ -13,9 +14,11 @@ FAILS="$STATE_DIR/test.fails"
 MAX_WAKES=3   # T7 用小帽
 
 fails=0
-say() { printf '%-52s -> %-9s [%s]\n' "$1" "$2" "$3"; }
+say() { printf '%-56s -> %-9s [%s]\n' "$1" "$2" "$3"; }
 expect_eq() { if [ "$2" = "$3" ]; then say "$1" "$2" PASS; else say "$1" "$2" "FAIL(want $3)"; fails=$((fails+1)); fi; }
 expect_rc() { if [ "$2" = "$3" ]; then say "$1" "rc=$2" PASS; else say "$1" "rc=$2" "FAIL(want $3)"; fails=$((fails+1)); fi; }
+expect_has() { if printf '%s' "$2" | grep -q "$3"; then say "$1" "has($3)" PASS; else say "$1" "missing($3)" FAIL; fails=$((fails+1)); fi; }
+expect_not() { if printf '%s' "$2" | grep -q "$3"; then say "$1" "has($3)" FAIL; else say "$1" "no($3)" PASS; fi; }
 # 与 watcher 相同的 sed 提取（pre 面产生器——夹具与实现同口径）：
 p_att()     { printf '%s' "$1" | sed -n 's/.*"attention":\([0-9]\).*/\1/p'; }
 p_reason()  { printf '%s' "$1" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p'; }
@@ -30,11 +33,17 @@ R_OUTSIDE='{"attention":1,"reason":"awaiting_verdict","threads":[104],"other":{"
 PRE='{"attention":1,"reason":"awaiting_verdict","threads":[104]}'
 PRE_ATT=$(p_att "$PRE"); PRE_REASON=$(p_reason "$PRE"); PRE_THREADS=$(p_threads "$PRE")
 
-echo "== T9 结构：谓词实现唯一 + 调用点 + 语法 =="
-expect_eq "wg_judge_surface 定义数(wake_guard)" "$(grep -c 'wg_judge_surface()' "$HERE/wake_guard.sh")" "1"
-expect_eq "wg__tb_obj 定义数(wake_guard)"      "$(grep -c 'wg__tb_obj()' "$HERE/wake_guard.sh")" "1"
-expect_eq "dsh-watcher 调用数"                  "$(grep -c 'verdict=$(wg_judge_surface' "$HERE/dsh-watcher.sh")" "1"
-expect_eq "claude-watcher 调用数"               "$(grep -c 'verdict=$(wg_judge_surface' "$HERE/claude-watcher.sh")" "1"
+echo "== T9 结构：谓词唯一住址（B1）+ 调用点 + 语法 + 劈叉钉死（pi #1758 §四） =="
+expect_eq "break_glass 字面全仓计数(5 文件)" "$(cat "$HERE/wake_guard.sh" "$HERE/dsh-watcher.sh" "$HERE/claude-watcher.sh" "$HERE/pi-watcher.sh" "$HERE/host-watch.sh" | grep -c '"tier":"break_glass"')" "1"
+expect_eq "wg_judge_surface 定义数" "$(grep -c 'wg_judge_surface()' "$HERE/wake_guard.sh")" "1"
+expect_eq "wg__tb_obj 定义数"      "$(grep -c 'wg__tb_obj()' "$HERE/wake_guard.sh")" "1"
+expect_eq "wg__is_neutral 定义数"  "$(grep -c 'wg__is_neutral()' "$HERE/wake_guard.sh")" "1"
+expect_eq "dsh-watcher 预检走单源"  "$(grep -c 'wg__is_neutral' "$HERE/dsh-watcher.sh")" "1"
+expect_eq "claude-watcher 预检走单源" "$(grep -c 'wg__is_neutral' "$HERE/claude-watcher.sh")" "1"
+expect_eq "pi-watcher 无表面判定(劈叉钉死)" "$(grep -c 'wg_judge_surface' "$HERE/pi-watcher.sh")" "0"
+expect_eq "pi-watcher 无 break_glass 字面" "$(grep -c '"tier":"break_glass"' "$HERE/pi-watcher.sh")" "0"
+expect_eq "wg_judge_cursor 定义数" "$(grep -c 'wg_judge_cursor()' "$HERE/wake_guard.sh")" "1"
+expect_eq "pi-watcher 游标判定调用" "$(grep -c 'wg_judge_cursor ' "$HERE/pi-watcher.sh")" "1"
 for f in wake_guard.sh dsh-watcher.sh claude-watcher.sh pi-watcher.sh host-watch.sh; do
   bash -n "$HERE/$f" && say "bash -n $f" OK PASS || { say "bash -n $f" OK FAIL; fails=$((fails+1)); }
 done
@@ -68,6 +77,13 @@ v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" '{"attention":1,"
 expect_eq "T2b reason 变" "$v" "delivered"
 
 echo
+echo "== T2c（B2）：探针失败/缺 attention 字段 → failed 不得 delivered =="
+v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "")
+expect_eq "T2c 空响应" "$v" "failed"
+v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" '{"reason":"x"}')
+expect_eq "T2c 缺 attention 字段" "$v" "failed"
+
+echo
 echo "== T3：break_glass 且 rc!=0 → failed；3 轮跳闸 =="
 : > "$FAILS"
 ( . "$HERE/wake_guard.sh"
@@ -81,11 +97,21 @@ expect_rc "T3 第三轮 gate tripped 退出" "$t3_rc" "1"
 expect_eq "T3 FAILS=3" "$(cat "$STATE_DIR/t3.fails")" "3"
 
 echo
-echo "== T4：re-arm（本轮 post 无 latch）→ 回落 failed =="
+echo "== T4 + C1 后半：re-arm 单轮 failed；rc=0 无 latch 三连 → 第 3 轮跳闸（端到端） =="
 v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_MANUAL")
 expect_eq "T4 post=manual 档" "$v" "failed"
 v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_HEALTHY")
 expect_eq "T4 post=无档" "$v" "failed"
+: > "$FAILS"
+( . "$HERE/wake_guard.sh"
+  FAILS="$STATE_DIR/t4b.fails"; : > "$FAILS"
+  for i in 1 2 3; do
+    v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_HEALTHY")
+    wg_apply_verdict "$v" "t4b" "empty-wake"
+  done
+) ; t4b_rc=$?
+expect_rc "C1 健康行三连第 3 轮跳闸" "$t4b_rc" "1"
+expect_eq "C1 FAILS=3" "$(cat "$STATE_DIR/t4b.fails")" "3"
 
 echo
 echo "== T5：同态 + token_blocked 空 / tier=manual / 缺档 → failed（检测力不变） =="
@@ -95,9 +121,13 @@ v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_MANUAL")
 expect_eq "T5 tier=manual" "$v" "failed"
 
 echo
-echo "== T6：break_glass 在 token_blocked 之外 → 不得中性（括号配对提取） =="
+echo "== T6 + T6b（B5）：域外不命中；多字节前缀不改变提取结果 =="
 v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_OUTSIDE")
 expect_eq "T6 域外 break_glass" "$v" "failed"
+R_CJK='{"reason":"中文中文中文","token_blocked":{"corrupt":{"tier":"break_glass"}},"last_read":"x"}'
+R_ASCII='{"reason":"ascii","token_blocked":{"corrupt":{"tier":"break_glass"}},"last_read":"x"}'
+expect_eq "T6b CJK/ASCII 提取逐字相等" "$(wg__tb_obj "$R_CJK")" "$(wg__tb_obj "$R_ASCII")"
+expect_eq "T6b 提取对象本体" "$(wg__tb_obj "$R_CJK")" '{"corrupt":{"tier":"break_glass"}}'
 
 echo
 echo "== T7：中性态 + 日帽用尽 → 不 exit、探针照发、keepalive 日志 =="
@@ -112,18 +142,45 @@ expect_rc "T7 非中性超帽 → rc=1（降级信号）" "$rc" "1"
 expect_eq "T7 keepalive 语义在日志" "$(printf '%s' "$out" | grep -c '本轮跳过唤醒')" "1"
 
 echo
-echo "== T8：状态落盘纪律（默认 STATE_DIR 非 /tmp；FAILS 跨进程仍在） =="
+echo "== T8 + C3：落盘纪律 + prior_fails 上日志 + 中性轮不掉 delivered 行 =="
 t8_default=$( ( unset STATE_DIR; . "$HERE/wake_guard.sh"; wg__state_dir ) )
 case "$t8_default" in /tmp*|*\\Temp*) say "T8 默认 STATE_DIR" "$t8_default" FAIL; fails=$((fails+1));; *) say "T8 默认 STATE_DIR" "$t8_default" PASS;; esac
 echo 2 > "$FAILS"
-( . "$HERE/wake_guard.sh"; FAILS="$STATE_DIR/test.fails"; v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_CORRUPT_2120"); wg_apply_verdict "$v" "t8" "empty-wake" )
+t8_log=$( . "$HERE/wake_guard.sh"; FAILS="$STATE_DIR/test.fails"; v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_CORRUPT_2120"); wg_apply_verdict "$v" "t8" "empty-wake" )
 expect_eq "T8 中性轮重置 FAILS=0（跨进程可见）" "$(cat "$FAILS")" "0"
+expect_has "C3 neutral 日志含 prior_fails=2" "$t8_log" "prior_fails=2"
+expect_not "C3 中性轮不掉 delivered 行" "$t8_log" "delivered (attention consumed"
+
+echo
+echo "== T-pi（C4）：wg_judge_cursor 游标判据（pi-watcher 判定面逐字） =="
+v=$(wg_judge_cursor 0 "2026-11-08T04:16:01" 1750 "2026-11-08T04:36:06" 1750)
+expect_eq "T-pi 空轮询 last_read 前进 → delivered" "$v" "delivered"
+v=$(wg_judge_cursor 0 "2026-11-08T04:16:01" 1750 "2026-11-08T04:16:01" 1750)
+expect_eq "T-pi 游标不动 → failed" "$v" "failed"
+v=$(wg_judge_cursor 0 "2026-11-08T04:16:01" 1750 "" "")
+expect_eq "T-pi 空 post → failed（保守向，claude #1756 细化①）" "$v" "failed"
+v=$(wg_judge_cursor 0 "2026-11-08T04:16:01" 1750 "2026-11-08T04:36:06" 1751)
+expect_eq "T-pi delivered_id 前进 → delivered" "$v" "delivered"
+
+echo
+echo "== neutral_since 哨兵（dsh #1757 §三 三纪律） =="
+: > "$FAILS"; rm -f "$STATE_DIR/neutral_since.t-ns"
+( . "$HERE/wake_guard.sh"; FAILS="$STATE_DIR/ns.fails"; : > "$FAILS"
+  v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_CORRUPT_2120"); wg_apply_verdict "$v" "t-ns" "empty-wake" )
+NS="$STATE_DIR/neutral_since.t-ns"
+[ -f "$NS" ] && say "neutral 后哨兵在" "exists" PASS || { say "neutral 后哨兵在" "missing" FAIL; fails=$((fails+1)); }
+case "$(cat "$NS" 2>/dev/null)" in *Z) say "哨兵时间戳 Z 结尾(UTC)" OK PASS;; *) say "哨兵时间戳" "$(cat "$NS" 2>/dev/null)" FAIL; fails=$((fails+1));; esac
+( . "$HERE/wake_guard.sh"; FAILS="$STATE_DIR/ns.fails"; wg_apply_verdict delivered "t-ns" "empty-wake" )
+[ -f "$NS" ] && { say "delivered 后哨兵删" "still there" FAIL; fails=$((fails+1)); } || say "delivered 后哨兵删" "removed" PASS
+( . "$HERE/wake_guard.sh"; FAILS="$STATE_DIR/ns.fails"; echo 0 > "$FAILS"; wg_apply_verdict failed "t-ns" "rc-nonzero" 2>/dev/null; true )
+[ -f "$NS" ] && { say "failed 后哨兵删" "still there" FAIL; fails=$((fails+1)); } || say "failed 后哨兵删" "removed" PASS
+( . "$HERE/wake_guard.sh"; STATE_DIR="$STATE_DIR"; wg_preflight t-pf 1200 >/dev/null 2>&1 || true )
+[ -f "$NS" ] && { say "preflight 清哨兵" "still there" FAIL; fails=$((fails+1)); } || say "preflight 清哨兵（新进程≠旧 latch）" "removed" PASS
 
 echo
 echo "== T10：真 server（需隔离服务；无环境则 SKIP） =="
 if [ -x "$HERE/../.venv/bin/python" ] && command -v sqlite3 >/dev/null 2>&1; then
   echo "T10 环境具备——按 dsh #1751 §一 T10 规格执行（隔离库+隔离端口）"
-  echo "T10 详细断言随隔离服务部署轮执行（board 回执附读数）"
 else
   say "T10 真 server 断言" "SKIP" "SKIP(需 .venv+sqlite3 隔离环境，随部署轮执行)"
 fi

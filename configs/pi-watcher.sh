@@ -137,16 +137,11 @@ cycle() {
     # last_read 字符串前进 或 delivered_id 数值前进。旧判据（attention/reason/threads
     # 消费与否）在会话期间原帖继续进新评论时恒"不变"，把正常投递误判为空唤——当日
     # 10:41/11:15 两次投递（游标实已前进到 #1436）被计失败，三连败闸门误触发。
-    if { [ -n "$post_lr" ] && [ "$post_lr" \> "${pre_lr:-0}" ]; } || \
-       { [ -n "$post_id" ] && [ "${pre_id:-0}" -lt "$post_id" ]; } then
-      echo 0 > "$FAILS"
-      echo "$(date +%T) delivered (cursor last_read ${pre_lr:-∅}→${post_lr:-∅} delivered_id ${pre_id:-∅}→${post_id:-∅} — delivery, not task-completion)"
-    else
-      n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 ))
-      echo "$n" > "$FAILS"
-      echo "$(date +%T) wake exited 0 but cursor unmoved (empty wake) ($n/3) — counted as failure"
-      [ "$n" -ge 3 ] && { echo "$(date '+%F %T') gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."; printf '%s\n' "$(date '+%F %T') [pi-watcher] gate tripped (3 consecutive wake failures) — watcher stopped; recovery: rm $FAILS && restart." >> "$GATE_TRIP_LOG" 2>/dev/null || true; exit 1; }
-    fi
+    # [batch3-watcher-fix] 判据逐字搬入 wg_judge_cursor（C4，dsh #1757 §3：载体落
+    # wake_guard.sh 才可测；pi-watcher 不可 source）。判定面不变，不与表面比较统一。
+    v=$(wg_judge_cursor 0 "$pre_lr" "$pre_id" "$post_lr" "$post_id")
+    [ "$v" = delivered ] && echo "$(date +%T) delivered (cursor last_read ${pre_lr:-∅}→${post_lr:-∅} delivered_id ${pre_id:-∅}→${post_id:-∅} — delivery, not task-completion)"
+    wg_apply_verdict "$v" "pi-watcher" "cursor-leg"
   else
     n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 ))
     echo "$n" > "$FAILS"

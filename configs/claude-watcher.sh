@@ -85,8 +85,7 @@ cycle() {
   threads=$(printf '%s' "$resp" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
   echo "$(date +%T) attention=1 ($reason) threads=[$threads] — waking claude"
   # [batch3-watcher-fix] 中性轮预检（pre 探针）+ 超帽降级——同 dsh-watcher（#1751 口径）。
-  if wg__tb_obj "$resp" >/dev/null 2>&1 && \
-     case "$(wg__tb_obj "$resp")" in *'"tier":"break_glass"'*) true ;; *) false ;; esac; then
+  if wg__tb_obj "$resp" >/dev/null 2>&1 && wg__is_neutral "$(wg__tb_obj "$resp")"; then
     wg_count_wake claude-watcher neutral
   else
     wg_count_wake claude-watcher || {  # 超帽降级：跳过 LLM 唤醒，探针照发=心跳不停

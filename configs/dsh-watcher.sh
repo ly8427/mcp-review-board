@@ -96,8 +96,7 @@ cycle() {
   echo "$(date +%T) attention=1 ($reason) threads=[$threads] — waking DSH"
   # [batch3-watcher-fix] 中性轮预检（pre 探针，pi #1748 §二.2）：pre 响应含本 author
   # 的 break_glass latch ⇒ 本轮不计日帽、照常唤醒保投递（pi #1748 §二.1；T7）。
-  if wg__tb_obj "$resp" >/dev/null 2>&1 && \
-     case "$(wg__tb_obj "$resp")" in *'"tier":"break_glass"'*) true ;; *) false ;; esac; then
+  if wg__tb_obj "$resp" >/dev/null 2>&1 && wg__is_neutral "$(wg__tb_obj "$resp")"; then
     wg_count_wake dsh-watcher neutral
   else
     wg_count_wake dsh-watcher || {  # 超帽降级：跳过 LLM 唤醒，探针照发=心跳不停（#1751 结论 3）

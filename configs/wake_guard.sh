@@ -8,7 +8,7 @@
 # 三个动作，成本各几行：
 #   wg_preflight <tag> <interval>  启动自检：节奏过密/无上限 → 拒绝启动（exit 2）
 #   wg_stop_check <tag>            停止标志存在 → 干净退出（唯一不花 token 的停法）
-#   wg_count_wake <tag>            持久计数 + 每轮打印 wake n/MAX，超帽即停
+#   wg_count_wake <tag> [neutral]  持久计数 + 每轮打印；超帽 return 1（停唤醒不停心跳，调用方降级 keepalive）
 #
 # 环境变量：
 #   MAX_WAKES       每日唤醒上限；调用方给默认值（见各 watcher），<=0 或非数字 → 拒启动
@@ -45,6 +45,7 @@ wg_preflight() {
   if ! mkdir -p "$(wg__state_dir)" 2>/dev/null; then
     echo "$WG_ERR_PREFIX [$_tag] 无法创建 STATE_DIR=$(wg__state_dir) → 拒绝启动"; exit 2
   fi
+  rm -f "$(wg__state_dir)/neutral_since.${_tag}" 2>/dev/null   # 纪律 2：新进程 ≠ 旧 latch
   echo "$WG_ERR_PREFIX [$_tag] 在岗: INTERVAL=${_interval}s, MAX_WAKES=${MAX_WAKES}/日, STATE_DIR=$(wg__state_dir)"
 }
 
@@ -97,10 +98,11 @@ wg_count_wake() {
 #   须先升级再上量。rc 0=提取成功（对象打到 stdout）；1=键不存在/未闭合。
 wg__tb_obj() {
   _s="$1"
-  _off=$(printf '%s' "$_s" | grep -boF '"token_blocked":{' 2>/dev/null | head -1 | cut -d: -f1)
-  [ -n "$_off" ] || return 1
-  _tail=${_s:$_off}
-  _tail=${_tail#*\"token_blocked\":\{}
+  # B5 (dsh #1757 §一): shortest-prefix strip instead of grep -b byte offset used
+  # as a character index — the byte/char mismatch class is deleted, not documented.
+  case "$_s" in *'"token_blocked":{'*) ;; *) return 1 ;; esac
+  _tail=${_s#*'"token_blocked":{'}
+  _depth=1; _out="{"
   _depth=1; _out="{"
   while [ -n "$_tail" ]; do
     _c=${_tail:0:1}; _tail=${_tail:1}
@@ -124,18 +126,28 @@ wg__tb_obj() {
 #   4) 其余（含 token_blocked 空/tier=manual/缺 tier——服务端已归一 manual，T5 是
 #      谓词级防御）→ failed（检测力不变）
 wg_judge_surface() {
-  [ "${1:-1}" -ne 0 ] && { printf 'failed'; return 0; }
+  case "${1:-}" in ''|*[!0-9]*) printf 'failed'; return 0 ;; esac   # B3: 非数字 rc 不当 0
+  [ "$1" -ne 0 ] && { printf 'failed'; return 0; }                 # rc!=0 → failed（语序 1：crash/hang 计费不豁免，T3）
   _p_att="${2:-}"; _p_reason="${3:-}"; _p_threads="${4:-}"; _post="${5:-}"
+  [ -z "$_post" ] && { printf 'failed'; return 0; }                 # B2：探针失败=不可判，不记 delivered
   _aatt=$(printf '%s' "$_post" | sed -n 's/.*"attention":\([0-9]\).*/\1/p')
+  [ -z "$_aatt" ] && { printf 'failed'; return 0; }                 # B2: 缺 attention 字段同判（T2c）
   _areason=$(printf '%s' "$_post" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')
   _athreads=$(printf '%s' "$_post" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
   if [ "${_aatt:-0}" != "1" ] || [ "$_areason" != "$_p_reason" ] || [ "$_athreads" != "$_p_threads" ]; then
     printf 'delivered'; return 0
   fi
   _tb=$(wg__tb_obj "$_post") || { printf 'failed'; return 0; }
-  case "$_tb" in
-    *'"tier":"break_glass"'*) printf 'neutral' ;;
-    *)                        printf 'failed' ;;
+  wg__is_neutral "$_tb" && { printf 'neutral'; return 0; }
+  printf 'failed'
+}
+
+# wg__is_neutral <token_blocked_object> — 0/1。break_glass 字面唯一住址（B1，dsh
+# #1754 §二：三份手抄会让日帽预检与 C1.2 中性判定对同一响应分叉而套件照绿）。
+wg__is_neutral() {
+  case "$1" in
+    *'"tier":"break_glass"'*) return 0 ;;
+    *)                        return 1 ;;
   esac
 }
 
@@ -143,16 +155,36 @@ wg_judge_surface() {
 #   载体=被 source 的真函数（dsh #1751 结论 1：判据禁抄进测试文件；T1–T8 直接打本函数）。
 #   failed 时 $_n 计数走 $FAILS（调用方已指向 STATE_DIR 持久面，T8 禁 /tmp）；
 #   3 连败 → 日志 gate tripped 并 exit 1（T3：crash/hang 计费不豁免）。
+# wg_judge_cursor <rc> <pre_lr> <pre_id> <post_lr> <post_id> → delivered|failed
+#   pi-watcher 游标判据逐字搬入（C4，dsh #1757 §3：载体只能落本库——source
+#   pi-watcher.sh 会自杀/真唤醒/永不返回）。判据与 pi-watcher 原两腿逐字同
+#   （含空串守卫），不与表面比较统一（conservative 方向是现行为，统一=C1.2 新洞）。
+wg_judge_cursor() {
+  case "${1:-}" in ''|*[!0-9]*) printf 'failed'; return 0 ;; esac
+  _pre_lr="${2:-}"; _pre_id="${3:-}"; _post_lr="${4:-}"; _post_id="${5:-}"
+  if { [ -n "$_post_lr" ] && [ "$_post_lr" \> "${_pre_lr:-0}" ]; } || \
+     { [ -n "$_post_id" ] && [ "${_pre_id:-0}" -lt "$_post_id" ]; }; then
+    printf 'delivered'
+  else
+    printf 'failed'
+  fi
+}
+
 wg_apply_verdict() {
   _verdict="${1:-failed}"; _vtag="${2:-watcher}"; _vdetail="${3:-empty-wake}"
+  _ns="$(wg__state_dir)/neutral_since.${_vtag}"
   case "$_verdict" in
     delivered)
       echo 0 > "$FAILS"
+      rm -f "$_ns"   # neutral_since 纪律 1（dsh #1757 §三）：delivered 支也要删
       echo "$(date +%T) delivered (attention consumed — delivery, not task-completion)" ;;
     neutral)
+      _pf=$(cat "$FAILS" 2>/dev/null || echo 0)   # C3：prior_fails 上日志
       echo 0 > "$FAILS"
-      echo "$(date +%T) corrupt-await neutral (break_glass latch) — heartbeat kept, awaiting human reset" ;;
+      date -u +%FT%TZ > "$_ns" 2>/dev/null        # neutral_since 哨兵（UTC，#1757 §三.3）
+      echo "$(date +%T) corrupt-await neutral (break_glass latch) — heartbeat kept, awaiting human reset (prior_fails=$_pf)" ;;
     *)
+      rm -f "$_ns"                                 # neutral_since 纪律 1：failed 支同样删
       _n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 ))
       echo "$_n" > "$FAILS"
       echo "$(date +%T) wake counted as failure ($_vdetail) ($_n/3)"
