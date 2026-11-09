@@ -18,6 +18,13 @@ import sys
 import tempfile
 import urllib.request
 
+# deny 文案统一 UTF-8(#54 #662 §3.2:stderr 默认随控制台 GBK,check-hooks 按 UTF-8 解码会乱码)
+try:
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+
 # ---- 宿主配置段（全 env 驱动，R2/dsh-portable）----
 BOARD_URL = os.environ.get("RB_BOARD", "http://localhost:8765")
 REPO = os.environ.get("RB_REPO", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
