@@ -137,7 +137,7 @@ expect_eq "C1 FAILS=3" "$(cat "$STATE_DIR/t4b.fails")" "3"
 echo
 echo "== T5：同态 + token_blocked 无该键 / tier=manual / 缺档 → failed（检测力不变） =="
 v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_NOKEY")
-expect_eq "T5 空 token_blocked" "$v" "failed"
+expect_eq "T5 无该键（R_NOKEY，名物修正 #1815）" "$v" "failed"
 v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" "$R_MANUAL")
 expect_eq "T5 tier=manual" "$v" "failed"
 v=$(wg_judge_surface 0 "$PRE_ATT" "$PRE_REASON" "$PRE_THREADS" '{"attention":1,"reason":"awaiting_verdict","threads":[104],"token_blocked":{},"last_read":"x"}')
