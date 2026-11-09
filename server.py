@@ -4939,19 +4939,53 @@ def _board_html() -> str:
             f"<span class='p'>{mark} {escape(p['author'])} {_relative(last)}{err}{brief_html}</span>"
         )
 
+    # v2.12.2 (DEBT #17): sidebar thread index — same threads the main column
+    # renders, each entry a link to its per-thread anchor (#t{id}); titles
+    # escape()d, full text in title= since CSS truncates visually.
+    side = [
+        f"<div class='side-h'>Threads ({len(threads)})</div>",
+        "<a href='#' onclick='scrollTo(0,0);return false'>▲ top</a>",
+    ]
+    for t in threads:
+        aw = " ⏳" if t["id"] in awaiting_map else ""
+        side.append(
+            f"<a href='#t{t['id']}' title='{escape(t['title'])}'>"
+            f"#{t['id']} {escape(t['title'])}"
+            f"<span class='cnt st-{t['status']}'>{t['n']}·{t['status']}{aw}</span></a>"
+        )
+
     parts = [
         "<!doctype html><html><head><meta charset='utf-8'>",
         "<title>MCP Review Board</title>",
         "<style>",
-        "body{font-family:system-ui,sans-serif;max-width:1000px;margin:24px auto;padding:0 16px;color:#222}",
-        "h1{font-size:1.4rem} h2{font-size:1.1rem;margin-top:1.5em;border-bottom:1px solid #ddd;padding-bottom:4px}",
+        "html{color-scheme:light}",
+        "body{font-family:system-ui,sans-serif;margin:0;color:#222;background:#fff}",
+        "#layout{display:flex;max-width:1400px;margin:0 auto;padding:0 16px;gap:22px}",
+        "#sidebar{width:280px;flex-shrink:0;position:sticky;top:0;max-height:100vh;overflow-y:auto;padding:14px 0;font-size:.85rem}",
+        "#main{flex:1;min-width:0;padding:24px 0}",
+        "h1{font-size:1.4rem;margin:.5em 0} h2{font-size:1.1rem;margin-top:1.5em;border-bottom:1px solid #ddd;padding-bottom:4px;scroll-margin-top:12px}",
         ".meta{color:#888;font-size:.85rem} .badge{font-size:.75rem;padding:1px 6px;border-radius:3px;background:#eee;margin-left:6px}",
         ".open{color:#b35900}.resolved{color:#1a7f37}.wontfix{color:#888}.blocker{background:#ffe0e0}.major{background:#fff3e0}",
         "pre{background:#f6f8fa;padding:8px 12px;border-radius:6px;white-space:pre-wrap;word-wrap:break-word}",
-        ".c{margin:8px 0}.reply{margin-left:24px;border-left:2px solid #eee;padding-left:12px}",
+        ".c{margin:8px 0;scroll-margin-top:12px}.reply{margin-left:24px;border-left:2px solid #eee;padding-left:12px}",
         ".p{margin-right:14px;font-size:.85rem} .await{background:#fff3cd;padding:1px 8px;border-radius:10px;font-size:.75rem}",
         "details{margin-top:2em} summary{cursor:pointer;color:#888;font-size:.85rem}",
-        "</style></head><body>",
+        "#sidebar .side-h{font-weight:600;margin:4px 0}",
+        "#sidebar a{display:block;padding:3px 6px;border-radius:4px;color:inherit;text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+        "#sidebar a:hover{background:#eef1f4}",
+        "#sidebar .cnt{color:#999;font-size:.75rem;margin-left:4px}",
+        "#sidebar .st-open{color:#b35900}#sidebar .st-resolved{color:#1a7f37}#sidebar .st-wontfix{color:#888}",
+        ".foldbtn{display:block;margin:-4px 0 8px;background:none;border:none;color:#1a7f37;cursor:pointer;font-size:.8rem;padding:2px 4px}",
+        "pre.folded{max-height:9em;overflow:hidden}",
+        # line-clamp cuts at whole-line boxes even with taller CJK fallback
+        # lines; max-height alone would slice mid-glyph there, so it is
+        # dropped wherever line-clamp is supported (dsh round-2 finding)
+        "@supports(-webkit-line-clamp:6){pre.folded{max-height:none;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:6}}",
+        ".plink{margin-left:4px;text-decoration:none}",
+        "@media(max-width:920px){#layout{display:block}#sidebar{position:static;max-height:none;border-bottom:1px solid #ddd;width:auto}}",
+        "</style></head><body><div id='layout'><nav id='sidebar'>",
+        "".join(side),
+        "</nav><div id='main'>",
         "<h1>📋 MCP Review Board</h1>",
         f"<p class='meta'>{len(threads)} thread(s) · auto-refreshes 20s · "
         f"<a href='/'>refresh</a> · probe: <code>/attention?author=NAME</code></p>",
@@ -4966,12 +5000,17 @@ def _board_html() -> str:
             if aw else ""
         )
         parts.append(
-            f"<h2>#{t['id']} {escape(t['title'])} "
+            f"<h2 id='t{t['id']}'>#{t['id']} {escape(t['title'])} "
             f"<span class='badge {t['status']}'>{t['status']}</span>{aw_html}</h2>"
         )
         parts.append(f"<div class='meta'>{t['n']} comment(s) · created {t['created_at']}</div>")
         if t["context"]:
-            parts.append(f"<pre>{escape(t['context'])}</pre>")
+            # v2.12.2 (DEBT #17): long context folds like comment bodies —
+            # synthetic cid 'ctx{id}' keeps sessionStorage keys collision-free
+            parts.append(
+                f"<pre class='cbody' data-cid='ctx{t['id']}' "
+                f"data-len='{len(t['context'])}'>{escape(t['context'])}</pre>"
+            )
 
         comments = by_thread.get(t["id"], [])
         by_parent: dict[int | None, list[sqlite3.Row]] = {}
@@ -4995,11 +5034,15 @@ def _board_html() -> str:
                 else ""
             )
             cls = "c reply" if depth > 0 else "c"
+            # v2.12.2 (DEBT #17): per-comment anchor (#c{id}) + body length so
+            # the client-side folder can skip short bodies without scanning.
+            blen = len(c["body"] or "")
             parts.append(
-                f"<div class='{cls}'>"
+                f"<div class='{cls}' id='c{c['id']}'>"
                 f"<div><b>#{c['id']} {escape(c['author'])}</b>{sev}{st}{loc} "
-                f"<span class='meta'>{c['created_at']}</span></div>"
-                f"<pre>{escape(c['body'])}</pre></div>"
+                f"<span class='meta'>{c['created_at']}</span>"
+                f"<a class='plink meta' href='#c{c['id']}'>¶</a></div>"
+                f"<pre class='cbody' data-len='{blen}' data-cid='{c['id']}'>{escape(c['body'])}</pre></div>"
             )
             for child in by_parent.get(c["id"], []):
                 render(child, depth + 1)
@@ -5012,6 +5055,32 @@ def _board_html() -> str:
     parts.append(
         "<details><summary>协议 protocol v" + PROTOCOL_VERSION + "</summary>"
         "<pre style='font-size:.8rem'>" + escape(PROTOCOL) + "</pre></details>"
+    )
+    parts.append("</div></div>")
+    # v2.12.2 (DEBT #17): long-body folding — bodies over FOLD_AT chars start
+    # folded with an expand/collapse toggle; per-comment state persists across
+    # the 20s auto-refresh via sessionStorage, and a #cN hash target always
+    # expands so an anchor jump never lands on a hidden body.
+    parts.append(
+        "<script>(function(){"
+        "var FOLD_AT=700,K='rb-fold-';"
+        "var sess=null;try{sess=window.sessionStorage}catch(e){}"
+        "document.querySelectorAll('pre.cbody').forEach(function(p){"
+        "var n=+(p.dataset.len||0);if(n<=FOLD_AT)return;"
+        "var id=p.dataset.cid;"
+        "if(sess&&sess.getItem(K+id)==='open')return;"
+        "p.classList.add('folded');"
+        "var b=document.createElement('button');b.className='foldbtn';b.textContent='展开全文 ▾';"
+        "b.onclick=function(){var f=p.classList.toggle('folded');"
+        "b.textContent=f?'展开全文 ▾':'收起 ▴';"
+        "if(sess)sess.setItem(K+id,f?'folded':'open');};"
+        "p.after(b);});"
+        "var h=location.hash.slice(1);"
+        "if(h&&h.charAt(0)==='c'){var t=document.getElementById(h);"
+        "if(t){var pb=t.querySelector('pre.folded');"
+        "if(pb){pb.classList.remove('folded');var ob=pb.nextElementSibling;"
+        "if(ob&&ob.classList.contains('foldbtn'))ob.remove();}}}"
+        "})();</script>"
     )
     parts.append(
         "<script>setInterval(function(){if(!document.hidden){location.reload();}},20000);</script>"
