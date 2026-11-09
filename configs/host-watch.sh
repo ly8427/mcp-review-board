@@ -222,7 +222,12 @@ for w in "claude claude wake_claude" "dsh dsh wake_dsh" "opencode opencode wake_
   set -- $w
   wg_stop_check host-watch                       # 票3：STOP 存在即整轮安静退出
   if declare -F "$3" >/dev/null 2>&1; then
-    wg_count_wake "host-watch-$1"                # 票3：每名成员各自的每日上限
+    # [batch3-watcher-fix] 超帽降级（#1751 结论 3）：跳过该成员本轮 LLM 唤醒，
+    # 整轮继续（其余成员照常）——不再 exit 0 整轮即止。
+    wg_count_wake "host-watch-$1" || {
+      echo "$(date +%T) keepalive (daily cap) — $1 wake skipped this round, round continues"
+      continue
+    }
     wake "$1" "$2" "$3"
   else
     # win-test #12: a dangling reference silently passes while everyone is

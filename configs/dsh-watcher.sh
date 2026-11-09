@@ -42,7 +42,10 @@ TOKEN_FILE="${TOKEN_FILE:-$HOME/.dsh/rb-token.txt}"
 TASK_FILE_WIN="$(cygpath -w "$TASK_FILE" 2>/dev/null || echo "$TASK_FILE")"
 TOKEN_FILE_WIN="$(cygpath -w "$TOKEN_FILE" 2>/dev/null || echo "$TOKEN_FILE")"
 LOCK="${LOCK:-/tmp/rb-dsh-watcher.lock.d}"         # v2.3: mkdir lock dir(portable)
-FAILS="${FAILS:-/tmp/rb-dsh-watcher.fails}"
+# [batch3-watcher-fix 2026-11-09] FAILS 迁 /tmp → $HOME/.rb-wake（与 pi-watcher 1.2.0 同址
+# wake_guard STATE_DIR；dsh #1751 T8：中性计数落盘后仍在，禁 /tmp——Git Bash /tmp=%TEMP%
+# 虽跨重启，但与 pi-watcher 事故同族的 /tmp 状态面纪律不再新增）。
+FAILS="${FAILS:-$HOME/.rb-wake/dsh-watcher.fails}"
 
 gate=$(cat "$FAILS" 2>/dev/null || echo 0)
 if [ "${gate:-0}" -ge 3 ]; then
@@ -91,7 +94,33 @@ cycle() {
   reason=$(printf '%s' "$resp" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')
   threads=$(printf '%s' "$resp" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
   echo "$(date +%T) attention=1 ($reason) threads=[$threads] — waking DSH"
-  wg_count_wake dsh-watcher                        # 票3：每日上限，超帽即停
+  # [batch3-watcher-fix] 中性轮预检（pre 探针，pi #1748 §二.2）：pre 响应含本 author
+  # 的 break_glass latch ⇒ 本轮不计日帽、照常唤醒保投递（pi #1748 §二.1；T7）。
+  # [GPT round-6 P1 状态机] pre 探针 latch 检查（A1-A4，dsh #1817 §一/claude #1820 补强）：
+  #   哨兵不在 ∧ latch 在 → wg_note_notified + 照常唤醒（首次通知，计 neutral 不计帽）
+  #   哨兵在   ∧ latch 在 → keepalive 跳过 LLM（探针已发=心跳；1 探针/cycle，claude #1820 补强①）
+  #   哨兵在   ∧ latch 不在 → 删哨兵 + 恢复正常（人工 reset 完成，A4）
+  #   哨兵不在 ∧ latch 不在 → 正常
+  _latch_now=0
+  if wg__tb_obj "$resp" >/dev/null 2>&1 && wg__is_neutral "$(wg__tb_obj "$resp")"; then _latch_now=1; fi
+  _sentinel="$(wg__state_dir)/neutral_since.dsh-watcher"
+  if [ "$_latch_now" = 1 ] && [ ! -f "$_sentinel" ]; then
+    wg_note_notified dsh-watcher
+    wg_count_wake dsh-watcher neutral
+  elif [ "$_latch_now" = 1 ]; then
+    echo "$(date +%T) corrupt-await 已通知（notified_at=$(cat "$_sentinel" 2>/dev/null)）— keepalive 跳过 LLM，探针照发"
+    return 0
+  elif [ -f "$_sentinel" ]; then
+    rm -f "$_sentinel"   # latch 消失（人工 reset 完成）→ 恢复正常唤醒（A4）
+  fi
+  if [ "$_latch_now" = 1 ]; then
+    wg_count_wake dsh-watcher neutral
+  else
+    wg_count_wake dsh-watcher || {
+      echo "$(date +%T) keepalive (daily cap) — wake skipped, heartbeat kept"
+      return 0
+    }
+  fi
 
   cat > "$TASK_FILE" << EOF
 你是 review board 成员 dsh(rc.6 无 session 恢复,上下文一律从看板自取)。执行,不要向任何人提问:
@@ -102,9 +131,10 @@ cycle() {
    先落盘再使用(v2.3:治理调用自动确认只值 1h 短锁,显式落盘+ack 才享 24h)。
 0.5) 注入行 reason=token_invalid(v2.10 #77 档A):即使 token 文件在也重走 0) 四步
    (服务端无你的 hash ⇒ 必可重领,即自愈)。
-0.6) 轮询 header 的 token_blocked 含 "dsh" 且 tier=manual(v2.10 #77 档B):本轮禁一切
-   治理调用(不 set_verdict/不 bump_revision/不 set_quorum),只做只读工作并在相关帖
-   留一行"等人工 reset_token / 等重签窗口";不要反复试错 token。
+0.6) 轮询 header 的 token_blocked 非空，且其任一刀 tier 属 {manual, break_glass}
+   （键=线程号或字面 corrupt；含成员名的旧判据是死文字——dsh #1754 §五 更正）:本轮禁一切治理调用
+   (不 set_verdict/不 bump_revision/不 set_quorum),只做只读工作并在相关帖留一行
+   "等人工 reset_token / 等重签窗口";不要反复试错 token。
 0.7) 轮询 header 的 my_comment_due 含某帖且该项 blocking=true(v2.10 #79;v2.11.0 #81 三分支):
    ① 有预算(header budget 面 used<cap)→先在该帖 post_comment 留一行(一句话即可)再投票
    ——先评论后投票,一次唤醒同时清两族(trae #791 增量2);
@@ -136,22 +166,13 @@ EOF
       after=$(probe) || after=""
       aatt=$(printf '%s' "$after" | sed -n 's/.*"attention":\([0-9]\).*/\1/p')
     fi
-    areason=$(printf '%s' "$after" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')
-    athreads=$(printf '%s' "$after" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
-    if [ "${aatt:-0}" != "1" ] || [ "$areason" != "$reason" ] || [ "$athreads" != "$threads" ]; then
-      echo 0 > "$FAILS"
-      echo "$(date +%T) delivered (attention consumed — delivery, not task-completion)"
-    else
-      n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 ))
-      echo "$n" > "$FAILS"
-      echo "$(date +%T) wake exited 0 but attention unchanged ($n/3) — counted as failure"
-      [ "$n" -ge 3 ] && { echo "gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."; exit 1; }
-    fi
+    # [batch3-watcher-fix] 判定收口到共享函数 wg_judge_surface + wg_apply_verdict
+    # （语序：rc→表面→break_glass 中性→failed；dsh #1751 结论 2/T1–T10）。中性=
+    # corrupt-await 等人工修复态：FAILS 归 0、心跳保持、日志留痕（GPT 第五轮 P2）。
+    verdict=$(wg_judge_surface 0 "$att" "$reason" "$threads" "$after")
+    wg_apply_verdict "$verdict" "dsh-watcher" "empty-wake"
   else
-    n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 ))
-    echo "$n" > "$FAILS"
-    echo "$(date +%T) wake FAILED ($n/3)"
-    [ "$n" -ge 3 ] && { echo "gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."; exit 1; }
+    wg_apply_verdict failed "dsh-watcher" "rc-nonzero"
   fi
 }
 

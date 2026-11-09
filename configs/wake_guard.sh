@@ -8,7 +8,7 @@
 # 三个动作，成本各几行：
 #   wg_preflight <tag> <interval>  启动自检：节奏过密/无上限 → 拒绝启动（exit 2）
 #   wg_stop_check <tag>            停止标志存在 → 干净退出（唯一不花 token 的停法）
-#   wg_count_wake <tag>            持久计数 + 每轮打印 wake n/MAX，超帽即停
+#   wg_count_wake <tag> [neutral]  持久计数 + 每轮打印；超帽 return 1（停唤醒不停心跳，调用方降级 keepalive）
 #
 # 环境变量：
 #   MAX_WAKES       每日唤醒上限；调用方给默认值（见各 watcher），<=0 或非数字 → 拒启动
@@ -45,6 +45,7 @@ wg_preflight() {
   if ! mkdir -p "$(wg__state_dir)" 2>/dev/null; then
     echo "$WG_ERR_PREFIX [$_tag] 无法创建 STATE_DIR=$(wg__state_dir) → 拒绝启动"; exit 2
   fi
+  # [GPT round-7 P1-1] 启动不删哨兵——删点只能由 latch 事实驱动（delivered/failed 后探针确认），不能由进程生命周期驱动（dsh #1817 §1 / #1826 核心阻断同族）。重启后首轮探针自纠：latch 在=继承等待态跳过 LLM；latch 不在=删哨兵恢复常态。
   echo "$WG_ERR_PREFIX [$_tag] 在岗: INTERVAL=${_interval}s, MAX_WAKES=${MAX_WAKES}/日, STATE_DIR=$(wg__state_dir)"
 }
 
@@ -58,16 +59,167 @@ wg_stop_check() {
   fi
 }
 
+# wg_count_wake <tag> [neutral] — 持久计数 + 每轮打印；超帽返回 1（**不再 exit**）。
+# [batch3-watcher-fix 2026-11-09，board #103 #1747–#1751 / GPT 第五轮 P2]：
+#   ① 超帽动作从 exit 0（进程整个退出=心跳也停）降级为 return 1——调用方据此跳过
+#     本次 LLM 唤醒但**继续循环**（探针照发=心跳不停，dsh #1751 结论 3「帽照数、
+#     帽的动作改成停唤醒不停心跳」）。调用方须处理返回 1（四支已同批接线）。
+#   ② 第二参为 neutral（非空）时：本轮是 corrupt-await 中性轮——不计数、不查帽、
+#     照常放行（pi #1748 §二.1：否则中性轮 24h 后照样被日帽杀闹钟；成本有界，
+#     受 reset 窗口约束）。日志行留痕。
+# 返回：0=可唤醒；1=超帽（调用方降级）。
+# wg_note_notified <tag> — 「本轮已决定通知」哨兵写入（dsh #1817 §4 第 5 洞修法：
+#   写点从 wg_apply_verdict neutral（唤醒之后）前移到 pre-wake 决策点——否则
+#   post-probe 失败/缺字段（unknown 支）会把「已通知」丢掉，下一轮再烧一次）。
+#   时间戳 UTC（#1757 §三.3）。读者只判存在性，不解析内容。
+wg_note_notified() {
+  _tag="${1:-watcher}"
+  date -u +%FT%TZ > "$(wg__state_dir)/neutral_since.${_tag}" 2>/dev/null
+}
+
+
 wg_count_wake() {
   _tag="${1:-watcher}"
   _dir="$(wg__state_dir)"; _d="$(date +%Y%m%d)"
   _f="$_dir/wakes.${_tag}.${_d}"
+  if [ -n "${2:-}" ]; then
+    echo "$(date +%T) wake (corrupt-await 中性轮——不计入日帽，board #103 #1748 §二.1)"
+    return 0
+  fi
   _n=$(( $(cat "$_f" 2>/dev/null || echo 0) + 1 ))
   printf '%s\n' "$_n" > "$_f" 2>/dev/null || echo "$WG_ERR_PREFIX [$_tag] 计数落盘失败（$_f），本轮继续"
   echo "$(date +%T) wake ${_n}/${MAX_WAKES} (今日累计)"
   if [ "$_n" -gt "${MAX_WAKES:-0}" ]; then
-    echo "$WG_ERR_PREFIX [$_tag] 已达今日上限 ${MAX_WAKES} → 停止唤醒（计数保留在 $_f）"
+    echo "$WG_ERR_PREFIX [$_tag] 已达今日上限 ${MAX_WAKES} → 本轮跳过唤醒（心跳保持；计数保留在 $_f）"
     echo "  恢复：删 $_f，或调大 MAX_WAKES 后重启。"
-    exit 0
+    return 1
   fi
+  return 0
+}
+
+# [batch3-watcher-fix] 中性轮判定两件（GPT 第五轮 P2：watcher 失败计数须识别
+# 「等待人工 reset」态，board #103 #1747/#1749/#1751 定稿）：
+#
+# wg__tb_obj <response> — 从紧凑 JSON 响应里括号配对提取 token_blocked 对象（含花括号本体）。
+#   禁全响应 substring（dsh T6：break_glass 出现在别处不得命中）；
+#   禁右邻锚定 sed（dsh #1751 §二.2：右邻从 last_read 换代 meta_unparsable 会静默失效）。
+#   已知限界：不做引号内花括号跳过——现行 wire 的 since/exit 值不含花括号
+#   （#1751 §二.1 两例原文），fixture T2/T6 亦不含；若未来值引入花括号，本函数须先升级再上量。
+#   返回：0=提取成功（对象打 stdout）；1=键在但括号不闭合（截断/代理改写）；
+#        2=键不存在（fixture 失真/键前截断；≠健康行常态——健康行恒有该键）。紧凑 JSON 观测形态收进本函数
+#        （dsh #1756 §三：wire 上该键之前全 ASCII——#1751 §二.2 的右邻换代由调用方按对象判定，不靠右锚）。
+#        （dsh #1756 §三：wire 上该键之前全 ASCII——#1751 §二.2 的右邻换代由
+#        调用方按对象判定，不靠右锚）。
+wg__tb_obj() {
+  _s="$1"
+  # B5 (dsh #1757 §一): shortest-prefix strip instead of grep -b byte offset used
+  # as a character index — the byte/char mismatch class is deleted, not documented.
+  case "$_s" in
+    *'"token_blocked":{'*) ;; *) return 2 ;; esac
+  _tail=${_s#*'"token_blocked":{'}
+  _depth=1; _out="{"
+  while [ -n "$_tail" ]; do
+    _c=${_tail:0:1}; _tail=${_tail:1}
+    case "$_c" in
+      '{') _depth=$((_depth+1)); _out="$_out$_c" ;;
+      '}') _depth=$((_depth-1)); _out="$_out$_c"
+           [ "$_depth" -eq 0 ] && { printf '%s' "$_out"; return 0; } ;;
+      *)   _out="$_out$_c" ;;
+    esac
+  done
+  return 1
+}
+
+# wg_judge_surface <rc> <pre_att> <pre_reason> <pre_threads> <post_response>
+#   → stdout: delivered | neutral | unknown | failed
+# 语序写死（dsh #1751 结论 2，中性不得吞 delivered）：
+#   1) rc!=0 → failed（crash/hang 计费不豁免，T3）
+#   2) 表面动了（attention 掉 0 或 reason/threads 变）→ delivered（T2b）
+#   3) 表面未动 且 post 响应含本 author 的 break_glass latch → neutral（等待人工，
+#      T1；latch 键=字面 corrupt 非成员名，#1751 §二.1；提取走 wg__tb_obj 括号配对）
+#   3.5) 表面未动 且 post 无 token_blocked 键（fixture 失真/键前截断）→ failed；
+#        键在但括号不闭合 → unknown（T-140）——边界显式化 dsh #1776 §四.1/§四.2。
+#   4) 其余（含 token_blocked 空/tier=manual/缺 tier——服务端已归一 manual，T5 是
+#      谓词级防御）→ failed（检测力不变）
+wg_judge_surface() {
+  case "${1:-}" in ''|*[!0-9]*) printf 'failed'; return 0 ;; esac   # B3: 非数字 rc 不当 0
+  [ "$1" -ne 0 ] && { printf 'failed'; return 0; }                 # rc!=0 → failed（语序 1：crash/hang 计费不豁免，T3）
+  _p_att="${2:-}"; _p_reason="${3:-}"; _p_threads="${4:-}"; _post="${5:-}"
+  [ -z "$_post" ] && { printf 'unknown'; return 0; }                # B2→unknown（dsh #1760 §一）：中性态里探针失败判 failed 会把 C1.2 从网络面重开
+  _aatt=$(printf '%s' "$_post" | sed -n 's/.*"attention":\([0-9]\).*/\1/p')
+  [ -z "$_aatt" ] && { printf 'unknown'; return 0; }                # B2：缺 attention 字段同判（T2c 同 commit 翻转，N2）
+  _areason=$(printf '%s' "$_post" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')
+  _athreads=$(printf '%s' "$_post" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
+  if [ "${_aatt:-0}" != "1" ] || [ "$_areason" != "$_p_reason" ] || [ "$_athreads" != "$_p_threads" ]; then
+    printf 'delivered'; return 0
+  fi
+  _tb=$(wg__tb_obj "$_post"); _tb_rc=$?   # 单次提取（对象接住，不漏进 stdout）
+  case "$_tb_rc" in
+    2) printf 'failed'; return 0 ;;    # 键不在（#1776 §四.2 单源）
+    1) printf 'unknown'; return 0 ;;   # 键在但括号不闭合（T-140）
+    0) : ;;
+    *) printf 'failed'; return 0 ;;
+  esac
+  wg__is_neutral "$_tb" && { printf 'neutral'; return 0; }
+  printf 'failed'
+}
+
+# wg__is_neutral <token_blocked_object> — 0/1。break_glass 字面唯一住址（B1，dsh
+# #1754 §二：三份手抄会让日帽预检与 C1.2 中性判定对同一响应分叉而套件照绿）。
+wg__is_neutral() {
+  case "$1" in
+    *'"tier":"break_glass"'*) return 0 ;;
+    *)                        return 1 ;;
+  esac
+}
+
+# wg_apply_verdict <verdict> <tag> <detail> — 判定落账（FAILS 写/日志/C1.2 闸），
+#   载体=被 source 的真函数（dsh #1751 结论 1：判据禁抄进测试文件；T1–T8 直接打本函数）。
+#   failed 时 $_n 计数走 $FAILS（调用方已指向 STATE_DIR 持久面，T8 禁 /tmp）；
+#   3 连败 → 日志 gate tripped 并 exit 1（T3：crash/hang 计费不豁免）。
+# wg_judge_cursor <rc> <pre_lr> <pre_id> <post_lr> <post_id> → delivered|failed
+#   [batch3-watcher-fix] 判据逐字搬入 wg_judge_cursor（C4，dsh #1757 §3：载体只能落
+#   本库——source pi-watcher.sh 会自杀/真唤醒/永不返回）。判据与 pi-watcher 原两腿
+#   逐字同（含空串守卫）；rc 门=签名防御、生产恒 0（唯一调用点传字面 0）、勿删——#1766 §4。
+#   不与表面比较统一（conservative 方向是现行为，统一=C1.2 新洞）——cursor 判据有意保留（dsh #1809 §5 同族第三例，理由句归位）。
+wg_judge_cursor() {
+  case "${1:-}" in ''|*[!0-9]*) printf 'failed'; return 0 ;; esac
+  [ "$1" -ne 0 ] && { printf 'failed'; return 0; }   # rc≠0 ⇒ failed（pi #1761 §四；判别格 T-pi ⑤ 钉红前绿后）
+  _pre_lr="${2:-}"; _pre_id="${3:-}"; _post_lr="${4:-}"; _post_id="${5:-}"
+  if { [ -n "$_post_lr" ] && [ "$_post_lr" \> "${_pre_lr:-0}" ]; } || \
+     { [ -n "$_post_id" ] && [ "${_pre_id:-0}" -lt "$_post_id" ]; }; then
+    printf 'delivered'
+  else
+    printf 'failed'
+  fi
+}
+
+wg_apply_verdict() {
+  _verdict="${1:-failed}"; _vtag="${2:-watcher}"; _vdetail="${3:-empty-wake}"
+  _ns="$(wg__state_dir)/neutral_since.${_vtag}"
+  case "$_verdict" in
+    delivered)
+      echo 0 > "$FAILS"
+      # 哨兵删除改 latch 门控（pi #1819 §三.2）：由 pre-probe 的 latch 事实驱动，此处不再无条件删
+      echo "$(date +%T) delivered (attention consumed — delivery, not task-completion)" ;;
+    neutral)
+      _pf=$(cat "$FAILS" 2>/dev/null || echo 0)   # C3：prior_fails 上日志
+      echo 0 > "$FAILS"
+      date -u +%FT%TZ > "$_ns" 2>/dev/null        # neutral_since 哨兵（UTC，#1757 §三.3）
+      echo "$(date +%T) corrupt-await neutral (break_glass latch) — heartbeat kept, awaiting human reset (prior_fails=$_pf)" ;;
+    unknown)
+      echo "$(date +%T) probe unknown — no bookkeeping (FAILS/neutral_since unchanged) (($_vtag/$_vdetail))" ;;
+    *)
+      # 哨兵删除改 latch 门控（pi #1819 §三.2）：同上
+      _n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 ))
+      echo "$_n" > "$FAILS"
+      echo "$(date +%T) wake counted as failure ($_vdetail) ($_n/3)"
+      [ "$_n" -ge 3 ] && {
+        echo "gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."
+        # C4（dsh #1763 §三 直读形）：GATE_TRIP_LOG 仅 pi-watcher 定义（普通变量同 shell 可见）；
+        # 另三支展开为空=零行为变化。恢复 pi-watcher 主路径（游标不动）跳闸的持久记录。
+        [ -n "${GATE_TRIP_LOG:-}" ] && printf '%s\n' "$(date '+%F %T') [$_vtag] gate tripped (C1.2) — $_vdetail; watcher stopped; recovery: rm $FAILS && restart." >> "$GATE_TRIP_LOG" 2>/dev/null || true
+        exit 1
+      } ;;
+  esac
 }

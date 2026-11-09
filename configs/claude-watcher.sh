@@ -40,7 +40,9 @@ WORKDIR="$(cd "$SCRIPT_DIR/.." && pwd)"            # repo root — see note 3
 PROMPT_TEMPLATE="$SCRIPT_DIR/claude-polling-prompt.txt"
 TASK_FILE="${TASK_FILE:-/tmp/rb-claude-wake.txt}"
 LOCK="${LOCK:-/tmp/rb-claude-watcher.lock.d}"
-FAILS="${FAILS:-/tmp/rb-claude-watcher.fails}"
+# [batch3-watcher-fix 2026-11-09] FAILS 迁 /tmp → $HOME/.rb-wake（dsh #1751 T8 落盘纪律，
+# 与 pi-watcher 1.2.0/dsh-watcher 同址 wake_guard STATE_DIR）。
+FAILS="${FAILS:-$HOME/.rb-wake/claude-watcher.fails}"
 
 gate=$(cat "$FAILS" 2>/dev/null || echo 0)
 if [ "${gate:-0}" -ge 3 ]; then
@@ -82,7 +84,28 @@ cycle() {
   reason=$(printf '%s' "$resp" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')
   threads=$(printf '%s' "$resp" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
   echo "$(date +%T) attention=1 ($reason) threads=[$threads] — waking claude"
-  wg_count_wake claude-watcher                     # 票3：每日上限，超帽即停
+  # [batch3-watcher-fix] 中性轮预检（pre 探针）+ 超帽降级——同 dsh-watcher（#1751 口径）。
+  # [GPT round-6 P1 状态机] 同 dsh-watcher（A1-A4；claude #1820 补强：跳过轮=1 探针/cycle）
+  _latch_now=0
+  if wg__tb_obj "$resp" >/dev/null 2>&1 && wg__is_neutral "$(wg__tb_obj "$resp")"; then _latch_now=1; fi
+  _sentinel="$(wg__state_dir)/neutral_since.claude-watcher"
+  if [ "$_latch_now" = 1 ] && [ ! -f "$_sentinel" ]; then
+    wg_note_notified claude-watcher
+    wg_count_wake claude-watcher neutral
+  elif [ "$_latch_now" = 1 ]; then
+    echo "$(date +%T) corrupt-await 已通知（notified_at=$(cat "$_sentinel" 2>/dev/null)）— keepalive 跳过 LLM，探针照发"
+    return 0
+  elif [ -f "$_sentinel" ]; then
+    rm -f "$_sentinel"
+  fi
+  if [ "$_latch_now" = 1 ]; then
+    wg_count_wake claude-watcher neutral
+  else
+    wg_count_wake claude-watcher || {
+      echo "$(date +%T) keepalive (daily cap) — wake skipped, heartbeat kept"
+      return 0
+    }
+  fi
 
   # fixed repo template + board-derived injection only (v2.3 narrowing clause)
   { cat "$PROMPT_TEMPLATE"
@@ -106,20 +129,12 @@ cycle() {
     fi
     areason=$(printf '%s' "$after" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')
     athreads=$(printf '%s' "$after" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
-    if [ "${aatt:-0}" != "1" ] || [ "$areason" != "$reason" ] || [ "$athreads" != "$threads" ]; then
-      echo 0 > "$FAILS"
-      echo "$(date +%T) delivered (attention consumed — delivery, not task-completion)"
-    else
-      n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 ))
-      echo "$n" > "$FAILS"
-      echo "$(date +%T) wake exited 0 but attention unchanged ($n/3) — counted as failure"
-      [ "$n" -ge 3 ] && { echo "gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."; exit 1; }
-    fi
+    # [batch3-watcher-fix] 判定收口到共享函数 wg_judge_surface + wg_apply_verdict
+    # （同 dsh-watcher；T1–T10）。
+    verdict=$(wg_judge_surface 0 "$att" "$reason" "$threads" "$after")
+    wg_apply_verdict "$verdict" "claude-watcher" "empty-wake"
   else
-    n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 ))
-    echo "$n" > "$FAILS"
-    echo "$(date +%T) wake FAILED ($n/3)"
-    [ "$n" -ge 3 ] && { echo "gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."; exit 1; }
+    wg_apply_verdict failed "claude-watcher" "rc-nonzero"
   fi
 }
 

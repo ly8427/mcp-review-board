@@ -87,7 +87,24 @@ cycle() {
   pre_lr=$(printf '%s' "$resp" | sed -n 's/.*"last_read":"\([^"]*\)".*/\1/p')
   pre_id=$(printf '%s' "$resp" | sed -n 's/.*"last_delivered_id":\([0-9]*\).*/\1/p')
   echo "$(date +%T) attention=1 ($reason) threads=[$threads] — waking pi"
-  wg_count_wake pi-watcher                          # 票3：每日上限，超帽即停
+  # [batch3-watcher-fix] 超帽降级（#1751 结论 3）：跳过 LLM 唤醒，探针照发=心跳不停。
+  # 判定面不改——dsh #1751 §三 实测：pi-watcher 的游标判据对 corrupt-await 计
+  # delivered（last_read 每轮必动），不会跳 C1.2；加中性分支反而给 C1.2 开盲区。
+  # [GPT round-6 P1 状态机·游标族]（pi #1819 §三：哨兵删除改 latch 门控，防「一次通知」退化回每 20min）
+  _latch_now=0
+  if wg__tb_obj "$resp" >/dev/null 2>&1 && wg__is_neutral "$(wg__tb_obj "$resp")"; then _latch_now=1; fi
+  _sentinel="$(wg__state_dir)/neutral_since.pi-watcher"
+  if [ "$_latch_now" = 1 ] && [ ! -f "$_sentinel" ]; then
+    wg_note_notified pi-watcher
+    wg_count_wake pi-watcher            # 首醒轮计帽（dsh #1817 §6 硬条件：不得照抄免计）
+  elif [ "$_latch_now" = 1 ]; then
+    echo "$(date +%T) corrupt-await 已通知（notified_at=$(cat "$_sentinel" 2>/dev/null)）— keepalive 跳过 LLM，探针照发"
+    return 0
+  elif [ -f "$_sentinel" ]; then
+    rm -f "$_sentinel"                  # latch 消失 → 恢复正常
+  else
+    wg_count_wake pi-watcher || { echo "08:45:36 keepalive (daily cap) — wake skipped, heartbeat kept"; return 0; }
+  fi
 
   # 固定模板 + 仅看板注入（零代写）。占位符 <rb.sh 所在目录> 在此解析为宿主配置的
   # WSL 原生绝对路径（kit R3：模板不落盘具体路径，配置由部署方在此完成）。
@@ -131,16 +148,11 @@ cycle() {
     # last_read 字符串前进 或 delivered_id 数值前进。旧判据（attention/reason/threads
     # 消费与否）在会话期间原帖继续进新评论时恒"不变"，把正常投递误判为空唤——当日
     # 10:41/11:15 两次投递（游标实已前进到 #1436）被计失败，三连败闸门误触发。
-    if { [ -n "$post_lr" ] && [ "$post_lr" \> "${pre_lr:-0}" ]; } || \
-       { [ -n "$post_id" ] && [ "${pre_id:-0}" -lt "$post_id" ]; } then
-      echo 0 > "$FAILS"
-      echo "$(date +%T) delivered (cursor last_read ${pre_lr:-∅}→${post_lr:-∅} delivered_id ${pre_id:-∅}→${post_id:-∅} — delivery, not task-completion)"
-    else
-      n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 ))
-      echo "$n" > "$FAILS"
-      echo "$(date +%T) wake exited 0 but cursor unmoved (empty wake) ($n/3) — counted as failure"
-      [ "$n" -ge 3 ] && { echo "$(date '+%F %T') gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."; printf '%s\n' "$(date '+%F %T') [pi-watcher] gate tripped (3 consecutive wake failures) — watcher stopped; recovery: rm $FAILS && restart." >> "$GATE_TRIP_LOG" 2>/dev/null || true; exit 1; }
-    fi
+    # [batch3-watcher-fix] 判据逐字搬入 wg_judge_cursor（C4，dsh #1757 §3：载体落
+    # wake_guard.sh 才可测；pi-watcher 不可 source）。判定面不变，不与表面比较统一。
+    v=$(wg_judge_cursor 0 "$pre_lr" "$pre_id" "$post_lr" "$post_id")
+    [ "$v" = delivered ] && echo "$(date +%T) delivered (cursor last_read ${pre_lr:-∅}→${post_lr:-∅} delivered_id ${pre_id:-∅}→${post_id:-∅} — delivery, not task-completion)"
+    wg_apply_verdict "$v" "pi-watcher" "cursor-leg"
   else
     n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 ))
     echo "$n" > "$FAILS"
