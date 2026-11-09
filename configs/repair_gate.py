@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""repair-gate — 调用走样修复单机器闸(Stop hook)。2026-10-26 用户批准实施。
+"""repair-gate — 调用走样修复单机器闸(Stop/PostToolUse hook)。2026-10-26 用户批准实施。
+
+V2.0(2026-11-10):按 docs/DEBT.md #10 落地脚本直接执行面与时机(批次4.1)——
+  ① 看板类修复单脚本直执:post_comment/reply_comment/create_thread 三类确认后由
+    本脚本直接经 WSL rb.sh 执行(不经模型重发,消走样病灶通道),执行前置
+    quorum_guard 同款治理检查(import 复用,不复制判据):board_alive 全员必过、
+    create_thread 加 F6 打卡新鲜度 + quorum 名单校验——治理拒绝 = 带理由退回
+    (模型可修前置,MAX_BOUNCES 封顶),不静默绕门。set_quorum/set_verdict 不进
+    直执面(治理语义复杂,维持 V1 派发通道)。
+  ② PostToolUse 时机:同一脚本容忍 PostToolUse 形状 payload(payload 本就
+    payload-agnostic,bounce 的 {"decision":"block"} 两事件协议同形),回合内
+    开出的单不必等收工;宿主接线=config.json hooks.events 加 PostToolUse 条目。
+  ③ 残余收口:状态原子写改唯一临时名(并发 Stop/PostToolUse 不再共用 .tmp);
+    直执面每次记录返回形状头 200 字节进日志(为"看板族业务成功字段"积累实证,
+    V1.5 留账的后续);宿主真实走样端到端首验仍留账(等下一次真实走样,不可预演)。
 
 V1.3(2026-10-27):按评审第二轮收口 F1——核销证据从"锚点后区域内 工具名与参数
   两个字符串分别命中"升级为"锚点后**同一条结构化调用记录**内 工具名+参数 同时
@@ -61,6 +75,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -74,13 +89,24 @@ RECEIPT_RE = re.compile(r"^(执行|误报)\s+([0-9a-f]{6}(?:-[0-9]+)?)\s*$")
 ALLOW_TOOLS = {
     "CronDelete", "CronUpdate",
     "mcp__review-board__create_thread",
+    "mcp__review-board__post_comment",
+    "mcp__review-board__reply_comment",
     "mcp__review-board__set_quorum",
     "mcp__review-board__set_verdict",
 }
 SHORT_TOOLS = {
     "create_thread": "mcp__review-board__create_thread",
+    "post_comment": "mcp__review-board__post_comment",
+    "reply_comment": "mcp__review-board__reply_comment",
     "set_quorum": "mcp__review-board__set_quorum",
     "set_verdict": "mcp__review-board__set_verdict",
+}
+# V2①:直执面白名单(确认后由脚本直接执行,不经模型重发)。
+# set_quorum/set_verdict 治理语义复杂(创建者末票门/名单改写审计),维持 V1 派发通道。
+DIRECT_TOOLS = {
+    "mcp__review-board__post_comment",
+    "mcp__review-board__reply_comment",
+    "mcp__review-board__create_thread",
 }
 MAX_BOUNCES = 4      # 每张单的退回上限(登记/确认/派发/催办合计),超限报警转人工
 STATE_TTL = 86400    # 台账条目保质期(秒)
@@ -119,9 +145,12 @@ def load_state() -> dict:
 
 
 def save_state(st: dict) -> bool:
-    """原子写(临时文件+替换)。返回是否成功——失败时调用方必须停发派发/催办
-    指令并报警转人工(F6:状态没落盘,绝不驱动副作用)。"""
-    tmp = STATE_PATH + ".tmp"
+    """原子写(唯一临时名+替换)。返回是否成功——失败时调用方必须停发派发/催办
+    指令并报警转人工(F6:状态没落盘,绝不驱动副作用)。
+    V2③:临时名带 pid+时间戳——Stop 与 PostToolUse 钩子并发时不再共用 .tmp
+    (评审第四轮非阻塞建议);并发写语义 = 各自原子替换、后写者胜(状态条目
+    幂等,回执/登记重复由 L4/alloc_order_id 去重吸收)。"""
+    tmp = f"{STATE_PATH}.tmp{os.getpid()}-{time.time_ns()}"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(st, f, ensure_ascii=False, indent=1)
@@ -364,6 +393,75 @@ def dispatch_instruction(h: str, tool: str, args: str) -> str:
             f"完成并核对返回成功前本回合不会结束。")
 
 
+# ─────────────────── V2①:看板类脚本直接执行面 ───────────────────
+
+DRYRUN = os.environ.get("RB_REPAIR_DRYRUN") == "1"
+
+
+def _gov_check(tool: str, args: str):
+    """直执前置:quorum_guard 同款治理检查(import 复用,判据不复制)。
+    返回 (True, "") 或 (False, 拒绝理由)。治理拒绝 ≠ 闸故障——理由退回给
+    模型修前置(如开轮询打卡),MAX_BOUNCES 封顶,绝不静默绕门(DEBT #10①)。"""
+    try:
+        import quorum_guard_hook as qg  # 同目录;die() 走 SystemExit
+    except Exception as e:
+        return False, f"治理模块不可导入({e})——按 fail-closed 处理,转人工"
+    try:
+        if tool == "mcp__review-board__create_thread":
+            qg.check_poll_marker()                       # F6:发起者打卡新鲜度
+            try:
+                names = json.loads(args).get("quorum") or []
+            except ValueError:
+                names = []
+            if names:
+                qg.check_quorum_names(names, qg.load_roster())   # 名单/形态/闸门
+        qg.board_alive()                                 # 全员:板不可达不执行
+        return True, ""
+    except SystemExit:
+        return False, "治理前置未过(quorum_guard 拒绝,理由见 stderr)——请先修复前置再重开修复单"
+    except Exception as e:
+        return False, f"治理检查异常({e})——按 fail-closed 处理,转人工"
+
+
+def _direct_exec(tool: str, args: str):
+    """看板类直执:与 V1 派发同一条 rb.sh 通道,但由本脚本直接跑(不经模型)。
+    成功判据沿用 V1.5 口径:退出码 0 + 输出可解析为无 error 键的非空 JSON
+    (业务字段留待形状实证——每次把返回头 200 字节记日志,为逐工具补字段积累)。"""
+    short = tool.replace("mcp__review-board__", "")
+    b64 = base64.b64encode(args.encode("utf-8")).decode("ascii")
+    cmd = (f"~/opt/rb/rb.sh {short} \"$(printf %s {b64} | base64 -d)\"")
+    if DRYRUN:
+        log("direct-exec-dryrun", f"{short} (dryrun,未触板)")
+        return True, "dryrun"
+    try:
+        r = subprocess.run(["wsl", "-e", "bash", "-c", cmd], capture_output=True,
+                           timeout=60)
+    except Exception as e:
+        return False, f"执行异常({e})"
+    out = (r.stdout or b"").decode("utf-8", "replace").strip()
+    log("direct-exec-shape", f"{short} rc={r.returncode} head={out[:200]!r}")  # V2③:形状实证
+    if r.returncode != 0:
+        return False, f"rb.sh 退出码 {r.returncode}: {(r.stderr or b'').decode('utf-8', 'replace')[:200]}"
+    try:
+        parsed = json.loads(out)
+    except ValueError:
+        return False, f"返回不是 JSON: {out[:200]}"
+    if isinstance(parsed, dict) and parsed.get("error"):
+        return False, f"返回带 error: {out[:200]}"
+    if not out:
+        return False, "返回为空"
+    return True, out[:200]
+
+
+def _gov_and_exec(tool: str, args: str):
+    """治理前置 + 直执的组合入口。返回 (done, message)。"""
+    ok, why = _gov_check(tool, args)
+    if not ok:
+        return False, f"修复单治理前置未过:{why}"
+    done, detail = _direct_exec(tool, args)
+    return done, detail
+
+
 def main() -> None:
     raw = sys.stdin.read()
     try:
@@ -376,8 +474,9 @@ def main() -> None:
     # ---- 收集全部候选串里的修复单与回执(L1/L2/L3;V1.3 扫描全部候选串) ----
     orders = {}
     receipts = {}
-    for s in candidate_strings(payload):
-        for line in strip_code(s).splitlines():
+
+    def scan_text(text: str) -> None:
+        for line in strip_code(text).splitlines():
             mo = ORDER_RE.match(line)
             if mo:
                 tool, args = mo.group(1), mo.group(2)
@@ -396,8 +495,32 @@ def main() -> None:
             if mr:
                 receipts[mr.group(2)] = mr.group(1)
 
+    for s in candidate_strings(payload):
+        scan_text(s)
+
     state = load_state()
     now = time.time()
+
+    # ---- V2②:rollout 增量扫描(PostToolUse 时机) ----
+    # PostToolUse 载荷不含助手正文(正文在 rollout)——持久扫描偏移,每次只扫
+    # 上次锚点之后的新增字节;首锚=当前字节位(历史引用一律无效,L3 同款)。
+    cur = rollout_size(payload)
+    if cur >= 0:
+        sc = state.get("_scan")
+        prev = sc.get("off") if isinstance(sc, dict) else None
+        if isinstance(prev, int) and 0 <= prev <= cur:
+            for ln in rollout_after(payload, prev).splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    rec = json.loads(ln)     # rollout 行是 JSON 记录:解析后递归抽串,
+                except ValueError:           # 否则嵌在 text 字段里的回执/单子匹配不到
+                    rec = ln                 # 非 JSON 行按原文本扫(保守)
+                for s in candidate_strings(rec):
+                    scan_text(s)
+        # 存 dict 形态(load_state 只保留 dict 条目——存整数会被过滤丢掉)
+        state["_scan"] = {"ts": now, "off": cur}   # 首轮/轮转都重锚当前位,绝不全扫
 
     # ---- 回执落账(L4) ----
     for h, act in receipts.items():
@@ -423,6 +546,8 @@ def main() -> None:
     msgs = []
     need_bounce = False
     for h, v in list(state.items()):
+        if h.startswith("_"):
+            continue   # V2②:_scan 等内部键不是票据
         if v.get("done") or v.get("void") or v.get("alarm"):
             continue
         tool, args = v.get("tool", ""), v.get("args", "")
@@ -440,6 +565,27 @@ def main() -> None:
                 f"两次无回执将自动作废。")
             need_bounce = True
         elif not v.get("dispatched"):
+            if tool in DIRECT_TOOLS:
+                # V2①:看板类直执——脚本自己跑(治理前置+rb.sh),不经模型重发
+                v["bounces"] = v.get("bounces", 0) + 1
+                done, detail = _gov_and_exec(tool, args)
+                if done:
+                    v["done"] = True
+                    v["finished"] = now
+                    v["direct"] = True
+                    log("order-direct-done", f"{h} {tool} {detail[:120]}")
+                    continue
+                if "治理前置未过" in detail:
+                    # 治理拒绝可由模型修前置(开轮询打卡等)——保持未派发,下轮重试
+                    # 治理检查,自愈;封顶 MAX_BOUNCES 兜病理
+                    msgs.append(f"修复单 {h} {detail}(下轮自动重试治理检查)")
+                    need_bounce = True
+                    continue
+                # 执行失败(板不可达/返回异常)——回退 dispatched,下轮重试,封顶 MAX_BOUNCES
+                v["dispatched"] = False
+                msgs.append(f"修复单 {h} 直执失败:{detail}(下轮自动重试)")
+                need_bounce = True
+                continue
             v["dispatched"] = True
             v["dispatch_offset"] = rollout_size(payload)  # F1:核销锚点=此刻文件字节位
             v["bounces"] = v.get("bounces", 0) + 1
