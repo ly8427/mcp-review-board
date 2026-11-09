@@ -209,7 +209,7 @@ pf_out=$( . "$HERE/wake_guard.sh"; STATE_DIR="$STATE_DIR"; wg_preflight t-ns 120
    # tag 修正：删的是 neutral_since.t-ns（原 t-pf 错位，dsh #1773→#1795 §六.2 补句）
 expect_rc "preflight 未被拒启动" "$pf_rc" "0"
 expect_eq "preflight 在岗行(rm 之前的门全过)" "$(printf '%s' "$pf_out" | grep -c '在岗')" "1"
-[ -f "$NS" ] && { say "preflight 清哨兵（新进程≠旧 latch）" "still there" FAIL; fails=$((fails+1)); } || say "preflight 清哨兵（新进程≠旧 latch）" "removed" PASS
+[ -f "$NS" ] && say "preflight 后哨兵保持（GPT P1-1 修正：启动不删）" "exists" PASS || { say "preflight 后哨兵" "missing" FAIL; fails=$((fails+1)); }
 
 echo
 echo "== T10：真 server（需隔离服务；无环境则 SKIP） =="

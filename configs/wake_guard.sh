@@ -45,7 +45,7 @@ wg_preflight() {
   if ! mkdir -p "$(wg__state_dir)" 2>/dev/null; then
     echo "$WG_ERR_PREFIX [$_tag] 无法创建 STATE_DIR=$(wg__state_dir) → 拒绝启动"; exit 2
   fi
-  rm -f "$(wg__state_dir)/neutral_since.${_tag}" 2>/dev/null   # 纪律 2：新进程 ≠ 旧 latch
+  # [GPT round-7 P1-1] 启动不删哨兵——删点只能由 latch 事实驱动（delivered/failed 后探针确认），不能由进程生命周期驱动（dsh #1817 §1 / #1826 核心阻断同族）。重启后首轮探针自纠：latch 在=继承等待态跳过 LLM；latch 不在=删哨兵恢复常态。
   echo "$WG_ERR_PREFIX [$_tag] 在岗: INTERVAL=${_interval}s, MAX_WAKES=${MAX_WAKES}/日, STATE_DIR=$(wg__state_dir)"
 }
 
