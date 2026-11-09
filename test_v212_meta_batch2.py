@@ -106,7 +106,12 @@ def main():
         check(f"T1c gate does NOT say claim_token ({label})",
               "claim_token" not in (gate or ""), gate)
         check(f"T1d token_invalid_tids empty for corrupt row ({label})", ti == [])
-        check(f"T1e token_blocked face empty, no raise ({label})", tb == {})
+        # batch3(#1552 §五→#1553 §三): corrupt 行的 token_blocked 面不再是空 dict ——
+        # 它得到 break_glass 只读家(哨兵键 corrupt、tier=break_glass;坏行字节不可写,
+        # reset 是唯一授权覆写,条目由 _meta_state 派生)。
+        check(f"T1e corrupt row gets the break_glass home, no raise ({label})",
+              set(tb) == {"corrupt"} and tb["corrupt"].get("tier") == "break_glass"
+              and "reset_token" in tb["corrupt"].get("exit", ""), tb)
         check(f"T1f awaiting_split no raise ({label})", isinstance(aw, tuple) and len(aw) == 2)
         check(f"T1g bytes untouched through all token faces ({label})", raw_meta(a) == before)
         check(f"T1h no token_blocked_latched audit ({label})",
@@ -362,6 +367,24 @@ def main():
     check("T11m bytes untouched by the poll", raw_meta("v5-poll") == vbefore,
           repr(raw_meta("v5-poll")))
 
+    # --- #99 ②(#1690 §3 登记,#1700 §二 三根针;#1707 §三 补落 RET2/KEEP3 两腿
+    # =定稿 #1682 §一「RET1+RET2 两条」/#1686 §四 验收集全落;方向=交付态口径) ---
+    # 五串均为 server.py 字节精确字面;含反引号串按源码拼写(#1703 拼写课: 拼错即不绑定)。
+    # 交付态计数: RET1=0 / RET2=0 / POS=1 / KEEP3=1 / KEEP4=1 ⇒ 本闸钉住交付态;
+    # #28 注记回卷到 master 措辞 ⇒ RET1/POS 翻红 = 回归签名、必须红(#1707 §二.2 改判:
+    # 非中间态);② 定性=已落状态的回卷锁,不验证 (甲) 改动。收窄主张见 server.py #1635 块。
+    _srv_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "server.py"), encoding="utf-8").read()
+    check("② RET1 退役针: roster-wide face 措辞不得回魂(同行含 unauthenticated, so 亦不得回魂)",
+          "roster-wide face would let" not in _srv_src)
+    check("② POS 正针: errors_by_author 收窄主张在位",
+          "errors_by_author returns ONE name per" in _srv_src)
+    check("② KEEP4 保留针(源码拼写带反引号): scalar errors 句在位",
+          "the scalar `errors` face is out of scope" in _srv_src)
+    check("② RET2 退役针(#1682 §一定稿腿、#1707 §三补落): causal-inversion 连接词不得回魂",
+          "unauthenticated, so" not in _srv_src)
+    check("② KEEP3 保留针(#1686 §四 KEEP3==1、#1707 §三补落): version-gate carrier 句在位",
+          "Key name is the version-gate carrier and must not change" in _srv_src)
     print("=" * 60)
     print(f"v2.12.0 batch2: {len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

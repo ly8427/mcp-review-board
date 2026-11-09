@@ -519,6 +519,33 @@ def main():
     out = srv.confirm_form_b(thread_id=tid3, nonce=nonce)
     check("nonce is one-time", out.startswith("ERROR") and "consumed" in out)
 
+    # ---------- #25(DEBT): DATA_DIR 缺失 ⇒ nonce fail-open 负例 ----------
+    # 钉「fail-open 是有意行为」,不是修 bug(dsh #1672 §六.1: 回执写「钉 fail-open」,
+    # 绝不写「修复」)。判据(dsh #1672 §五 #25 行): DATA_DIR 指向不存在路径(不 mkdir)
+    # ⇒ 工具仍返 nonce requested ∧ form_b_requested 审计行数 +1 ∧ 该路径无文件。
+    _saved_dir = srv.DATA_DIR
+    try:
+        _missing = _saved_dir / "nonexistent-sub" / "deeper"
+        with _RO(db) as conn:
+            n_aud = conn.execute(
+                "SELECT COUNT(*) FROM verdict_events WHERE action='form_b_requested'").fetchone()[0]
+        srv.DATA_DIR = _missing
+        tid5 = mk_thread(srv, "anna", ["anna", "brin"], ctx, tok)
+        out = srv.request_form_b(thread_id=tid5, author="anna", names=["trae"], token=tok["anna"])
+        p = _missing / "form_b_nonce.txt"
+        nonce = p.read_text(encoding="utf-8").split("nonce=")[1].split(" ")[0] if p.exists() else None
+        check("#25: DATA_DIR 缺失仍返 nonce requested(同一行 bool(nonce)=False,无文件落盘)",
+              out.startswith("form_b nonce requested for thread #") and "pending" in out
+              and bool(nonce) is False,
+              f"out={out[:60]}... nonce={nonce!r}")
+        with _RO(db) as conn:
+            n_after = conn.execute(
+                "SELECT COUNT(*) FROM verdict_events WHERE action='form_b_requested'").fetchone()[0]
+        check("#25: form_b_requested 审计行仍在(+1,审计与文件写无关)",
+              n_after == n_aud + 1, f"rows={n_after}")
+    finally:
+        srv.DATA_DIR = _saved_dir
+
     print(f"\n{'='*60}\nv2.9.2 gates: {len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", *FAIL, sep="\n  - ")

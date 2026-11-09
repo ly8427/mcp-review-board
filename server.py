@@ -205,7 +205,7 @@ SUSPEND_AFTER_HOURS = 24
 # --- v2 A1: participant registry / heartbeat --------------------------------
 # Single source of truth for the served version (v2.9.3 #55: was duplicated in
 # three literals — FastMCP serverInfo, /ping, PROTOCOL header — and drifted).
-PROTOCOL_VERSION = "2.12.0"
+PROTOCOL_VERSION = "2.12.1"
 mcp = FastMCP("ReviewBoard", version=PROTOCOL_VERSION)  # align serverInfo with pyproject
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -1021,6 +1021,13 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
   按(作者,帖,修订)去重(#55③ 口径)。出口=`reset_token(human_override=True)`(同时清
   latch)或重签窗口到期;**任一次 token 正确的治理调用即清 latch**(正确出示=持有证明,
   其后即便被 L1.5 拒也与 token 无关)。
+  batch3(#1552 §五→#1553 §三,tier 契约枚举变更,随版本闸登记):`tier` 在 latch 写入点
+  落盘(成因已知处手写,读面**原样取用**、不按 since/revision 反推成因,dsh #1664 §三①);
+  另增 `tier:"break_glass"` 档=corrupt 行的只读家——坏行字节不可读也不可写(reset 是
+  唯一授权覆写),成因即状态本身,条目由 `_meta_state` 派生(同 meta_unparsable 面,
+  dsh #1432 §三),哨兵键 `corrupt`(不与 str(tid) 相撞),同样**不置 attention、不计
+  唤醒失败**,唯一出口=人工 reset。轮询侧禁治理按显式白名单:manual 及未知 tier 禁、
+  仅 break_glass 不禁(claude #1666)——脚本字面 `tier=manual` 匹配天然不误触。
 - **版本闸**:本节即 attention 返回契约变更的闸——init_db 每版本写一行
   `attention_contract` 审计(note 含 reason 全表与 header 键全表),幂等;watcher 文案
   分支随本批同落:**先评论(my_comment_due 含本帖)再投票**(trae #791 增量2,一次唤醒
@@ -1106,7 +1113,8 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
   仍为 7。返回体新增上述两条 ERROR 文案;参数语义不变。返回契约的 header 键
   枚举:1.1b 枚举不变,修复批追加 `meta_unparsable`/`errors_by_author` 两键
   (见 `attention_contract` 审计的 keys= 行,dsh #1595 ①)。随
-  `PROTOCOL_VERSION` 2.11.0→2.12.0 由 `attention_contract` 审计落一行。
+  每次 `PROTOCOL_VERSION` 变更(含降级重写,`!=` 双向)由 `attention_contract`
+  审计落一行。
 - **受邀未到场不阻塞决议,但自动关门仍须台账**(dsh #1293 §四,定案①认):
   受邀未到场者从不进入活跃集合 ⇒ 不再有「24h 冻结窗口」,其余活跃成员全 pass 后
   当天即可收口;但 `recompute_thread` 把「名册内非活跃者」喂给 wake_ledger 门 ⇒
@@ -1394,6 +1402,9 @@ def init_db() -> None:
         acv = conn.execute(
             "SELECT value FROM meta WHERE key='attention_contract_ver'"
         ).fetchone()
+        # `!=` 刻意双向:库内存有更新的契约版本(二进制降级/回滚)同样重写
+        # marker 并落一行审计 —— 留痕、不静默(dsh #1731 §一 降级格;本批
+        # 语义不变,专用测试格归下一批在版本闸下走)。
         if acv is None or acv[0] != PROTOCOL_VERSION:
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('attention_contract_ver', ?)",
@@ -1405,7 +1416,8 @@ def init_db() -> None:
                 "|awaiting_floor_comment|mentioned|new_comments|idle"
                 " keys=my_comment_due|token_invalid|token_blocked"
                 "|awaiting_my_verdict|blocked_my_verdict"
-                "|meta_unparsable|errors_by_author"))
+                "|meta_unparsable|errors_by_author"
+                " token_blocked.value=manual|break_glass"))
 
 
 # --- v2.8 (threads #39/#40): cross-thread full-text search read face ---------
@@ -3825,7 +3837,12 @@ def _token_gate(conn: sqlite3.Connection, author: str, token: str | None,
         key = str(thread_id)
         entry = latch.get(key)
         if not (entry and entry.get("revision") == rev_n):
-            latch[key] = {"since": _now_iso(), "revision": rev_n}
+            # batch3 (#77 档B扩展, #1552 §五→#1553 §三): the tier is written
+            # HERE, where the cause is known (readable hash ∧ mismatched
+            # presentation ⇒ manual); the face reads it back as-is and never
+            # infers a cause from since/revision (dsh #1664 §三①).
+            latch[key] = {"since": _now_iso(), "revision": rev_n,
+                          "tier": "manual"}
             meta["token_blocked"] = latch
             _set_meta(conn, author, meta)
             _audit(conn, author, "token_blocked_latched", thread_id=thread_id,
@@ -3835,11 +3852,34 @@ def _token_gate(conn: sqlite3.Connection, author: str, token: str | None,
     return _token_err(conn, author, "token_gate", state=meta_state)
 
 
+def _tier_out(e: dict) -> str:
+    """(甲) 只让已知 tier 上 wire;未知值/null/缺键一律落迁移默认 manual."""
+    t = e.get("tier") if isinstance(e, dict) else None
+    return t if t in ("manual", "break_glass") else "manual"
+
+
 def _token_blocked_face(conn: sqlite3.Connection, author: str) -> dict:
     """档B (#77 ②): READ-ONLY latch face — never raises attention, never
-    counts as a wake failure. Carries the manual-tier exit path: human reset,
-    or the reissue window end (auto-ack 1h / explicit 24h from ack)."""
+    counts as a wake failure. Two tiers (batch3 #77 档B扩展, #1552 §五→
+    #1553 §三): "manual" — read back as stored (the tier is written at the
+    latch write point where the cause is known; this face never infers one
+    from since/revision), exit = human reset or the reissue window end
+    (auto-ack 1h / explicit 24h from ack); and "break_glass" — a corrupt
+    row's home: its bytes are unreadable and must not be written (reset is
+    the only authorized overwrite), so the state itself is the cause and the
+    entry is derived from _meta_state exactly like the meta_unparsable face
+    (dsh #1432 §三). Same discipline as the rest of the face: no attention,
+    no wake-failure count. The poll-side whitelist forbids governance on
+    manual and any unknown tier and leaves only break_glass alone
+    (claude #1666)."""
     meta_state, meta, _raw = _meta_state(conn, author)
+    if meta_state in META_CORRUPT:
+        # Sentinel key "corrupt" cannot collide with a str(thread_id) key;
+        # no "since" exists for a corruption (nothing was latched — the gate
+        # never writes to a corrupt row).
+        return {"corrupt": {"tier": "break_glass",
+                            "exit": "reset_token(human_override=True) "
+                                    "(break-glass, audited)."}}
     if meta_state != META_DICT:
         return {}
     latch = meta.get("token_blocked") or {}
@@ -3854,7 +3894,10 @@ def _token_blocked_face(conn: sqlite3.Connection, author: str) -> dict:
         except ValueError:
             pass
     return {
-        tid: {"tier": "manual", "since": e.get("since"),
+        # Pre-batch3 entries carry no tier field; the mismatch branch was their
+        # only writer, so "manual" is the migration default (not an inference —
+        # a stored tier is always taken as-is).
+        tid: {"tier": _tier_out(e), "since": e.get("since"),
               "exit": f"reset_token(human_override=True){window}"}
         for tid, e in latch.items()
     }
@@ -3906,14 +3949,23 @@ def _awaiting_split(conn: sqlite3.Connection, author: str) -> tuple[list[int], l
     # surface as reason=token_invalid (wake = claim 四步, doable now);
     # blocked (L1.5) semantics are UNCHANGED (pi #775 绑定③).
     meta_state, meta, _raw = _meta_state(conn, author)
-    if meta_state != META_DICT:
+    # v2.12.0 batch3 (#1552 §五→#1553 §三): exclude by state, not by a ti-set
+    # difference — the carve preconditions below (readable dict row ∧ no token
+    # hash) are exactly _token_invalid_tids' early-return guards inverted, and
+    # its thread loop is the same predicate as `actionable`, so the old set
+    # difference was always the whole family: one arithmetic, no second copy
+    # (#874 §3 / #1617 §5). The function itself stays (the reason=token_invalid
+    # threads source on the two read faces). The early exit is now
+    # `in META_CORRUPT` so the comment below says what the code does: MISSING
+    # is no longer swallowed (a row-less member is tokenless and carves;
+    # DDL-level unreachable today — meta TEXT NOT NULL DEFAULT '{}').
+    if meta_state in META_CORRUPT:
         # Corrupt row: leave actionable intact (do not carve as tokenless);
         # the governance gate returns a named state instead of a false
         # normal-issue text.
         return actionable, blocked
-    if not (meta and meta.get("token_hash")):
-        ti = set(_token_invalid_tids(conn, author))
-        actionable = [t for t in actionable if t not in ti]
+    if not (isinstance(meta, dict) and meta.get("token_hash")):
+        actionable = []
     return actionable, blocked
 
 
@@ -5099,8 +5151,11 @@ async def attention_probe(request: Request):
             tb_face = _token_blocked_face(conn, author)
             mrow_state, _mrow, _mraw = _meta_state(conn, author)
             corrupt_meta = mrow_state in META_CORRUPT
+            # batch3 (#1622 同族收尾, dsh #1668 §三.2): the row-presence test
+            # is predicated, not truthiness-folded — an empty dict row
+            # (meta='{}') must not read as "absent"; no third condition added.
             token_fire = (not corrupt_meta
-                          and not (_mrow and _mrow.get("token_hash"))
+                          and not (isinstance(_mrow, dict) and _mrow.get("token_hash"))
                           and (bool(ti_tids) or bool(_active_roster_tids(conn, author))))
             # v2.5 (thread #33): the holder's OWN continued posting over a standing
             # object wakes them to reconsider — priority BELOW awaiting_verdict
@@ -5196,10 +5251,12 @@ async def attention_probe(request: Request):
             # serves a DIFFERENT board and refuse to wake members against it.
             "uptime_secs": int(time.time() - _STARTED_AT),
             "errors": _PROBE_ERRORS,
-            # #1635 (user ruling 甲): narrowed to the subject's own entry —
-            # /attention is unauthenticated, so a roster-wide face would let
-            # anyone enumerate every member's probe-failure counts (GPT round-3
-            # P2). Key name is the version-gate carrier and must not change
+            # #1635 (user ruling 甲): errors_by_author returns ONE name per
+            # request — the subject's own entry, keyed by the caller-supplied
+            # `author` query param; never the whole table. Per-name enumeration
+            # of others' counts remains possible (/attention is
+            # unauthenticated), GPT round-3 P2.
+            # Key name is the version-gate carrier and must not change
             # (dsh #1637 §三.5); the scalar `errors` face is out of scope.
             "errors_by_author": ({author: _PROBE_ERRORS_BY_AUTHOR[author]}
                                  if author in _PROBE_ERRORS_BY_AUTHOR else {}),
