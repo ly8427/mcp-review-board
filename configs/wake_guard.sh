@@ -190,7 +190,7 @@ wg_apply_verdict() {
   case "$_verdict" in
     delivered)
       echo 0 > "$FAILS"
-      rm -f "$_ns"   # neutral_since 纪律 1（dsh #1757 §三）：delivered 支也要删
+      # 哨兵删除改 latch 门控（pi #1819 §三.2）：由 pre-probe 的 latch 事实驱动，此处不再无条件删
       echo "$(date +%T) delivered (attention consumed — delivery, not task-completion)" ;;
     neutral)
       _pf=$(cat "$FAILS" 2>/dev/null || echo 0)   # C3：prior_fails 上日志
@@ -200,7 +200,7 @@ wg_apply_verdict() {
     unknown)
       echo "$(date +%T) probe unknown — no bookkeeping (FAILS/neutral_since unchanged) (($_vtag/$_vdetail))" ;;
     *)
-      rm -f "$_ns"                                 # neutral_since 纪律 1：failed 支同样删
+      # 哨兵删除改 latch 门控（pi #1819 §三.2）：同上
       _n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 ))
       echo "$_n" > "$FAILS"
       echo "$(date +%T) wake counted as failure ($_vdetail) ($_n/3)"

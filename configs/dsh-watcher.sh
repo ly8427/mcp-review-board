@@ -96,10 +96,27 @@ cycle() {
   echo "$(date +%T) attention=1 ($reason) threads=[$threads] — waking DSH"
   # [batch3-watcher-fix] 中性轮预检（pre 探针，pi #1748 §二.2）：pre 响应含本 author
   # 的 break_glass latch ⇒ 本轮不计日帽、照常唤醒保投递（pi #1748 §二.1；T7）。
-  if wg__tb_obj "$resp" >/dev/null 2>&1 && wg__is_neutral "$(wg__tb_obj "$resp")"; then
+  # [GPT round-6 P1 状态机] pre 探针 latch 检查（A1-A4，dsh #1817 §一/claude #1820 补强）：
+  #   哨兵不在 ∧ latch 在 → wg_note_notified + 照常唤醒（首次通知，计 neutral 不计帽）
+  #   哨兵在   ∧ latch 在 → keepalive 跳过 LLM（探针已发=心跳；1 探针/cycle，claude #1820 补强①）
+  #   哨兵在   ∧ latch 不在 → 删哨兵 + 恢复正常（人工 reset 完成，A4）
+  #   哨兵不在 ∧ latch 不在 → 正常
+  _latch_now=0
+  if wg__tb_obj "$resp" >/dev/null 2>&1 && wg__is_neutral "$(wg__tb_obj "$resp")"; then _latch_now=1; fi
+  _sentinel="$(wg__state_dir)/neutral_since.dsh-watcher"
+  if [ "$_latch_now" = 1 ] && [ ! -f "$_sentinel" ]; then
+    wg_note_notified dsh-watcher
+    wg_count_wake dsh-watcher neutral
+  elif [ "$_latch_now" = 1 ]; then
+    echo "$(date +%T) corrupt-await 已通知（notified_at=$(cat "$_sentinel" 2>/dev/null)）— keepalive 跳过 LLM，探针照发"
+    return 0
+  elif [ -f "$_sentinel" ]; then
+    rm -f "$_sentinel"   # latch 消失（人工 reset 完成）→ 恢复正常唤醒（A4）
+  fi
+  if [ "$_latch_now" = 1 ]; then
     wg_count_wake dsh-watcher neutral
   else
-    wg_count_wake dsh-watcher || {  # 超帽降级：跳过 LLM 唤醒，探针照发=心跳不停（#1751 结论 3）
+    wg_count_wake dsh-watcher || {
       echo "$(date +%T) keepalive (daily cap) — wake skipped, heartbeat kept"
       return 0
     }

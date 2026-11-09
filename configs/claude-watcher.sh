@@ -85,10 +85,23 @@ cycle() {
   threads=$(printf '%s' "$resp" | sed -n 's/.*"threads":\[\([^]]*\)\].*/\1/p')
   echo "$(date +%T) attention=1 ($reason) threads=[$threads] — waking claude"
   # [batch3-watcher-fix] 中性轮预检（pre 探针）+ 超帽降级——同 dsh-watcher（#1751 口径）。
-  if wg__tb_obj "$resp" >/dev/null 2>&1 && wg__is_neutral "$(wg__tb_obj "$resp")"; then
+  # [GPT round-6 P1 状态机] 同 dsh-watcher（A1-A4；claude #1820 补强：跳过轮=1 探针/cycle）
+  _latch_now=0
+  if wg__tb_obj "$resp" >/dev/null 2>&1 && wg__is_neutral "$(wg__tb_obj "$resp")"; then _latch_now=1; fi
+  _sentinel="$(wg__state_dir)/neutral_since.claude-watcher"
+  if [ "$_latch_now" = 1 ] && [ ! -f "$_sentinel" ]; then
+    wg_note_notified claude-watcher
+    wg_count_wake claude-watcher neutral
+  elif [ "$_latch_now" = 1 ]; then
+    echo "$(date +%T) corrupt-await 已通知（notified_at=$(cat "$_sentinel" 2>/dev/null)）— keepalive 跳过 LLM，探针照发"
+    return 0
+  elif [ -f "$_sentinel" ]; then
+    rm -f "$_sentinel"
+  fi
+  if [ "$_latch_now" = 1 ]; then
     wg_count_wake claude-watcher neutral
   else
-    wg_count_wake claude-watcher || {  # 超帽降级：跳过 LLM 唤醒，探针照发=心跳不停
+    wg_count_wake claude-watcher || {
       echo "$(date +%T) keepalive (daily cap) — wake skipped, heartbeat kept"
       return 0
     }
