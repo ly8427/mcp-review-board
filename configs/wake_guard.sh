@@ -68,6 +68,16 @@ wg_stop_check() {
 #     照常放行（pi #1748 §二.1：否则中性轮 24h 后照样被日帽杀闹钟；成本有界，
 #     受 reset 窗口约束）。日志行留痕。
 # 返回：0=可唤醒；1=超帽（调用方降级）。
+# wg_note_notified <tag> — 「本轮已决定通知」哨兵写入（dsh #1817 §4 第 5 洞修法：
+#   写点从 wg_apply_verdict neutral（唤醒之后）前移到 pre-wake 决策点——否则
+#   post-probe 失败/缺字段（unknown 支）会把「已通知」丢掉，下一轮再烧一次）。
+#   时间戳 UTC（#1757 §三.3）。读者只判存在性，不解析内容。
+wg_note_notified() {
+  _tag="${1:-watcher}"
+  date -u +%FT%TZ > "$(wg__state_dir)/neutral_since.${_tag}" 2>/dev/null
+}
+
+
 wg_count_wake() {
   _tag="${1:-watcher}"
   _dir="$(wg__state_dir)"; _d="$(date +%Y%m%d)"
