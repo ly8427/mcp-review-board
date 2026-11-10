@@ -16,6 +16,7 @@
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -45,6 +46,55 @@ def _res(rid, content, is_error=None):
     return json.dumps(d, ensure_ascii=False)
 
 ORDER_LINE = '修复单:: CronDelete {"id":"42"}'
+
+
+def _readline_bounded(stream, secs=30):
+    """有界读行(GPT round-14/16:子进程启动失败时测试不得挂死)。"""
+    import queue
+    import threading
+    q = queue.Queue()
+    threading.Thread(target=lambda: q.put(stream.readline()), daemon=True).start()
+    try:
+        return q.get(timeout=secs)
+    except queue.Empty:
+        raise AssertionError("子进程输出行超时(%ss)——启动失败或未打印" % secs)
+
+
+class _StubBoard:
+    """内嵌 stub 看板(GPT round-16 P2-4:并发/治理测试不得依赖本机 8765)。"""
+
+    def __init__(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        self.url = None
+        self._srv = None
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b"{}"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        self._H = Handler
+        self._srv_cls = ThreadingHTTPServer
+
+    def start(self):
+        self._srv = self._srv_cls(("127.0.0.1", 0), self._H)
+        port = self._srv.server_address[1]
+        self.url = "http://127.0.0.1:%d" % port
+        import threading
+        threading.Thread(target=self._srv.serve_forever, daemon=True).start()
+        return self.url
+
+    def stop(self):
+        if self._srv:
+            self._srv.shutdown()
+            self._srv.server_close()
 BOARD_ORDER = ('修复单:: create_thread {"title":"a\'; rm -rf /tmp/nope; `echo x` '
                '$(touch /tmp/rb-pwned)","context":"中文\\"引号\\"","n":3}')
 
@@ -338,7 +388,8 @@ sys.path.insert(0, os.path.join(HERE, "configs"))
 
 
 class V22Concurrency(unittest.TestCase):
-    """独立于 Harness(避免继承把 V1 测试重跑一遍)。"""
+    """独立于 Harness(避免继承把 V1 测试重跑一遍)。
+    治理检查的板依赖走内嵌 stub(P2-4)——不依赖本机 8765。"""
 
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
@@ -346,14 +397,18 @@ class V22Concurrency(unittest.TestCase):
         self.logp = os.path.join(self._dir.name, "log.txt")
         self.alarm = os.path.join(self._dir.name, "alarm.txt")
         self.rollout = os.path.join(self._dir.name, "rollout.jsonl")
+        self.board = _StubBoard()
+        self.board_url = self.board.start()
 
     def tearDown(self):
+        self.board.stop()
         self._dir.cleanup()
 
     def _env(self):
         return dict(os.environ,
                     RB_REPAIR_STATE=self.state, RB_REPAIR_LOG=self.logp,
-                    RB_REPAIR_ALARM=self.alarm, AG_ROLLOUT=self.rollout)
+                    RB_REPAIR_ALARM=self.alarm, AG_ROLLOUT=self.rollout,
+                    RB_BOARD=self.board_url)
 
     def st(self):
         with open(self.state, encoding="utf-8") as f:
@@ -418,8 +473,6 @@ class V22Concurrency(unittest.TestCase):
         # 父进程收齐两个 WAITING 才放行 → 放行时两者都已撞过这把锁。
         sys.path.insert(0, os.path.join(HERE, "configs"))
         import repair_gate as rg
-        import queue as _q
-        import threading as _th
         cfg_dir = os.path.join(HERE, "configs")
         wrapper = (
             "import sys\n"
@@ -439,25 +492,17 @@ class V22Concurrency(unittest.TestCase):
         children = []
         barrier_ok = False
 
-        def _readline_bounded(stream, secs=30):
-            q = _q.Queue()
-            _th.Thread(target=lambda: q.put(stream.readline()), daemon=True).start()
-            try:
-                return q.get(timeout=secs)
-            except _q.Empty:
-                raise AssertionError("子进程 WAITING/READY 行超时(启动失败?)")
-
         try:
             rg._lock_exclusive(lf)             # 父进程持锁 = 屏障
             for _ in range(2):
                 e = self._child_env()
                 cp = subprocess.Popen([PY, "-c", wrapper], stdin=subprocess.PIPE,
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=e)
+                children.append(cp)   # P3-2:先入清理列表,再写 stdin(防写入期异常漏清理)
                 cp.stdin.write(json.dumps({"hook_event_name": "PostToolUse",
                                            "session_id": "v22", "tool_name": "Read",
                                            "tool_input": {}}).encode("utf-8"))
                 cp.stdin.close()
-                children.append(cp)
             for cp in children:                # 确定性握手:收齐两个 WAITING 才放行
                 self.assertEqual(_readline_bounded(cp.stdout).strip(), b"WAITING",
                                  "子进程未实际遭遇锁竞争(非阻塞尝试未失败)")
@@ -529,7 +574,7 @@ class V22Concurrency(unittest.TestCase):
              sys.argv[0], self.state + ".claim"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            self.assertEqual(holder.stdout.readline().strip(), b"LOCKED")
+            self.assertEqual(_readline_bounded(holder.stdout).strip(), b"LOCKED")
             holder.stdout.close(); holder.stderr.close()
             t0 = time.time()
             holder.kill()                      # 异常退出（非正常释放）
@@ -579,6 +624,235 @@ class V22Concurrency(unittest.TestCase):
         finally:
             rg._unlock(lf)
             lf.close()
+
+
+class V25ScanAndExec(unittest.TestCase):
+    """GPT round-16 P2-5:PostToolUse 增量扫描数据链 + 直执判据矩阵回归。
+    全部走内嵌 stub 看板(治理)与 RB_REPAIR_EXEC_CMD 桩(执行)——
+    不依赖本机 8765;POSIX 上连 wsl 都不需要(执行桩走 bash 直连)。"""
+
+    ORDER = '修复单:: post_comment {"thread_id": 31, "body": "hi"}'
+    ARGS = '{"thread_id": 31, "body": "hi"}'
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        d = self._dir.name
+        self.state = os.path.join(d, "state.json")
+        self.logp = os.path.join(d, "log.txt")
+        self.alarm = os.path.join(d, "alarm.txt")
+        self.rollout = os.path.join(d, "rollout.jsonl")
+        open(self.rollout, "w", encoding="utf-8").close()
+        self.board = _StubBoard()
+        self.board_url = self.board.start()
+
+    def tearDown(self):
+        self.board.stop()
+        self._dir.cleanup()
+
+    def _wsl_path(self, win_path):
+        """Windows 路径 → WSL 形态(/mnt/c/...)。不是 Git-Bash 的 /c/...——
+        直执子进程经 wsl -e bash 执行,必须用 WSL 路径(round-16 调试实证)。"""
+        p = win_path.replace("\\", "/")
+        if len(p) > 1 and p[1] == ":":
+            p = "/mnt/" + p[0].lower() + p[2:]
+        return p
+
+    def _env(self, exec_stub=False):
+        e = dict(os.environ,
+                 RB_REPAIR_STATE=self.state, RB_REPAIR_LOG=self.logp,
+                 RB_REPAIR_ALARM=self.alarm, AG_ROLLOUT=self.rollout,
+                 RB_BOARD=self.board_url, RB_REPAIR_DRYRUN="0")
+        if exec_stub:
+            stub = os.path.join(self._dir.name, "stub.sh")
+            with open(stub, "w", encoding="utf-8", newline="\n") as f:
+                f.write('#!/bin/sh\ncat "$(dirname "$0")/stub.sh.out"\n')
+            cmd = "bash %s/stub.sh {short} {b64}" % self._wsl_path(
+                os.path.join(self._dir.name))
+            e["RB_REPAIR_EXEC_CMD"] = cmd
+        return e
+
+    def _stub_out(self, text):
+        """写执行桩的返回体(stub.sh 会 cat 它)。"""
+        stub = os.path.join(self._dir.name, "stub.sh")
+        if not os.path.exists(stub):
+            with open(stub, "w", encoding="utf-8", newline="\n") as f:
+                f.write('#!/bin/sh\ncat "$(dirname "$0")/stub.sh.out"\n')
+        with open(os.path.join(self._dir.name, "stub.sh.out"), "w",
+                  encoding="utf-8", newline="\n") as f:
+            f.write(text)
+
+    def _run(self, env, text=None, post=True):
+        payload = {"hook_event_name": "PostToolUse" if post else "Stop",
+                   "session_id": "v25", "tool_name": "Read", "tool_input": {}}
+        if text is not None:
+            payload["last_message"] = {"role": "assistant", "content": text}
+        r = subprocess.run([PY, GATE], input=json.dumps(payload, ensure_ascii=False)
+                           .encode("utf-8"), capture_output=True, env=env, timeout=60)
+        out = r.stdout.decode("utf-8", "replace").strip()
+        try:
+            return json.loads(out) if out else None
+        except ValueError:
+            return None
+
+    def _orders(self):
+        st = self.st()
+        return {k: v for k, v in st.items() if not k.startswith("_")}
+
+    def st(self):
+        with open(self.state, encoding="utf-8") as f:
+            return json.load(f)
+
+    def _append(self, text, newline=True):
+        with open(self.rollout, "a", encoding="utf-8", newline="") as f:
+            f.write(text + ("\n" if newline else ""))
+
+    # ── 1:PostToolUse 从 rollout 增量发现新修复单 ──
+    def test_a_order_discovered_from_delta(self):
+        e = self._env()
+        self._run(e)                       # 首轮:锚定当前位(空 rollout)
+        self.assertEqual(len(self._orders()), 0, "首轮只锚定不登记")
+        self._append(self.ORDER)
+        self._run(e)                       # PostToolUse:增量发现新单
+        st = self.st()
+        self.assertEqual(len(self._orders()), 1, "增量发现新修复单")
+        self.assertIn("_scan", st)
+
+    # ── 2:回执经增量读取 → 直执销账(经执行桩,全链) ──
+    def test_b_receipt_via_delta_completes_direct_exec(self):
+        e = self._env(exec_stub=True)
+        self._stub_out('{"thread_id": 31, "body": "hi", "ok": true}')
+        self._run(e)
+        self._append(self.ORDER)
+        self._run(e)
+        hid = list(self._orders())[0]
+        self._append("执行 " + hid)
+        out = self._run(e, post=False)     # Stop 事件也可(此处验证增量路径)
+        st = self.st()
+        self.assertTrue(st[hid].get("done"), "直执销账")
+        self.assertTrue(st[hid].get("exec_evidence"))
+        self.assertIsNone(out, "完成态静默放行")
+
+    # ── 3:未写完的尾行保留下轮,不被跳过 ──
+    def test_c_incomplete_tail_line_deferred(self):
+        e = self._env()
+        self._run(e)
+        self._append(self.ORDER)
+        self._run(e)
+        self.assertEqual(len(self._orders()), 1)
+        size_after_first = os.path.getsize(self.rollout)
+        # 追加完整第二单 + 半条第三单(无换行)
+        self._append(self.ORDER.replace('"thread_id": 31', '"thread_id": 32'))
+        partial = '修复单:: post_comment {"thread_id": 33, "bo'
+        self._append(partial, newline=False)
+        self._run(e)
+        st = self.st()
+        self.assertEqual(len(self._orders()), 2, "完整行被消费")
+        scan = st["_scan"]
+        self.assertLess(scan["off"], os.path.getsize(self.rollout),
+                        "偏移不越过未完成尾行")
+        self.assertGreater(scan["off"], size_after_first, "偏移推进到完整行末")
+        self._append('dy": "z"}\n')       # 补完半条
+        self._run(e)
+        self.assertEqual(len(self._orders()), 3, "补完后下轮读出第三单")
+
+    # ── 4:增量超过 1 MiB 不丢数据 ──
+    def test_d_large_delta_over_1mib(self):
+        e = self._env()
+        self._run(e)
+        pad = '{"pad": 1}'                 # ~10B 良性行
+        blob = "\n".join([pad] * 100000) + "\n" + self.ORDER + "\n"   # ≈1.2MiB
+        self._append(blob)
+        self.assertGreater(os.path.getsize(self.rollout) - 1, 1024 * 1024)
+        self._run(e)
+        self.assertEqual(len(self._orders()), 1, ">1MiB 增量末尾的修复单仍被发现")
+
+    # ── 5:文件轮转(身份变化)→ 重锚不误读 ──
+    def test_e_rotation_reanchors(self):
+        e = self._env()
+        self._run(e)                       # 锚定
+        st = self.st()
+        st["_scan"] = {"ts": time.time(), "off": 10 ** 9, "fid": "bogus"}
+        json.dump(st, open(self.state, "w", encoding="utf-8"))
+        self._append(self.ORDER)           # 若被误读会登记新单
+        self._run(e)
+        st = self.st()
+        self.assertEqual(len(self._orders()), 0, "轮转后不按旧偏移误读")
+        self.assertLess(st["_scan"]["off"], 10 ** 9, "重锚到当前文件末尾")
+
+    # ── 6:重复扫描同段不重复登记 ──
+    def test_f_no_double_register(self):
+        e = self._env()
+        self._run(e)
+        self._append(self.ORDER)
+        self._run(e)
+        self._run(e)                       # 无新增数据
+        self.assertEqual(len(self._orders()), 1, "同段不重复登记")
+
+    # ── 7:直执判据矩阵(P2-2)——无效返回不得销账 ──
+    def test_g_exec_rejects_invalid_returns(self):
+        for out_json, expect_done in (("false", False), ("null", False),
+                                      ("[]", False), ("0", False),
+                                      ('{"ok": false}', False),
+                                      ('{"success": false}', False),
+                                      ('{"thread_id": 31, "ok": true}', True)):
+            with self.subTest(out_json=out_json):
+                d = tempfile.mkdtemp(prefix="rg25g-")
+                try:                      # 每例独立目录,互不污染(桩仍指向 self._dir)
+                    env = dict(os.environ,
+                               RB_REPAIR_STATE=os.path.join(d, "state.json"),
+                               RB_REPAIR_LOG=os.path.join(d, "log.txt"),
+                               RB_REPAIR_ALARM=os.path.join(d, "alarm.txt"),
+                               AG_ROLLOUT=os.path.join(d, "rollout.jsonl"),
+                               RB_BOARD=self.board_url, RB_REPAIR_DRYRUN="0",
+                               RB_REPAIR_EXEC_CMD="bash %s/stub.sh {short} {b64}"
+                                                  % self._wsl_path(self._dir.name))
+                    self._stub_out(out_json)
+                    rollout = env["AG_ROLLOUT"]
+                    open(rollout, "w", encoding="utf-8").close()
+
+                    def run(text=None):
+                        payload = {"hook_event_name": "Stop", "session_id": "g",
+                                   "tool_name": "Read", "tool_input": {}}
+                        if text is not None:
+                            payload["last_message"] = {"role": "assistant",
+                                                       "content": text}
+                        r = subprocess.run([PY, GATE],
+                                           input=json.dumps(payload, ensure_ascii=False)
+                                           .encode("utf-8"), capture_output=True,
+                                           env=env, timeout=60)
+                        o = r.stdout.decode("utf-8", "replace").strip()
+                        try:
+                            return json.loads(o) if o else None
+                        except ValueError:
+                            return None
+
+                    run(self.ORDER)
+                    st = json.load(open(env["RB_REPAIR_STATE"], encoding="utf-8"))
+                    hid = [k for k in st if not k.startswith("_")][0]
+                    with open(rollout, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({"type": "assistant", "text": "执行 " + hid},
+                                           ensure_ascii=False) + "\n")
+                    run()
+                    st = json.load(open(env["RB_REPAIR_STATE"], encoding="utf-8"))
+                    self.assertEqual(bool(st[hid].get("done")), expect_done,
+                                     "out=%r done 期望 %s" % (out_json, expect_done))
+                    if not expect_done:
+                        self.assertTrue(st[hid].get("executing"), "未确认→executing 人工核")
+                finally:
+                    shutil.rmtree(d, ignore_errors=True)
+
+    # ── 8:治理拒绝理由传播(P2-3)——死端口板 → bounce 带具体理由 ──
+    def test_h_gov_reason_propagated(self):
+        e = self._env(exec_stub=True)
+        e["RB_BOARD"] = "http://127.0.0.1:9"
+        out = self._run(e, text=self.ORDER, post=False)     # 登记+确认步
+        self.assertIsNotNone(out)
+        hid = list(self._orders())[0]
+        self._append("执行 " + hid)
+        out = self._run(e, post=False)
+        self.assertIsNotNone(out, "治理拒绝退回")
+        self.assertIn("治理前置未过", out["reason"])
+        self.assertIn("看板不可达", out["reason"], "具体拒绝理由随 bounce 传给模型")
 
 
 if __name__ == "__main__":

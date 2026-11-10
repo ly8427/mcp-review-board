@@ -317,6 +317,46 @@ def rollout_after(payload, offset) -> str:
         return ""
 
 
+def _file_id(path):
+    """V2.5(P3-1):文件身份(轮转检测)。ino/dev 可用时优先,否则 mtime_ns+size。"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if getattr(st, "st_ino", 0) and getattr(st, "st_dev", 0):
+        return "i%d:%d" % (st.st_dev, st.st_ino)
+    return "m%d:s%d" % (st.st_mtime_ns, st.st_size)
+
+
+def rollout_complete_lines_after(payload, offset):
+    """V2.5(GPT round-16 P2-1):锚点之后的新增字节中,只取**完整 JSONL 行**
+    (以 \\n 结尾);返回 (完整行文本, 新偏移=锚点+完整行字节数)。
+    分块读到当前文件末尾——无 1 MiB 截断(截断+指针越界=数据永久丢失,旧缺陷);
+    未写完的尾行保留在文件里,偏移不越过它,下轮重读。轮转/锚点无效 → ("", -1)。"""
+    path = _rollout_path(payload)
+    if not path or not isinstance(offset, int) or offset < 0:
+        return "", -1
+    try:
+        if os.path.getsize(path) <= offset:
+            return "", offset
+        chunks = []
+        with open(path, "rb") as f:
+            f.seek(offset)
+            while True:
+                chunk = f.read(262144)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        raw = b"".join(chunks)
+        nl = raw.rfind(b"\n")
+        if nl < 0:
+            return "", offset            # 只有未完成尾行:一字不消费
+        keep = raw[:nl + 1]
+        return keep.decode("utf-8", "replace"), offset + len(keep)
+    except OSError:
+        return "", -1
+
+
 def _arg_variants(args: str):
     """参数以字符串形式出现时的已知序列化变体(漏配新形态=待核,不误核)。"""
     out = [args]
@@ -481,62 +521,72 @@ def _gov_check(tool: str, args: str):
         import quorum_guard_hook as qg  # 同目录;die() 走 SystemExit
     except Exception as e:
         return False, f"治理模块不可导入({e})——按 fail-closed 处理,转人工"
+    import contextlib
+    import io as _io
+    buf = _io.StringIO()
     try:
-        if tool == "mcp__review-board__create_thread":
-            qg.check_poll_marker()                       # F6:发起者打卡新鲜度
-            try:
-                names = json.loads(args).get("quorum") or []
-            except ValueError:
-                names = []
-            if names:
-                qg.check_quorum_names(names, qg.load_roster())   # 名单/形态/闸门
-        qg.board_alive()                                 # 全员:板不可达不执行
+        with contextlib.redirect_stderr(buf):
+            if tool == "mcp__review-board__create_thread":
+                qg.check_poll_marker()                       # F6:发起者打卡新鲜度
+                try:
+                    names = json.loads(args).get("quorum") or []
+                except ValueError:
+                    names = []
+                if names:
+                    qg.check_quorum_names(names, qg.load_roster())   # 名单/形态/闸门
+            qg.board_alive()                                 # 全员:板不可达不执行
         return True, ""
     except SystemExit:
-        return False, "治理前置未过(quorum_guard 拒绝,理由见 stderr)——请先修复前置再重开修复单"
+        # V2.5(P2-3):捕获 quorum_guard die() 写到 stderr 的**具体理由**随 bounce
+        # 传给模型——"自动修前置"必须让模型知道缺什么(打卡过期/名单不在册/板不可达)
+        reason = (buf.getvalue() or "").strip()
+        head = reason.splitlines()[0][:200] if reason else "quorum_guard 拒绝(理由未捕获)"
+        return False, f"治理前置未过:{head}——请先修复前置再重开修复单"
     except Exception as e:
         return False, f"治理检查异常({e})——按 fail-closed 处理,转人工"
 
 
 def _direct_exec(tool: str, args: str):
     """看板类直执:与 V1 派发同一条 rb.sh 通道,但由本脚本直接跑(不经模型)。
-    成功判据沿用 V1.5 口径:退出码 0 + 输出可解析为无 error 键的非空 JSON
-    (业务字段留待形状实证——每次把返回头 200 字节记日志,为逐工具补字段积累)。"""
+    成功判据(V2.5,GPT round-16 P2-2 收紧):退出码 0 + 输出可解析为 **JSON 对象**
+    + 无 error 键 + 无显式失败标志(ok=false/success=false)。false/null/0/[]
+    一律不算成功——无效返回不得销账。业务级成功字段仍是 DEBT #10 残余:
+    当前保证=「返回未被既有规则判失败」,不含「业务目标已确认实现」。
+    测试接缝:RB_REPAIR_EXEC_CMD 可替换命令模板({short}/{b64} 占位)。"""
     short = tool.replace("mcp__review-board__", "")
     b64 = base64.b64encode(args.encode("utf-8")).decode("ascii")
-    cmd = (f"~/opt/rb/rb.sh {short} \"$(printf %s {b64} | base64 -d)\"")
+    tmpl = os.environ.get(
+        "RB_REPAIR_EXEC_CMD",
+        '~/opt/rb/rb.sh {short} "$(printf %s {b64} | base64 -d)"')
+    cmd = tmpl.format(short=short, b64=b64)
     if DRYRUN:
         log("direct-exec-dryrun", f"{short} (dryrun,未触板)")
         return True, "dryrun"
     try:
-        r = subprocess.run(["wsl", "-e", "bash", "-c", cmd], capture_output=True,
-                           timeout=60)
+        if os.name == "nt":
+            r = subprocess.run(["wsl", "-e", "bash", "-c", cmd], capture_output=True,
+                               timeout=60)
+        else:
+            r = subprocess.run(["bash", "-c", cmd], capture_output=True, timeout=60)
     except Exception as e:
         return False, f"执行异常({e})"
     out = (r.stdout or b"").decode("utf-8", "replace").strip()
     log("direct-exec-shape", f"{short} rc={r.returncode} head={out[:200]!r}")  # V2③:形状实证
     if r.returncode != 0:
         return False, f"rb.sh 退出码 {r.returncode}: {(r.stderr or b'').decode('utf-8', 'replace')[:200]}"
+    if not out:
+        return False, "返回为空"
     try:
         parsed = json.loads(out)
     except ValueError:
         return False, f"返回不是 JSON: {out[:200]}"
-    if isinstance(parsed, dict) and parsed.get("error"):
+    if not isinstance(parsed, dict):
+        return False, f"返回非 JSON 对象({type(parsed).__name__}): {out[:200]}"
+    if parsed.get("error"):
         return False, f"返回带 error: {out[:200]}"
-    if not out:
-        return False, "返回为空"
+    if parsed.get("ok") is False or parsed.get("success") is False:
+        return False, f"返回显式失败标志: {out[:200]}"
     return True, out[:200]
-
-
-def _gov_and_exec(tool: str, args: str):
-    """治理前置 + 直执的组合入口。返回 (done, message)。
-    V2.1 起主流程拆用 _gov_check/_direct_exec 两阶段(副作用前持久化),本组合
-    仅供外部脚本/测试复用。"""
-    ok, why = _gov_check(tool, args)
-    if not ok:
-        return False, f"修复单治理前置未过:{why}"
-    done, detail = _direct_exec(tool, args)
-    return done, detail
 
 
 def main() -> None:
@@ -599,20 +649,35 @@ def main() -> None:
             cur = rollout_size(payload)
             if cur >= 0:
                 sc = state.get("_scan")
-                prev = sc.get("off") if isinstance(sc, dict) else None
-                if isinstance(prev, int) and 0 <= prev <= cur:
-                    for ln in rollout_after(payload, prev).splitlines():
+                prev_off = sc.get("off") if isinstance(sc, dict) else None
+                prev_fid = sc.get("fid") if isinstance(sc, dict) else None
+                fid = _file_id(_rollout_path(payload))
+                rescan = (isinstance(prev_off, int) and 0 <= prev_off <= cur
+                          and (prev_fid is None or prev_fid == fid))
+                if rescan:
+                    # V2.5(P2-1):只消费完整 JSONL 行,偏移推进到完整行末——
+                    # >1MiB 分块全读(无截断丢数据);未写完的尾行保留下轮重读
+                    text, new_off = rollout_complete_lines_after(payload, prev_off)
+                    for ln in text.splitlines():
                         ln = ln.strip()
                         if not ln:
                             continue
                         try:
                             rec = json.loads(ln)     # rollout 行是 JSON 记录:解析后递归抽串,
                         except ValueError:           # 否则嵌在 text 字段里的回执/单子匹配不到
-                            rec = ln                 # 非 JSON 行按原文本扫(保守)
-                        for s in candidate_strings(rec):
-                            scan_text(s)
-                # 存 dict 形态(load_state 只保留 dict 条目——存整数会被过滤丢掉)
-                state["_scan"] = {"ts": now, "off": cur}   # 首轮/轮转都重锚当前位,绝不全扫
+                            log("scan-nonjson-line", ln[:60])   # V2.5:非 JSON 行可观测
+                            scan_text(ln)            # 非 JSON 行按原文本扫(注释即承诺)
+                            continue
+                        for sx in candidate_strings(rec):
+                            scan_text(sx)
+                    # 存 dict 形态(load_state 只保留 dict 条目——存整数会被过滤丢掉)
+                    state["_scan"] = {"ts": now, "off": new_off, "fid": fid}
+                else:
+                    # 首轮/轮转(文件身份变化)/锚点越界 → 重锚当前位,绝不全扫;
+                    # 轮转留一行日志(P3-1:身份入游标,替换后旧偏移不再误读新文件)
+                    log("scan-anchor" if prev_off is None else "scan-rotated",
+                        f"off={cur} fid={fid}")
+                    state["_scan"] = {"ts": now, "off": cur, "fid": fid}
 
             # ---- 回执落账(L4) ----
             for h, act in receipts.items():
