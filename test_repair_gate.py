@@ -329,7 +329,7 @@ class Harness(unittest.TestCase):
 # ═══════════════ V2.2/V2.3（GPT round-10/11）：跨进程互斥回归 ═══════════════
 # GPT round-11 点名五用例（要求提交进仓库、可反复运行，双进程用真 OS 进程 +
 # 同步屏障，而非单线程 mock）：
-#   1 双进程同单竞争   → _direct_exec 恰一次
+#   1 双进程同单竞争   → _direct_exec 恰一次（WAITING 握手:已实际撞锁才算就位）
 #   2 后到进程重读状态 → 看到 executing/done 不执行副作用
 #   3 锁持有者异常退出 → OS 回收锁,另一进程可立即取得
 #   4 TTL 超期         → executing 条目保留、报警、不重执行
@@ -412,21 +412,40 @@ class V22Concurrency(unittest.TestCase):
     def test_t3_two_real_processes_claim_exactly_once(self):
         self._seed()
         self._receipt()
-        # 确定性同步屏障（GPT round-12 P2:1.5s 定时不构成必然竞争）——
-        # 子进程先打 READY 再尝试取锁;父进程收齐两个 READY 才放行。
-        # 放行时两个子进程都已阻塞在锁请求上 = 必然真竞争。
+        # 确定性同步屏障 V2（GPT round-14 P2:READY 只证明"到达打印行",
+        # 不证明"已阻塞在锁上"）——子进程先实际尝试一次非阻塞取锁
+        # (父进程持锁,必失败),失败后才发 WAITING;WAITING = 已真实遭遇竞争。
+        # 父进程收齐两个 WAITING 才放行 → 放行时两者都已撞过这把锁。
         sys.path.insert(0, os.path.join(HERE, "configs"))
         import repair_gate as rg
+        import queue as _q
+        import threading as _th
         cfg_dir = os.path.join(HERE, "configs")
         wrapper = (
             "import sys\n"
             "sys.path.insert(0, r'" + cfg_dir.replace("\\", "/") + "')\n"
-            "print('READY', flush=True)\n"      # 取锁前就位信号
-            "import repair_gate\n"
-            "repair_gate.main()\n"
+            "import repair_gate as rg\n"
+            "f = open(rg.STATE_PATH + '.claim', 'a+')\n"
+            "try:\n"
+            "    rg._try_lock(f)\n"              # 非阻塞尝试:父持锁,必失败
+            "except OSError:\n"
+            "    pass\n"
+            "else:\n"
+            "    raise AssertionError('child acquired lock before barrier')\n"
+            "print('WAITING', flush=True)\n"     # 信号 = 已实际遭遇锁竞争
+            "rg.main()\n"                        # main 内有界等待→父放行后真正竞争
         )
         lf = open(self.state + ".claim", "a+")
         children = []
+
+        def _readline_bounded(stream, secs=30):
+            q = _q.Queue()
+            _th.Thread(target=lambda: q.put(stream.readline()), daemon=True).start()
+            try:
+                return q.get(timeout=secs)
+            except _q.Empty:
+                raise AssertionError("子进程 WAITING/READY 行超时(启动失败?)")
+
         try:
             rg._lock_exclusive(lf)             # 父进程持锁 = 屏障
             for _ in range(2):
@@ -438,17 +457,32 @@ class V22Concurrency(unittest.TestCase):
                                            "tool_input": {}}).encode("utf-8"))
                 cp.stdin.close()
                 children.append(cp)
-            for cp in children:                # 确定性握手:收齐两个 READY 才放行
-                self.assertEqual(cp.stdout.readline().strip(), b"READY",
-                                 "子进程未在取锁前就位")
-            rg._unlock(lf)                     # 双 READY 到齐 → 真竞争开始
+            for cp in children:                # 确定性握手:收齐两个 WAITING 才放行
+                self.assertEqual(_readline_bounded(cp.stdout).strip(), b"WAITING",
+                                 "子进程未实际遭遇锁竞争(非阻塞尝试未失败)")
+            rg._unlock(lf)                     # 双 WAITING 到齐 → 真竞争开始
         finally:
             lf.close()
-        for cp in children:
-            out, err = cp.communicate(timeout=60)
-            self.assertEqual(cp.returncode, 0, "子进程须正常退出(排除 fail-open 崩溃)")
-            self.assertEqual(err.decode("utf-8", "replace"), "",
-                             "stderr 须干净(排除被 fail-open 吞掉的异常)")
+        for cp in children:                    # 有界等待;失败(超时)才清理,防泄漏
+            try:
+                out, err = cp.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                cp.kill()
+                cp.communicate()
+                raise AssertionError("子进程 60s 未退出,已清理(泄漏防护)")
+            self.assertEqual(cp.returncode, 0,
+                             "子进程须正常退出(排除 fail-open 崩溃) rc=%s err=%r out=%r"
+                             % (cp.returncode, err.decode("utf-8", "replace")[:400], out[:200]))
+            err_d = err.decode("utf-8", "replace")
+            # stderr 断言语义(GPT round-14 的意图=排除 fail-open 吞异常,非字面真空):
+            # 禁止「内部错误(放行)」/ Traceback(fail-open 吞异常的两种痕迹);
+            # 容忍「领取锁忙」一行——那是输家 8s 等锁超时后合法的 fail-closed 降级,
+            # 行为正确(零副作用)且有留痕,不是异常。
+            self.assertNotIn("内部错误", err_d, "fail-open 吞异常 err=%r" % err_d[:400])
+            self.assertNotIn("Traceback", err_d, "裸 traceback err=%r" % err_d[:400])
+            if err_d.strip():
+                self.assertIn("领取锁忙", err_d,
+                              "stderr 非空且非已知合法降级行 err=%r" % err_d[:400])
         log = self._log()
         self.assertEqual(log.count("order-direct-done"), 1, "恰一次执行")
         self.assertEqual(log.count("direct-exec-dryrun"), 1, "恰一次 _direct_exec")
