@@ -437,6 +437,7 @@ class V22Concurrency(unittest.TestCase):
         )
         lf = open(self.state + ".claim", "a+")
         children = []
+        barrier_ok = False
 
         def _readline_bounded(stream, secs=30):
             q = _q.Queue()
@@ -461,9 +462,26 @@ class V22Concurrency(unittest.TestCase):
                 self.assertEqual(_readline_bounded(cp.stdout).strip(), b"WAITING",
                                  "子进程未实际遭遇锁竞争(非阻塞尝试未失败)")
             rg._unlock(lf)                     # 双 WAITING 到齐 → 真竞争开始
+            barrier_ok = True
         finally:
-            lf.close()
-        for cp in children:                    # 有界等待;失败(超时)才清理,防泄漏
+            # 失败路径统一清理(GPT round-15 P2):屏障未走通时,先释放父锁,
+            # 再回收全部已启动子进程——防"失败测试留下仍在跑的子进程访问
+            # 临时目录/污染后续测试"。正常路径(barrier_ok)跳过 kill:放行后
+            # 子进程在合法运行主流程,由下方 communicate 有界等待自然回收。
+            try:
+                rg._unlock(lf)
+            except Exception:
+                pass  # 正常路径已释放;幂等兜底
+            if not barrier_ok:
+                for cp in children:
+                    if cp.poll() is None:
+                        cp.kill()
+                    try:                       # 失败路径回收资源(含已退出者)
+                        cp.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        cp.kill()
+                        cp.communicate()
+        for cp in children:                    # 全路径回收资源;有界等待防泄漏
             try:
                 out, err = cp.communicate(timeout=60)
             except subprocess.TimeoutExpired:
@@ -477,7 +495,7 @@ class V22Concurrency(unittest.TestCase):
             # stderr 断言语义(GPT round-14 的意图=排除 fail-open 吞异常,非字面真空):
             # 禁止「内部错误(放行)」/ Traceback(fail-open 吞异常的两种痕迹);
             # 容忍「领取锁忙」一行——那是输家 8s 等锁超时后合法的 fail-closed 降级,
-            # 行为正确(零副作用)且有留痕,不是异常。
+            # 行为正确(零副作用)且只留着当记录,不是异常。
             self.assertNotIn("内部错误", err_d, "fail-open 吞异常 err=%r" % err_d[:400])
             self.assertNotIn("Traceback", err_d, "裸 traceback err=%r" % err_d[:400])
             if err_d.strip():
