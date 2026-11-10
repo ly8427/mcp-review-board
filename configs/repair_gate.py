@@ -149,7 +149,17 @@ def load_state() -> dict:
     if not isinstance(st, dict):
         return {}
     now = time.time()
-    return {h: v for h, v in st.items() if isinstance(v, dict) and now - v.get("ts", 0) < STATE_TTL}
+
+    def _keep(v):
+        if not isinstance(v, dict):
+            return False
+        fresh = now - v.get("ts", 0) < STATE_TTL
+        # V2.2(GPT round-10 P2):executing 未完成/已报警的条目不随 TTL 静默过期——
+        # 副作用结果未定的记录消失 = 下一轮重执行风险;超期走报警留档,不删除
+        pinned = (v.get("executing") and not v.get("done")) or v.get("alarm")
+        return fresh or pinned
+
+    return {h: v for h, v in st.items() if _keep(v)}
 
 
 def save_state(st: dict) -> bool:
@@ -182,6 +192,36 @@ def _save_failure_alarm() -> None:
     except OSError:
         pass
     sys.stderr.write(f"[repair-gate] {msg}\n")
+
+
+# ---- V2.2(GPT round-10 P1):跨进程互斥原语 ----
+# msvcrt.locking(LK_LOCK) = 阻塞重试约 10 秒后抛 OSError(Windows 主宿主);
+# fcntl.flock(LOCK_EX) = 阻塞等待(POSIX/WSL)。领取锁失败 = 本轮回不做任何
+# 副作用(fail-closed)——宁可推迟到下一轮,不可双执行。
+def _lock_exclusive(f):
+    try:
+        import msvcrt
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        f.seek(0, 2)
+    except ImportError:
+        import fcntl
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock(f):
+    try:
+        f.seek(0)
+        import msvcrt
+        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    except ImportError:
+        try:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def candidate_strings(payload):
@@ -508,182 +548,214 @@ def main() -> None:
     for s in candidate_strings(payload):
         scan_text(s)
 
-    state = load_state()
-    now = time.time()
+    # ---- V2.2(GPT round-10 P1):跨进程互斥——读→处理→存全程单飞 ----
+    # Stop 与 PostToolUse 两入口可能并发:整台状态机(领单检查→executing 持久化→
+    # 执行→结果落盘)持同一把排他锁串行;后到者要么排队等锁后重读最新状态
+    # (看到 executing/done 即不再执行),要么等锁超时放行本回合(fail-closed)。
+    # V2.1 的两阶段纪律(状态落盘先于副作用)在锁内保持不变。
+    _lf = None
+    try:
+        _lf = open(STATE_PATH + ".claim", "a+")
+        try:
+            _lock_exclusive(_lf)
+        except OSError:
+            log("claim-lock-busy", "另一钩子实例处理中——本轮回放行,不做任何副作用")
+            sys.stderr.write("[repair-gate] 领取锁忙,本轮回放行(fail-closed)\n")
+            allow()
+        try:
+            state = load_state()
+            now = time.time()
 
-    # ---- V2②:rollout 增量扫描(PostToolUse 时机) ----
-    # PostToolUse 载荷不含助手正文(正文在 rollout)——持久扫描偏移,每次只扫
-    # 上次锚点之后的新增字节;首锚=当前字节位(历史引用一律无效,L3 同款)。
-    cur = rollout_size(payload)
-    if cur >= 0:
-        sc = state.get("_scan")
-        prev = sc.get("off") if isinstance(sc, dict) else None
-        if isinstance(prev, int) and 0 <= prev <= cur:
-            for ln in rollout_after(payload, prev).splitlines():
-                ln = ln.strip()
-                if not ln:
+            # ---- V2②:rollout 增量扫描(PostToolUse 时机) ----
+            # PostToolUse 载荷不含助手正文(正文在 rollout)——持久扫描偏移,每次只扫
+            # 上次锚点之后的新增字节;首锚=当前字节位(历史引用一律无效,L3 同款)。
+            cur = rollout_size(payload)
+            if cur >= 0:
+                sc = state.get("_scan")
+                prev = sc.get("off") if isinstance(sc, dict) else None
+                if isinstance(prev, int) and 0 <= prev <= cur:
+                    for ln in rollout_after(payload, prev).splitlines():
+                        ln = ln.strip()
+                        if not ln:
+                            continue
+                        try:
+                            rec = json.loads(ln)     # rollout 行是 JSON 记录:解析后递归抽串,
+                        except ValueError:           # 否则嵌在 text 字段里的回执/单子匹配不到
+                            rec = ln                 # 非 JSON 行按原文本扫(保守)
+                        for s in candidate_strings(rec):
+                            scan_text(s)
+                # 存 dict 形态(load_state 只保留 dict 条目——存整数会被过滤丢掉)
+                state["_scan"] = {"ts": now, "off": cur}   # 首轮/轮转都重锚当前位,绝不全扫
+
+            # ---- 回执落账(L4) ----
+            for h, act in receipts.items():
+                v = state.get(h)
+                if not v:
+                    log("receipt-unknown", h)
                     continue
-                try:
-                    rec = json.loads(ln)     # rollout 行是 JSON 记录:解析后递归抽串,
-                except ValueError:           # 否则嵌在 text 字段里的回执/单子匹配不到
-                    rec = ln                 # 非 JSON 行按原文本扫(保守)
-                for s in candidate_strings(rec):
-                    scan_text(s)
-        # 存 dict 形态(load_state 只保留 dict 条目——存整数会被过滤丢掉)
-        state["_scan"] = {"ts": now, "off": cur}   # 首轮/轮转都重锚当前位,绝不全扫
+                if act == "误报" and not v.get("done"):
+                    v["void"] = True
+                    v["done"] = True
+                    log("order-void", f"{h} {v.get('tool')}")
+                elif act == "执行" and not v.get("confirmed"):
+                    v["confirmed"] = True
+                    log("order-confirmed", h)
 
-    # ---- 回执落账(L4) ----
-    for h, act in receipts.items():
-        v = state.get(h)
-        if not v:
-            log("receipt-unknown", h)
-            continue
-        if act == "误报" and not v.get("done"):
-            v["void"] = True
-            v["done"] = True
-            log("order-void", f"{h} {v.get('tool')}")
-        elif act == "执行" and not v.get("confirmed"):
-            v["confirmed"] = True
-            log("order-confirmed", h)
+            # ---- 新单登记(F3:独立编号) ----
+            for (tool, args) in orders:
+                h = alloc_order_id(state, tool, args)
+                state[h] = {"ts": now, "bounces": 0, "confirmed": False, "tool": tool, "args": args}
+                log("order-register", f"{h} {tool}")
 
-    # ---- 新单登记(F3:独立编号) ----
-    for (tool, args) in orders:
-        h = alloc_order_id(state, tool, args)
-        state[h] = {"ts": now, "bounces": 0, "confirmed": False, "tool": tool, "args": args}
-        log("order-register", f"{h} {tool}")
-
-    # ---- 台账状态机:驱动所有未结条目(不依赖正文提取,V1.2) ----
-    msgs = []
-    need_bounce = False
-    for h, v in list(state.items()):
-        if h.startswith("_"):
-            continue   # V2②:_scan 等内部键不是票据
-        if v.get("done") or v.get("void") or v.get("alarm"):
-            continue
-        if v.get("executing") and not v.get("done"):
-            # V2.1(P1-1):executing 已持久化 = 副作用窗口曾打开——本地无法区分
-            # 「已写成功但完成态没落盘」与「写了没成功」,绝不自动重执行;
-            # 转人工核,封顶后报警(GPT round-9:交给核验或人工)
-            if v.get("bounces", 0) >= MAX_BOUNCES:
-                v["alarm"] = True
-                try:
-                    with open(ALARM_PATH, "a", encoding="utf-8") as f:
-                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} 修复单 {h} {v.get('tool')} "
-                                f"executing 状态多轮未核(执行结果未确认),转人工\n")
-                except OSError:
-                    pass
-                log("order-alarm-executing", h)
-                sys.stderr.write(f"[repair-gate] 修复单 {h} 执行结果未确认,转人工\n")
-                continue
-            v["bounces"] = v.get("bounces", 0) + 1
-            msgs.append(f"修复单 {h} 处于 executing(执行已发起、完成态未落盘)。为防重复写入"
-                        f"不会自动重试——请人工核对该写入是否已在看板上:在→结束回合;"
-                        f"不在→重开新修复单。累计 {v['bounces']}/{MAX_BOUNCES}。")
-            need_bounce = True
-            continue
-        tool, args = v.get("tool", ""), v.get("args", "")
-        if not v.get("confirmed"):
-            if v.get("bounces", 0) >= 2:
-                v["void"] = True
-                v["done"] = True
-                log("order-stale-void", h)
-                continue
-            v["bounces"] = v.get("bounces", 0) + 1
-            msgs.append(
-                f"修复单 {h} 已登记(工具 {tool},参数 {args})。防误触发确认步——"
-                f"真实修复:单独一行回复『执行 {h}』;"
-                f"只是讨论中引用了格式:单独一行回复『误报 {h}』作废。"
-                f"两次无回执将自动作废。")
-            need_bounce = True
-        elif not v.get("dispatched"):
-            if tool in DIRECT_TOOLS:
-                # V2.1(GPT round-9 P1-1/P1-2):直执两阶段化——
-                #   阶段0 治理检查(纯读,无副作用,失败可重试但受封顶);
-                #   阶段1 治理过 → 先把 executing 状态持久化成功(F6:状态落盘先于副作用),
-                #         落盘失败 → 报警放行,绝不执行;
-                #   阶段2 执行;成功 → done+证据落盘(再落盘失败也不重执——下轮看到
-                #         executing 无 done → 转人工核,绝不重复写);
-                #         未确认成功 → 保持 executing,转人工核(副作用窗口本地不可判,
-                #         绝不自动重试——GPT round-9:交给核验或人工)。
-                v["bounces"] = v.get("bounces", 0) + 1
-                ok_gov, why_gov = _gov_check(tool, args)
-                if not ok_gov:
-                    # 治理拒绝:无副作用,可修前置后重试——但封顶(P1-2:此前漏封)
+            # ---- 台账状态机:驱动所有未结条目(不依赖正文提取,V1.2) ----
+            msgs = []
+            need_bounce = False
+            for h, v in list(state.items()):
+                if h.startswith("_"):
+                    continue   # V2②:_scan 等内部键不是票据
+                if v.get("done") or v.get("void") or v.get("alarm"):
+                    continue
+                if v.get("executing") and not v.get("done"):
+                    # V2.2(GPT round-10 P2):executing 超 TTL(24h)未人工核 → 报警留行,
+                    # 但条目保留不删(load_state 已豁免其过期)——静默消失 = 重执行风险
+                    if now - v.get("ts", 0) >= STATE_TTL and not v.get("stale_alarmed"):
+                        v["stale_alarmed"] = True
+                        try:
+                            with open(ALARM_PATH, "a", encoding="utf-8") as f:
+                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} 修复单 {h} {v.get('tool')} "
+                                        f"executing 超24h未人工核——条目保留不删,请尽快人工核对看板\n")
+                        except OSError:
+                            pass
+                        log("order-executing-stale", h)
+                        sys.stderr.write(f"[repair-gate] 修复单 {h} executing 超24h未核,已报警留档\n")
+                    # V2.1(P1-1):executing 已持久化 = 副作用窗口曾打开——本地无法区分
+                    # 「已写成功但完成态没落盘」与「写了没成功」,绝不自动重执行;
+                    # 转人工核,封顶后报警(GPT round-9:交给核验或人工)
                     if v.get("bounces", 0) >= MAX_BOUNCES:
                         v["alarm"] = True
                         try:
                             with open(ALARM_PATH, "a", encoding="utf-8") as f:
-                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} 修复单 {h} {tool} "
-                                        f"治理前置多次未过({why_gov[:80]}),转人工\n")
+                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} 修复单 {h} {v.get('tool')} "
+                                        f"executing 状态多轮未核(执行结果未确认),转人工\n")
                         except OSError:
                             pass
-                        log("order-alarm-gov", h)
-                        sys.stderr.write(f"[repair-gate] 修复单 {h} 治理前置多次未过,转人工\n")
+                        log("order-alarm-executing", h)
+                        sys.stderr.write(f"[repair-gate] 修复单 {h} 执行结果未确认,转人工\n")
                         continue
-                    msgs.append(f"修复单 {h} 治理前置未过:{why_gov}(下轮自动重试治理检查,"
-                                f"累计 {v['bounces']}/{MAX_BOUNCES} 次后转人工)")
+                    v["bounces"] = v.get("bounces", 0) + 1
+                    msgs.append(f"修复单 {h} 处于 executing(执行已发起、完成态未落盘)。为防重复写入"
+                                f"不会自动重试——请人工核对该写入是否已在看板上:在→结束回合;"
+                                f"不在→重开新修复单。累计 {v['bounces']}/{MAX_BOUNCES}。")
                     need_bounce = True
                     continue
-                # 阶段1:副作用前持久化 executing 意图——失败绝不执行(F6)
-                v["executing"] = True
-                v["dispatch_offset"] = rollout_size(payload)
-                if not save_state(state):
-                    _save_failure_alarm()
-                    allow()   # 状态没落盘 → 不驱动副作用,报警放行
-                # 阶段2:执行
-                done, detail = _direct_exec(tool, args)
-                if done:
-                    v["done"] = True
-                    v["finished"] = now
-                    v["direct"] = True
-                    v["exec_evidence"] = detail[:200]
-                    log("order-direct-done", f"{h} {tool} {detail[:120]}")
-                    continue   # done 落盘统一走末尾 save;若这次落盘失败,下轮走 executing 人工核,不重执
-                # 未确认成功:保持 executing——下轮转人工核,绝不自动重试
-                v["exec_unconfirmed"] = detail[:200]
-                log("order-direct-unconfirmed", f"{h} {tool} {detail[:120]}")
-                msgs.append(f"修复单 {h} 直执未确认成功:{detail}。为防重复写入,本单不会自动重试——"
-                            f"请人工核对看板上是否已有该写入:有→直接结束回合即可;没有→重开新修复单。")
-                need_bounce = True
-                continue
-            v["dispatched"] = True
-            v["dispatch_offset"] = rollout_size(payload)  # F1:核销锚点=此刻文件字节位
-            v["bounces"] = v.get("bounces", 0) + 1
-            msgs.append(dispatch_instruction(h, tool, args))
-            need_bounce = True
-        else:
-            if verify_execution(payload, tool, args, v.get("dispatch_offset")):
-                v["done"] = True
-                v["finished"] = now
-                log("order-done", f"{h} {tool}")
-                continue
-            if v.get("bounces", 0) >= MAX_BOUNCES:
-                v["alarm"] = True
-                try:
-                    with open(ALARM_PATH, "a", encoding="utf-8") as f:
-                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} 修复单 {h} {tool} {args} "
-                                f"多次派发未完成,转人工处理\n")
-                except OSError:
-                    pass
-                log("order-alarm", h)
-                # 报警文件的独立备份信号:标准错误流(宿主钩子日志可见)
-                sys.stderr.write(f"[repair-gate] 修复单 {h} {tool} 多次派发未完成,转人工"
-                                 f"(报警文件 {ALARM_PATH})\n")
-                continue  # 放行收工,报警文件留痕
-            v["bounces"] = v.get("bounces", 0) + 1
-            msgs.append(
-                f"修复单 {h} 在派发之后的原始会话记录中未找到『{tool} 以指定参数执行"
-                f"且结果成功』的证据。若确已执行成功,直接结束回合即可(本闸下次会核到);"
-                f"若尚未执行或执行失败,按派发指令继续或重开修复单。")
-            need_bounce = True
+                tool, args = v.get("tool", ""), v.get("args", "")
+                if not v.get("confirmed"):
+                    if v.get("bounces", 0) >= 2:
+                        v["void"] = True
+                        v["done"] = True
+                        log("order-stale-void", h)
+                        continue
+                    v["bounces"] = v.get("bounces", 0) + 1
+                    msgs.append(
+                        f"修复单 {h} 已登记(工具 {tool},参数 {args})。防误触发确认步——"
+                        f"真实修复:单独一行回复『执行 {h}』;"
+                        f"只是讨论中引用了格式:单独一行回复『误报 {h}』作废。"
+                        f"两次无回执将自动作废。")
+                    need_bounce = True
+                elif not v.get("dispatched"):
+                    if tool in DIRECT_TOOLS:
+                        # V2.1(GPT round-9 P1-1/P1-2):直执两阶段化——
+                        #   阶段0 治理检查(纯读,无副作用,失败可重试但受封顶);
+                        #   阶段1 治理过 → 先把 executing 状态持久化成功(F6:状态落盘先于副作用),
+                        #         落盘失败 → 报警放行,绝不执行;
+                        #   阶段2 执行;成功 → done+证据落盘(再落盘失败也不重执——下轮看到
+                        #         executing 无 done → 转人工核,绝不重复写);
+                        #         未确认成功 → 保持 executing,转人工核(副作用窗口本地不可判,
+                        #         绝不自动重试——GPT round-9:交给核验或人工)。
+                        v["bounces"] = v.get("bounces", 0) + 1
+                        ok_gov, why_gov = _gov_check(tool, args)
+                        if not ok_gov:
+                            # 治理拒绝:无副作用,可修前置后重试——但封顶(P1-2:此前漏封)
+                            if v.get("bounces", 0) >= MAX_BOUNCES:
+                                v["alarm"] = True
+                                try:
+                                    with open(ALARM_PATH, "a", encoding="utf-8") as f:
+                                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} 修复单 {h} {tool} "
+                                                f"治理前置多次未过({why_gov[:80]}),转人工\n")
+                                except OSError:
+                                    pass
+                                log("order-alarm-gov", h)
+                                sys.stderr.write(f"[repair-gate] 修复单 {h} 治理前置多次未过,转人工\n")
+                                continue
+                            msgs.append(f"修复单 {h} 治理前置未过:{why_gov}(下轮自动重试治理检查,"
+                                        f"累计 {v['bounces']}/{MAX_BOUNCES} 次后转人工)")
+                            need_bounce = True
+                            continue
+                        # 阶段1:副作用前持久化 executing 意图——失败绝不执行(F6)
+                        v["executing"] = True
+                        v["dispatch_offset"] = rollout_size(payload)
+                        if not save_state(state):
+                            _save_failure_alarm()
+                            allow()   # 状态没落盘 → 不驱动副作用,报警放行
+                        # 阶段2:执行
+                        done, detail = _direct_exec(tool, args)
+                        if done:
+                            v["done"] = True
+                            v["finished"] = now
+                            v["direct"] = True
+                            v["exec_evidence"] = detail[:200]
+                            log("order-direct-done", f"{h} {tool} {detail[:120]}")
+                            continue   # done 落盘统一走末尾 save;若这次落盘失败,下轮走 executing 人工核,不重执
+                        # 未确认成功:保持 executing——下轮转人工核,绝不自动重试
+                        v["exec_unconfirmed"] = detail[:200]
+                        log("order-direct-unconfirmed", f"{h} {tool} {detail[:120]}")
+                        msgs.append(f"修复单 {h} 直执未确认成功:{detail}。为防重复写入,本单不会自动重试——"
+                                    f"请人工核对看板上是否已有该写入:有→直接结束回合即可;没有→重开新修复单。")
+                        need_bounce = True
+                        continue
+                    v["dispatched"] = True
+                    v["dispatch_offset"] = rollout_size(payload)  # F1:核销锚点=此刻文件字节位
+                    v["bounces"] = v.get("bounces", 0) + 1
+                    msgs.append(dispatch_instruction(h, tool, args))
+                    need_bounce = True
+                else:
+                    if verify_execution(payload, tool, args, v.get("dispatch_offset")):
+                        v["done"] = True
+                        v["finished"] = now
+                        log("order-done", f"{h} {tool}")
+                        continue
+                    if v.get("bounces", 0) >= MAX_BOUNCES:
+                        v["alarm"] = True
+                        try:
+                            with open(ALARM_PATH, "a", encoding="utf-8") as f:
+                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} 修复单 {h} {tool} {args} "
+                                        f"多次派发未完成,转人工处理\n")
+                        except OSError:
+                            pass
+                        log("order-alarm", h)
+                        # 报警文件的独立备份信号:标准错误流(宿主钩子日志可见)
+                        sys.stderr.write(f"[repair-gate] 修复单 {h} {tool} 多次派发未完成,转人工"
+                                         f"(报警文件 {ALARM_PATH})\n")
+                        continue  # 放行收工,报警文件留痕
+                    v["bounces"] = v.get("bounces", 0) + 1
+                    msgs.append(
+                        f"修复单 {h} 在派发之后的原始会话记录中未找到『{tool} 以指定参数执行"
+                        f"且结果成功』的证据。若确已执行成功,直接结束回合即可(本闸下次会核到);"
+                        f"若尚未执行或执行失败,按派发指令继续或重开修复单。")
+                    need_bounce = True
 
-    if not save_state(state):
-        # F6:状态没落盘 → 停发一切派发/催办指令,报警转人工,放行收工
-        _save_failure_alarm()
-        allow()
-    if need_bounce:
-        bounce("[repair-gate] 修复单事务未结:\n" + "\n".join("- " + m for m in msgs))
-    allow()
+            if not save_state(state):
+                # F6:状态没落盘 → 停发一切派发/催办指令,报警转人工,放行收工
+                _save_failure_alarm()
+                allow()
+            if need_bounce:
+                bounce("[repair-gate] 修复单事务未结:\n" + "\n".join("- " + m for m in msgs))
+            allow()
+        finally:
+            _unlock(_lf)
+    finally:
+        if _lf is not None:
+            _lf.close()
 
 
 if __name__ == "__main__":
