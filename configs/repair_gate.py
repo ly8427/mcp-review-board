@@ -2,6 +2,14 @@
 # -*- coding: utf-8 -*-
 """repair-gate — 调用走样修复单机器闸(Stop/PostToolUse hook)。2026-10-26 用户批准实施。
 
+V2.1(2026-11-10):按 GPT round-9 评审收口两处 P1——
+  P1-1 直执两阶段化:治理检查(纯读)→ executing 状态持久化成功(失败=报警放行
+    绝不执行,F6"状态未持久化绝不驱动副作用"在此落地)→ 执行 → done+证据落盘。
+    任一环节断链,下轮看到 executing 无 done → 转人工核,绝不自动重执行
+    (副作用窗口本地不可判,防重复写入);executing 封顶 MAX_BOUNCES → 报警。
+  P1-2 治理拒绝分支补封顶(此前漏封:打卡持续不新鲜等场景会无限重试)。
+  另:direct-exec 成功判据弱(无业务字段校验)与 PostToolUse 首扫锚点两处 P2
+    维持 DEBT #10 残余留账(等返回形状实证/真实宿主验证)。
 V2.0(2026-11-10):按 docs/DEBT.md #10 落地脚本直接执行面与时机(批次4.1)——
   ① 看板类修复单脚本直执:post_comment/reply_comment/create_thread 三类确认后由
     本脚本直接经 WSL rb.sh 执行(不经模型重发,消走样病灶通道),执行前置
@@ -454,7 +462,9 @@ def _direct_exec(tool: str, args: str):
 
 
 def _gov_and_exec(tool: str, args: str):
-    """治理前置 + 直执的组合入口。返回 (done, message)。"""
+    """治理前置 + 直执的组合入口。返回 (done, message)。
+    V2.1 起主流程拆用 _gov_check/_direct_exec 两阶段(副作用前持久化),本组合
+    仅供外部脚本/测试复用。"""
     ok, why = _gov_check(tool, args)
     if not ok:
         return False, f"修复单治理前置未过:{why}"
@@ -550,6 +560,27 @@ def main() -> None:
             continue   # V2②:_scan 等内部键不是票据
         if v.get("done") or v.get("void") or v.get("alarm"):
             continue
+        if v.get("executing") and not v.get("done"):
+            # V2.1(P1-1):executing 已持久化 = 副作用窗口曾打开——本地无法区分
+            # 「已写成功但完成态没落盘」与「写了没成功」,绝不自动重执行;
+            # 转人工核,封顶后报警(GPT round-9:交给核验或人工)
+            if v.get("bounces", 0) >= MAX_BOUNCES:
+                v["alarm"] = True
+                try:
+                    with open(ALARM_PATH, "a", encoding="utf-8") as f:
+                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} 修复单 {h} {v.get('tool')} "
+                                f"executing 状态多轮未核(执行结果未确认),转人工\n")
+                except OSError:
+                    pass
+                log("order-alarm-executing", h)
+                sys.stderr.write(f"[repair-gate] 修复单 {h} 执行结果未确认,转人工\n")
+                continue
+            v["bounces"] = v.get("bounces", 0) + 1
+            msgs.append(f"修复单 {h} 处于 executing(执行已发起、完成态未落盘)。为防重复写入"
+                        f"不会自动重试——请人工核对该写入是否已在看板上:在→结束回合;"
+                        f"不在→重开新修复单。累计 {v['bounces']}/{MAX_BOUNCES}。")
+            need_bounce = True
+            continue
         tool, args = v.get("tool", ""), v.get("args", "")
         if not v.get("confirmed"):
             if v.get("bounces", 0) >= 2:
@@ -566,24 +597,53 @@ def main() -> None:
             need_bounce = True
         elif not v.get("dispatched"):
             if tool in DIRECT_TOOLS:
-                # V2①:看板类直执——脚本自己跑(治理前置+rb.sh),不经模型重发
+                # V2.1(GPT round-9 P1-1/P1-2):直执两阶段化——
+                #   阶段0 治理检查(纯读,无副作用,失败可重试但受封顶);
+                #   阶段1 治理过 → 先把 executing 状态持久化成功(F6:状态落盘先于副作用),
+                #         落盘失败 → 报警放行,绝不执行;
+                #   阶段2 执行;成功 → done+证据落盘(再落盘失败也不重执——下轮看到
+                #         executing 无 done → 转人工核,绝不重复写);
+                #         未确认成功 → 保持 executing,转人工核(副作用窗口本地不可判,
+                #         绝不自动重试——GPT round-9:交给核验或人工)。
                 v["bounces"] = v.get("bounces", 0) + 1
-                done, detail = _gov_and_exec(tool, args)
+                ok_gov, why_gov = _gov_check(tool, args)
+                if not ok_gov:
+                    # 治理拒绝:无副作用,可修前置后重试——但封顶(P1-2:此前漏封)
+                    if v.get("bounces", 0) >= MAX_BOUNCES:
+                        v["alarm"] = True
+                        try:
+                            with open(ALARM_PATH, "a", encoding="utf-8") as f:
+                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} 修复单 {h} {tool} "
+                                        f"治理前置多次未过({why_gov[:80]}),转人工\n")
+                        except OSError:
+                            pass
+                        log("order-alarm-gov", h)
+                        sys.stderr.write(f"[repair-gate] 修复单 {h} 治理前置多次未过,转人工\n")
+                        continue
+                    msgs.append(f"修复单 {h} 治理前置未过:{why_gov}(下轮自动重试治理检查,"
+                                f"累计 {v['bounces']}/{MAX_BOUNCES} 次后转人工)")
+                    need_bounce = True
+                    continue
+                # 阶段1:副作用前持久化 executing 意图——失败绝不执行(F6)
+                v["executing"] = True
+                v["dispatch_offset"] = rollout_size(payload)
+                if not save_state(state):
+                    _save_failure_alarm()
+                    allow()   # 状态没落盘 → 不驱动副作用,报警放行
+                # 阶段2:执行
+                done, detail = _direct_exec(tool, args)
                 if done:
                     v["done"] = True
                     v["finished"] = now
                     v["direct"] = True
+                    v["exec_evidence"] = detail[:200]
                     log("order-direct-done", f"{h} {tool} {detail[:120]}")
-                    continue
-                if "治理前置未过" in detail:
-                    # 治理拒绝可由模型修前置(开轮询打卡等)——保持未派发,下轮重试
-                    # 治理检查,自愈;封顶 MAX_BOUNCES 兜病理
-                    msgs.append(f"修复单 {h} {detail}(下轮自动重试治理检查)")
-                    need_bounce = True
-                    continue
-                # 执行失败(板不可达/返回异常)——回退 dispatched,下轮重试,封顶 MAX_BOUNCES
-                v["dispatched"] = False
-                msgs.append(f"修复单 {h} 直执失败:{detail}(下轮自动重试)")
+                    continue   # done 落盘统一走末尾 save;若这次落盘失败,下轮走 executing 人工核,不重执
+                # 未确认成功:保持 executing——下轮转人工核,绝不自动重试
+                v["exec_unconfirmed"] = detail[:200]
+                log("order-direct-unconfirmed", f"{h} {tool} {detail[:120]}")
+                msgs.append(f"修复单 {h} 直执未确认成功:{detail}。为防重复写入,本单不会自动重试——"
+                            f"请人工核对看板上是否已有该写入:有→直接结束回合即可;没有→重开新修复单。")
                 need_bounce = True
                 continue
             v["dispatched"] = True

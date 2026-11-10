@@ -26,15 +26,16 @@ stdin: hook payload JSON。规则（按严重度分级，机制与 quorum_guard_
 实证的路径与 in/out 用量字段）。宿主格式漂移时 R2 自动失效放行，不炸。
 """
 import json
+import os
+import sys
 
 # deny 文案统一 UTF-8(#54 #662 §3.2:stderr 默认随控制台 GBK,check-hooks 按 UTF-8 解码会乱码)
+# GPT round-9 P2 更正:reconfigure 必须在 import sys 之后(此前写在前面,
+# NameError 被 except 吞掉,UTF-8 配置实际未生效)
 try:
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
-
-import os
-import sys
 
 MAX_INPUT = int(os.environ.get("AG_MAX_INPUT", "50000"))
 TAIL_BYTES = 65536
