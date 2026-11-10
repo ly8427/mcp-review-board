@@ -151,27 +151,27 @@ class Harness(unittest.TestCase):
                              "```\n" + ORDER_LINE + "\n```\n仅引用示例。")
         self.assertEqual(rc, 0)
         self.assertIsNone(b)
-        self.assertEqual(self.st(), {})
+        self.assertEqual([k for k in self.st() if not k.startswith("_")], [])   # V2.6:忽略 _scan 内部键
 
     def test_bare_order_registers_unconfirmed(self):
         rc, b, _ = self.gate("开单说明文字超过三十个字符长度要求补足内容。\n"
                              + ORDER_LINE + "\n继续说明。")
         self.assertEqual(rc, 0)
         self.assertIsNotNone(b)
-        v = list(self.st().values())[0]
+        v = [x for k, x in self.st().items() if not k.startswith("_")][0]   # V2.6:忽略 _scan
         self.assertFalse(v["confirmed"])
 
     def test_non_whitelist_tool_rejected(self):
         rc, b, _ = self.gate("开单说明文字超过三十个字符长度要求补足内容。\n"
                              '修复单:: Bash {"command":"ls"}\n继续说明。')
         self.assertIsNone(b)
-        self.assertEqual(self.st(), {})
+        self.assertEqual([k for k in self.st() if not k.startswith("_")], [])   # V2.6:忽略 _scan 内部键
 
     def test_duplicate_order_lines_register_once(self):
         text = ("开单说明文字超过三十个字符长度要求补足内容。\n"
                 + ORDER_LINE + "\n" + ORDER_LINE + "\n继续说明。")
         self.gate(text)
-        self.assertEqual(len(self.st()), 1)
+        self.assertEqual(len([k for k in self.st() if not k.startswith("_")]), 1)   # V2.6:忽略 _scan
 
     # ---------- 回执（含短回执与并存边界） ----------
 
@@ -211,7 +211,7 @@ class Harness(unittest.TestCase):
         self.assertIsNotNone(b)
         rc, b, _ = self.gate("好。")   # 两次无回执 → 自动作废
         self.assertIsNone(b)
-        v = list(self.st().values())[0]
+        v = [x for k, x in self.st().items() if not k.startswith("_")][0]   # V2.6:忽略 _scan
         self.assertTrue(v["void"])
 
     # ---------- F1+F4+F5+F7 核销：同一条调用记录 + 配对的成功结果 ----------
@@ -747,7 +747,7 @@ class V25ScanAndExec(unittest.TestCase):
         self._run(e)
         st = self.st()
         self.assertEqual(len(self._orders()), 2, "完整行被消费")
-        scan = st["_scan"]
+        scan = st["_scan"]["sessions"]["v25"]
         self.assertLess(scan["off"], os.path.getsize(self.rollout),
                         "偏移不越过未完成尾行")
         self.assertGreater(scan["off"], size_after_first, "偏移推进到完整行末")
@@ -771,13 +771,16 @@ class V25ScanAndExec(unittest.TestCase):
         e = self._env()
         self._run(e)                       # 锚定
         st = self.st()
-        st["_scan"] = {"ts": time.time(), "off": 10 ** 9, "fid": "bogus"}
+        st["_scan"] = {"ts": time.time(),
+                       "sessions": {"v25": {"off": 10 ** 9, "fid": "bogus",
+                                            "size": 10 ** 9, "ts": time.time()}}}
         json.dump(st, open(self.state, "w", encoding="utf-8"))
         self._append(self.ORDER)           # 若被误读会登记新单
         self._run(e)
         st = self.st()
         self.assertEqual(len(self._orders()), 0, "轮转后不按旧偏移误读")
-        self.assertLess(st["_scan"]["off"], 10 ** 9, "重锚到当前文件末尾")
+        self.assertLess(st["_scan"]["sessions"]["v25"]["off"], 10 ** 9,
+                        "重锚到当前文件末尾")
 
     # ── 6:重复扫描同段不重复登记 ──
     def test_f_no_double_register(self):
@@ -802,13 +805,12 @@ class V25ScanAndExec(unittest.TestCase):
                                RB_REPAIR_STATE=os.path.join(d, "state.json"),
                                RB_REPAIR_LOG=os.path.join(d, "log.txt"),
                                RB_REPAIR_ALARM=os.path.join(d, "alarm.txt"),
-                               AG_ROLLOUT=os.path.join(d, "rollout.jsonl"),
                                RB_BOARD=self.board_url, RB_REPAIR_DRYRUN="0",
                                RB_REPAIR_EXEC_CMD="bash %s/stub.sh {short} {b64}"
                                                   % self._wsl_path(self._dir.name))
                     self._stub_out(out_json)
-                    rollout = env["AG_ROLLOUT"]
-                    open(rollout, "w", encoding="utf-8").close()
+                    env["RB_ROLLOUT_DIR"] = d   # 会话分区模式(P2-4/round-17 接缝)
+                    rollout = os.path.join(d, "model-io-session_g.jsonl")
 
                     def run(text=None):
                         payload = {"hook_event_name": "Stop", "session_id": "g",
@@ -855,5 +857,151 @@ class V25ScanAndExec(unittest.TestCase):
         self.assertIn("看板不可达", out["reason"], "具体拒绝理由随 bounce 传给模型")
 
 
+class V26Sessions(unittest.TestCase):
+    """GPT round-17:多 session 游标分区(P1)/ 原始会话 >1MiB 证据核验(P2)/
+    真实 JSONL 嵌套形态扫描(P2)/ 同 inode 截断重锚(P3)。"""
+
+    ORDER_CRON = '修复单:: CronDelete {"id":"42"}'
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.state = os.path.join(self._dir.name, "state.json")
+        self.logp = os.path.join(self._dir.name, "log.txt")
+        self.alarm = os.path.join(self._dir.name, "alarm.txt")
+        self.rdir = tempfile.mkdtemp(prefix="rg26roll-")
+        self.board = _StubBoard()
+        self.board_url = self.board.start()
+
+    def tearDown(self):
+        self.board.stop()
+        self._dir.cleanup()
+        shutil.rmtree(self.rdir, ignore_errors=True)
+
+    def _env(self):
+        return dict(os.environ,
+                    RB_REPAIR_STATE=self.state, RB_REPAIR_LOG=self.logp,
+                    RB_REPAIR_ALARM=self.alarm, RB_ROLLOUT_DIR=self.rdir,
+                    RB_BOARD=self.board_url, RB_REPAIR_DRYRUN="0")
+
+    def _sess_file(self, sid):
+        return os.path.join(self.rdir, "model-io-session_%s.jsonl" % sid)
+
+    def _run(self, sid, text=None):
+        payload = {"hook_event_name": "Stop", "session_id": sid,
+                   "tool_name": "Read", "tool_input": {}}
+        if text is not None:
+            payload["last_message"] = {"role": "assistant", "content": text}
+        r = subprocess.run([PY, GATE], input=json.dumps(payload, ensure_ascii=False)
+                           .encode("utf-8"), capture_output=True, env=self._env(),
+                           timeout=60)
+        out = r.stdout.decode("utf-8", "replace").strip()
+        try:
+            return json.loads(out) if out else None
+        except ValueError:
+            return None
+
+    def _st(self):
+        with open(self.state, encoding="utf-8") as f:
+            return json.load(f)
+
+    def _orders(self):
+        return {k: v for k, v in self._st().items() if not k.startswith("_")}
+
+    def _jsonl(self, sid, obj):
+        with open(self._sess_file(sid), "a", encoding="utf-8") as f:
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+    def _slot(self, sid):
+        return self._st().get("_scan", {}).get("sessions", {}).get(sid)
+
+    # ── S1(P1):A/B 交替触发,A 的新单与回执均不丢失 ──
+    def test_s1_alternating_sessions_no_loss(self):
+        self._run("sessA")                 # A 首锚(文件未产生 → 锚 0)
+        self._run("sessB")                 # B 首锚
+        # A 会话里出现新修复单(真实 JSONL 形态,S3 同款嵌套)
+        self._jsonl("sessA", {"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text",
+                         "text": "开单说明文字超过三十个字符长度要求补足内容。\n"
+                                 + self.ORDER_CRON + "\n继续说明。"}]}})
+        self._run("sessA")                 # A 的钩子扫描 → 登记
+        st = self._st()
+        hid = [k for k in st if not k.startswith("_")][0]
+        self.assertEqual(st[hid].get("src_session"), "sessA", "来源会话随单登记")
+        slot_a_before = self._slot("sessA")
+        # B 的钩子插入处理(旧全局游标在这里会覆盖 A 的游标)
+        self._run("sessB")
+        # A 的回执也进 A 文件
+        self._jsonl("sessA", {"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "执行 " + hid}]}})
+        self._run("sessA")                 # A 的钩子:确认 + Cron 派发
+        st = self._st()
+        self.assertTrue(st[hid].get("confirmed"), "回执确认不丢")
+        self.assertTrue(st[hid].get("dispatched"), "派发锚点落原始会话文件")
+        self.assertEqual(st[hid].get("verify_session"), "sessA")
+        slot_a_after = self._slot("sessA")
+        self.assertGreater(slot_a_after["off"], slot_a_before["off"], "A 游标前进")
+        # B 的钩子再插入一轮,A 的已 done 条目不被重算,游标互不干扰
+        self._run("sessB")
+        self.assertEqual(self._slot("sessA")["off"], slot_a_after["off"], "B 轮不越权动 A 游标")
+
+    # ── S2(P2):核验证据 >1MiB(原始会话文件),跨会话钩子核验仍成立 ──
+    def test_s2_verify_evidence_beyond_1mib(self):
+        self._run("sessA", text=self.ORDER_CRON)      # 登记(payload 文本面)
+        st = self._st()
+        hid = [k for k in st if not k.startswith("_")][0]
+        self._jsonl("sessA", {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "执行 " + hid}]}})
+        self._run("sessA")                            # 确认 + Cron 派发(锚点=此时 A 文件大小)
+        st = self._st()
+        off = st[hid]["dispatch_offset"]
+        # A 文件追加 >1MiB 填充行,证据(调用+成功结果)在填充之后——旧 1MiB 截断核验会漏
+        pad = "\n".join(json.dumps({"pad": i}) for i in range(100000))
+        with open(self._sess_file("sessA"), "a", encoding="utf-8") as f:
+            f.write(pad + "\n")
+            f.write(_call("cron-42", name="CronDelete", input={"id": "42"}) + "\n")
+            f.write(_res("cron-42", '{"deleted": true}') + "\n")
+        # 跨会话:B 的钩子跑状态机 → 核验必须读 **sessA** 的文件(verify_session)
+        self._run("sessB")
+        st = self._st()
+        self.assertTrue(st[hid].get("done"), ">1MiB 后的证据仍被核验销账")
+
+    # ── S3(P2):真实 JSONL 嵌套形态——单与回执主路径 ──
+    def test_s3_nested_jsonl_main_path(self):
+        self._run("sessN")                            # 首锚
+        self._jsonl("sessN", {"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text",
+                         "text": "开单说明文字超过三十个字符长度要求补足内容。\n"
+                                 + '修复单:: post_comment {"thread_id": 9, "body": "hi"}'
+                                 + "\n继续说明。"}]}})
+        self._run("sessN")
+        st = self._st()
+        hid = [k for k in st if not k.startswith("_")][0]
+        self.assertEqual(st[hid]["tool"], "mcp__review-board__post_comment",
+                         "嵌套 assistant 正文中的修复单被登记")
+        self._jsonl("sessN", {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "执行 " + hid}]}})
+        self._run("sessN")
+        st = self._st()
+        self.assertTrue(st[hid].get("confirmed"), "嵌套回执被确认")
+
+    # ── S4(P3):同 inode 原地截断(变小)→ 重锚,不按旧偏移误读 ──
+    def test_s4_shrink_reanchors(self):
+        self._run("sessS")                            # 首锚(文件未产生 → 0)
+        with open(self._sess_file("sessS"), "a", encoding="utf-8") as f:
+            f.write("x" * 500 + "\n")                # 制造内容,扫描推进
+        self._run("sessS")
+        off_before = self._slot("sessS")["off"]
+        self.assertGreater(off_before, 0)
+        # 原地截断到旧偏移之前,再写入超过旧偏移的新内容
+        with open(self._sess_file("sessS"), "r+b") as f:
+            f.truncate(max(0, off_before - 200))
+        with open(self._sess_file("sessS"), "a", encoding="utf-8") as f:
+            f.write("y" * 300 + "\n")
+        self._run("sessS")
+        slot = self._slot("sessS")
+        self.assertLess(slot["off"], off_before + 300, "截断后重锚,不沿用旧偏移越界读")
+
+
 if __name__ == "__main__":
+    unittest.main(verbosity=2)
     unittest.main(verbosity=2)

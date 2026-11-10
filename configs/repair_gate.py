@@ -280,18 +280,37 @@ def strip_code(text: str) -> str:
 
 # ---------- rollout 读取与核销证据(F1:同记录结构化匹配) ----------
 
-def _rollout_path(payload):
+def _rollout_dir():
+    """rollout 目录:RB_ROLLOUT_DIR 覆盖(测试/多实例),否则宿主默认。"""
+    return os.environ.get("RB_ROLLOUT_DIR") or os.path.join(
+        os.path.expanduser("~"), ".zcode", "cli", "rollout")
+
+
+def _session_key(payload):
     sid = payload.get("session_id") if isinstance(payload, dict) else None
-    sid = sid or os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("ZCODE_SESSION_ID")
-    path = os.environ.get("AG_ROLLOUT")
-    if not path and sid:
-        path = os.path.join(os.path.expanduser("~"), ".zcode", "cli", "rollout",
-                            f"model-io-session_{sid}.jsonl")
-    return path
+    return sid or os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("ZCODE_SESSION_ID")
+
+
+def _rollout_file_for(payload, session_key=None):
+    """V2.6(GPT round-17 P1):session → rollout 文件路径按 session 分区——
+    扫描游标与核验锚点都必须落在**原始 session 自己的文件**上,不再全局单份
+    (旧实现:跨会话 hook 互相覆盖游标 → 对方新增的修复单/回执永久漏扫)。
+    AG_ROLLOUT 仍强制单文件(向后兼容单文件部署)。"""
+    forced = os.environ.get("AG_ROLLOUT")
+    if forced:
+        return forced
+    sid = session_key or _session_key(payload)
+    if not sid:
+        return None
+    return os.path.join(_rollout_dir(), f"model-io-session_{sid}.jsonl")
+
+
+def _rollout_path(payload):
+    return _rollout_file_for(payload)
 
 
 def rollout_size(payload) -> int:
-    """当前 rollout 文件字节数(派发时刻的锚点)。读不到返回 -1。"""
+    """当前 payload 对应 rollout 文件字节数。读不到返回 -1。"""
     path = _rollout_path(payload)
     if not path:
         return -1
@@ -301,9 +320,29 @@ def rollout_size(payload) -> int:
         return -1
 
 
+def rollout_bytes_after(path, offset):
+    """V2.6(GPT round-17 P2):锚点后到 EOF 的全部字节,分块读,**无 1 MiB 截断**——
+    证据核验(verify_execution)此前沿用截断读取:>1MiB 之后才出现的调用+结果
+    会被误判为未核验而转人工。"""
+    try:
+        if os.path.getsize(path) <= offset:
+            return ""
+        chunks = []
+        with open(path, "rb") as f:
+            f.seek(offset)
+            while True:
+                chunk = f.read(262144)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
 def rollout_after(payload, offset) -> str:
-    """锚点之后新增的字节(上限 1 MiB)。文件不存在/比锚点还小(轮转清空)/锚点
-    无效 → 空串 = 保守待核,绝不把锚点前的旧记录当证据。"""
+    """兼容残留(V2.6 起证据核验改走 rollout_bytes_after;本函数已无调用方,
+    留作外部脚本兼容面,下版本移除)。"""
     path = _rollout_path(payload)
     if not path or not isinstance(offset, int) or offset < 0:
         return ""
@@ -328,12 +367,11 @@ def _file_id(path):
     return "m%d:s%d" % (st.st_mtime_ns, st.st_size)
 
 
-def rollout_complete_lines_after(payload, offset):
-    """V2.5(GPT round-16 P2-1):锚点之后的新增字节中,只取**完整 JSONL 行**
-    (以 \\n 结尾);返回 (完整行文本, 新偏移=锚点+完整行字节数)。
+def rollout_complete_lines_after(path, offset):
+    """V2.5(GPT round-16 P2-1)/V2.6 改路径入参:锚点之后的新增字节中,只取
+    **完整 JSONL 行**(以 \\n 结尾);返回 (完整行文本, 新偏移=锚点+完整行字节数)。
     分块读到当前文件末尾——无 1 MiB 截断(截断+指针越界=数据永久丢失,旧缺陷);
     未写完的尾行保留在文件里,偏移不越过它,下轮重读。轮转/锚点无效 → ("", -1)。"""
-    path = _rollout_path(payload)
     if not path or not isinstance(offset, int) or offset < 0:
         return "", -1
     try:
@@ -449,12 +487,18 @@ def _result_success(tool: str, err: bool, content) -> bool:
     return all(result.get(f) is True for f in fields)
 
 
-def verify_execution(payload, tool: str, args: str, offset) -> bool:
-    """F1+F4(V1.4):销账证据 = 锚点后 ①存在同一条记录内 工具名+参数 双匹配的
-    调用(带 id) ②该调用的执行结果(tool_use_id 配对)存在且 is_error 不为真。
+def verify_execution(payload, tool: str, args: str, offset, session_key=None) -> bool:
+    """F1+F4(V1.4)/V2.6(GPT round-17 P2):销账证据 = 锚点后 ①存在同一条记录内
+    工具名+参数 双匹配的调用(带 id) ②该调用的执行结果(tool_use_id 配对)存在
+    且 is_error 不为真。读取目标 = **原始 session 自己的 rollout**(session_key,
+    不再跟随当前 payload 的会话),分块读到 EOF(无 1 MiB 截断——截断会使
+    >1MiB 之后才出现的调用+结果被误判未核验而转人工)。
     只有调用没结果 / 结果带错 / 调用不带编号(格式不受支持) → 一律不算成功,
     保守待核,超限转人工——"发出过调用"绝不等于"修复成功"。"""
-    appended = rollout_after(payload, offset)
+    path = _rollout_file_for(payload, session_key)
+    if not path:
+        return False
+    appended = rollout_bytes_after(path, offset)
     if not appended:
         return False
     try:
@@ -616,7 +660,7 @@ def main() -> None:
                 except ValueError:
                     log("order-reject-json", args[:80])
                     continue
-                orders[(tool, args)] = True
+                orders[(tool, args)] = _session_key(payload)   # V2.6:来源会话
                 continue
             mr = RECEIPT_RE.match(line)
             if mr:
@@ -643,41 +687,64 @@ def main() -> None:
             state = load_state()
             now = time.time()
 
-            # ---- V2②:rollout 增量扫描(PostToolUse 时机) ----
-            # PostToolUse 载荷不含助手正文(正文在 rollout)——持久扫描偏移,每次只扫
-            # 上次锚点之后的新增字节;首锚=当前字节位(历史引用一律无效,L3 同款)。
-            cur = rollout_size(payload)
-            if cur >= 0:
-                sc = state.get("_scan")
-                prev_off = sc.get("off") if isinstance(sc, dict) else None
-                prev_fid = sc.get("fid") if isinstance(sc, dict) else None
-                fid = _file_id(_rollout_path(payload))
-                rescan = (isinstance(prev_off, int) and 0 <= prev_off <= cur
-                          and (prev_fid is None or prev_fid == fid))
-                if rescan:
-                    # V2.5(P2-1):只消费完整 JSONL 行,偏移推进到完整行末——
-                    # >1MiB 分块全读(无截断丢数据);未写完的尾行保留下轮重读
-                    text, new_off = rollout_complete_lines_after(payload, prev_off)
-                    for ln in text.splitlines():
-                        ln = ln.strip()
-                        if not ln:
-                            continue
-                        try:
-                            rec = json.loads(ln)     # rollout 行是 JSON 记录:解析后递归抽串,
-                        except ValueError:           # 否则嵌在 text 字段里的回执/单子匹配不到
-                            log("scan-nonjson-line", ln[:60])   # V2.5:非 JSON 行可观测
-                            scan_text(ln)            # 非 JSON 行按原文本扫(注释即承诺)
-                            continue
-                        for sx in candidate_strings(rec):
-                            scan_text(sx)
-                    # 存 dict 形态(load_state 只保留 dict 条目——存整数会被过滤丢掉)
-                    state["_scan"] = {"ts": now, "off": new_off, "fid": fid}
+            # ---- V2.6(GPT round-17 P1):rollout 增量扫描,游标按 session 分区 ----
+            # 每个会话有各自的 rollout 文件与各自的扫描游标(_scan.sessions[sid])
+            # ——跨会话的 hook 不再互相覆盖游标(旧全局单份:A 锚定→B 重锚→A 的新
+            # 单永久漏扫)。原地截断(同身份文件变小)→ 重锚(scan-shrunk);
+            # 同身份截断后**又长回超过旧偏移**的窗口仍不可检测,留账 DEBT #10。
+            sc = state.get("_scan")
+            sessions = (sc.get("sessions") if isinstance(sc, dict) and isinstance(sc.get("sessions"), dict) else {}) or {}
+            sid = _session_key(payload)
+            path = _rollout_file_for(payload)
+            cur = -1
+            if path:
+                try:
+                    cur = os.path.getsize(path)
+                except OSError:
+                    cur = -1
+            if path and sid:
+                slot = sessions.get(sid) or {}
+                if cur < 0:
+                    # V2.6:文件尚未产生 → 锚 0。此后该 session 写出的任何内容
+                    # 都会被增量扫描覆盖(旧逻辑整块跳过+不留锚=中间内容永久漏扫)
+                    slot = {"off": 0, "fid": None, "size": 0, "ts": now}
+                    sessions[sid] = slot
+                    state["_scan"] = {"ts": now, "sessions": sessions}
                 else:
-                    # 首轮/轮转(文件身份变化)/锚点越界 → 重锚当前位,绝不全扫;
-                    # 轮转留一行日志(P3-1:身份入游标,替换后旧偏移不再误读新文件)
-                    log("scan-anchor" if prev_off is None else "scan-rotated",
-                        f"off={cur} fid={fid}")
-                    state["_scan"] = {"ts": now, "off": cur, "fid": fid}
+                    prev_off = slot.get("off")
+                    prev_fid = slot.get("fid")
+                    prev_size = slot.get("size")
+                    fid = _file_id(path)
+                    rescan = (isinstance(prev_off, int) and 0 <= prev_off <= cur
+                              and (prev_fid is None or prev_fid == fid)
+                              and not (isinstance(prev_size, int) and cur < prev_size))
+                    if rescan:
+                        # V2.5(P2-1):只消费完整 JSONL 行,偏移推进到完整行末——
+                        # >1MiB 分块全读(无截断丢数据);未写完的尾行保留下轮重读
+                        text, new_off = rollout_complete_lines_after(path, prev_off)
+                        for ln in text.splitlines():
+                            ln = ln.strip()
+                            if not ln:
+                                continue
+                            try:
+                                rec = json.loads(ln)     # rollout 行是 JSON 记录:解析后递归抽串,
+                            except ValueError:           # 否则嵌在 text 字段里的回执/单子匹配不到
+                                log("scan-nonjson-line", ln[:60])   # V2.5:非 JSON 行可观测
+                                scan_text(ln)            # 非 JSON 行按原文本扫(注释即承诺)
+                                continue
+                            for sx in candidate_strings(rec):
+                                scan_text(sx)
+                        slot = {"off": new_off, "fid": fid, "size": cur, "ts": now}
+                    else:
+                        # 首锚/轮转(身份变化)/锚点越界/原地截断 → 重锚当前位,绝不全扫;
+                        # 各留一行日志可观测(P3-1)
+                        reason = ("scan-anchor" if prev_off is None
+                                  else "scan-shrunk" if isinstance(prev_size, int) and cur < prev_size
+                                  else "scan-rotated")
+                        log(reason, f"off={cur} fid={fid}")
+                        slot = {"off": cur, "fid": fid, "size": cur, "ts": now}
+                    sessions[sid] = slot
+                    state["_scan"] = {"ts": now, "sessions": sessions}
 
             # ---- 回执落账(L4) ----
             for h, act in receipts.items():
@@ -693,11 +760,13 @@ def main() -> None:
                     v["confirmed"] = True
                     log("order-confirmed", h)
 
-            # ---- 新单登记(F3:独立编号) ----
-            for (tool, args) in orders:
+            # ---- 新单登记(F3:独立编号;V2.6:登记来源 session——核验/派发锚点
+            #      都必须回到**原始 session 自己的 rollout**,不随当前 hook 会话漂移) ----
+            for (tool, args), src_sid in orders.items():
                 h = alloc_order_id(state, tool, args)
-                state[h] = {"ts": now, "bounces": 0, "confirmed": False, "tool": tool, "args": args}
-                log("order-register", f"{h} {tool}")
+                state[h] = {"ts": now, "bounces": 0, "confirmed": False, "tool": tool,
+                            "args": args, "src_session": src_sid}
+                log("order-register", f"{h} {tool} src={src_sid}")
 
             # ---- 台账状态机:驱动所有未结条目(不依赖正文提取,V1.2) ----
             msgs = []
@@ -785,7 +854,7 @@ def main() -> None:
                             continue
                         # 阶段1:副作用前持久化 executing 意图——失败绝不执行(F6)
                         v["executing"] = True
-                        v["dispatch_offset"] = rollout_size(payload)
+                        v["verify_session"] = v.get("src_session")
                         if not save_state(state):
                             _save_failure_alarm()
                             allow()   # 状态没落盘 → 不驱动副作用,报警放行
@@ -806,12 +875,20 @@ def main() -> None:
                         need_bounce = True
                         continue
                     v["dispatched"] = True
-                    v["dispatch_offset"] = rollout_size(payload)  # F1:核销锚点=此刻文件字节位
+                    # V2.6:核销锚点=**原始 session 自己的 rollout**此刻的字节位——
+                    # 证据核验也将读同一文件(不随当前 hook 的会话漂移)
+                    src_path = _rollout_file_for(payload, v.get("src_session"))
+                    try:
+                        v["dispatch_offset"] = os.path.getsize(src_path) if src_path else -1
+                    except OSError:
+                        v["dispatch_offset"] = -1
+                    v["verify_session"] = v.get("src_session")
                     v["bounces"] = v.get("bounces", 0) + 1
                     msgs.append(dispatch_instruction(h, tool, args))
                     need_bounce = True
                 else:
-                    if verify_execution(payload, tool, args, v.get("dispatch_offset")):
+                    if verify_execution(payload, tool, args, v.get("dispatch_offset"),
+                                        v.get("verify_session")):
                         v["done"] = True
                         v["finished"] = now
                         log("order-done", f"{h} {tool}")
