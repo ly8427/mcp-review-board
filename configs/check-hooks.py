@@ -1,4 +1,4 @@
-"""check-hooks：把 config.json 里每条 hook command 原样执行一次，判断"闸在不在岗"。
+r"""check-hooks：把 config.json 里每条 hook command 原样执行一次，判断"闸在不在岗"。
 
 设计要点（来自 2026-10-22 事故，每条都对应一次真实错误）：
 1) 判据是"原样执行"，不是"分段存在性检查"——否则 `...\python.exe 缺失的写法`（无 .exe）会被误判为死。
