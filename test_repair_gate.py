@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -91,7 +92,7 @@ class Harness(unittest.TestCase):
             return json.load(f)
 
     def first_id(self):
-        return list(self.st())[0]
+        return [k for k in self.st() if not k.startswith("_")][0]   # V2.2:忽略 _scan 等内部键
 
     # ---------- 登记与防误触发 ----------
 
@@ -278,7 +279,11 @@ class Harness(unittest.TestCase):
     # ---------- F2 派发指令的参数安全 ----------
 
     def test_board_dispatch_base64_no_raw_payload(self):
-        h = self._register(BOARD_ORDER)
+        # V2.1 起 create_thread 走直执面(gov 检查+base64 经 rb.sh);派发指令面
+        # 的防注入回归载体改为仍在派发通道的 set_verdict
+        order = ("修复单:: set_verdict {\"thread_id\":\"a'; rm -rf /tmp/nope; `echo x` "
+                 "$(touch /tmp/rb-pwned)\",\"verdict\":\"pass\"}")
+        h = self._register(order)
         rc, b, _ = self.gate(f"执行 {h}")
         self.assertIsNotNone(b, "应退回派发指令")
         reason = b["reason"]
@@ -296,7 +301,8 @@ class Harness(unittest.TestCase):
         rc, b, _ = self.gate("同一单再次出现,说明文字超过三十个字符长度要求补足内容。\n"
                              + ORDER_LINE + "\n补长度。")
         self.assertIsNotNone(b)
-        self.assertEqual(sorted(self.st().keys()), sorted([h1, h1 + "-2"]))
+        self.assertEqual(sorted(k for k in self.st() if not k.startswith("_")),
+                         sorted([h1, h1 + "-2"]))   # V2.2:忽略 _scan 等内部键
 
     # ---------- 报警与放行兜底 ----------
 
@@ -318,6 +324,186 @@ class Harness(unittest.TestCase):
         rc, out = self.gate_raw(b"not json")
         self.assertEqual(rc, 0)
         self.assertEqual(out, "")
+
+
+# ═══════════════ V2.2/V2.3（GPT round-10/11）：跨进程互斥回归 ═══════════════
+# GPT round-11 点名五用例（要求提交进仓库、可反复运行，双进程用真 OS 进程 +
+# 同步屏障，而非单线程 mock）：
+#   1 双进程同单竞争   → _direct_exec 恰一次
+#   2 后到进程重读状态 → 看到 executing/done 不执行副作用
+#   3 锁持有者异常退出 → OS 回收锁,另一进程可立即取得
+#   4 TTL 超期         → executing 条目保留、报警、不重执行
+#   5 锁获取失败       → 无任何副作用、正常放行
+sys.path.insert(0, os.path.join(HERE, "configs"))
+
+
+class V22Concurrency(unittest.TestCase):
+    """独立于 Harness(避免继承把 V1 测试重跑一遍)。"""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.state = os.path.join(self._dir.name, "state.json")
+        self.logp = os.path.join(self._dir.name, "log.txt")
+        self.alarm = os.path.join(self._dir.name, "alarm.txt")
+        self.rollout = os.path.join(self._dir.name, "rollout.jsonl")
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def _env(self):
+        return dict(os.environ,
+                    RB_REPAIR_STATE=self.state, RB_REPAIR_LOG=self.logp,
+                    RB_REPAIR_ALARM=self.alarm, AG_ROLLOUT=self.rollout)
+
+    def st(self):
+        with open(self.state, encoding="utf-8") as f:
+            return json.load(f)
+    """直执行（看板类）+ 跨进程锁的竞争回归。全部走 RB_REPAIR_DRYRUN=1——
+    验证的是锁与状态机时序，不触真实看板。"""
+
+    ORDER = '修复单:: post_comment {"thread_id": 7, "body": "hi"}'
+    ARGS = '{"thread_id": 7, "body": "hi"}'
+    HID = "v22a01"
+
+    def _seed(self, **extra):
+        st = {"ts": time.time(), "bounces": 0, "confirmed": True,
+              "tool": "mcp__review-board__post_comment", "args": self.ARGS}
+        st.update(extra)
+        json.dump({self.HID: st}, open(self.state, "w", encoding="utf-8"))
+
+    def _receipt(self):
+        with open(self.rollout, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "assistant", "text": f"执行 {self.HID}"},
+                               ensure_ascii=False) + "\n")
+
+    def _child_env(self, **over):
+        e = self._env()
+        e["RB_REPAIR_DRYRUN"] = "1"
+        e.update(over)
+        return e
+
+    def _spawn(self, e):
+        p = subprocess.Popen([PY, GATE], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=e)
+        p.stdin.write(json.dumps({"hook_event_name": "PostToolUse", "session_id": "v22",
+                                  "tool_name": "Read", "tool_input": {}}).encode("utf-8"))
+        p.stdin.close()
+        return p
+
+    def _log(self):
+        with open(self.logp, encoding="utf-8") as f:
+            return f.read()
+
+    def _gate(self):
+        """跑一次钩子(独立版,等价 Harness.gate 的最小面)。"""
+        p = subprocess.run([PY, GATE],
+                           input=json.dumps({"hook_event_name": "PostToolUse",
+                                             "session_id": "v22",
+                                             "tool_name": "Read",
+                                             "tool_input": {}}).encode("utf-8"),
+                           capture_output=True, env=self._env(), timeout=60)
+        out = p.stdout.decode("utf-8", "replace").strip()
+        try:
+            return json.loads(out) if out else None
+        except ValueError:
+            return None
+
+    # ── 用例 1+2（GPT 表格第 1、2 行）：同步屏障下双进程同单 ──
+    def test_t3_two_real_processes_claim_exactly_once(self):
+        self._seed()
+        self._receipt()
+        # 同步屏障：父进程先持锁再放行——两个子进程必然在锁上排队后同时开跑,
+        # 而非靠启动时差碰运气（GPT round-11:要用真竞争,不靠时序运气）
+        sys.path.insert(0, os.path.join(HERE, "configs"))
+        import repair_gate as rg
+        lf = open(self.state + ".claim", "a+")
+        try:
+            rg._lock_exclusive(lf)
+            c1, c2 = self._spawn(self._child_env()), self._spawn(self._child_env())
+            time.sleep(1.5)            # 两个子进程完成启动、进入锁等待队列
+            rg._unlock(lf)             # 同时放行——真竞争开始
+        finally:
+            lf.close()
+        for p in (c1, c2):
+            p.communicate(timeout=60)
+        log = self._log()
+        self.assertEqual(log.count("order-direct-done"), 1, "恰一次执行")
+        self.assertEqual(log.count("direct-exec-dryrun"), 1, "恰一次 _direct_exec")
+        st = self.st()
+        self.assertTrue(st[self.HID].get("done"))
+        self.assertIsNotNone(st[self.HID].get("exec_evidence"))
+        self.assertIsNone(st[self.HID].get("alarm"))
+        # 用例 2 显式格：第三个钩子（后到者）重读状态,看到 done → 不再执行
+        before = self._log()
+        self._gate()
+        self.assertEqual(self._log(), before, "后到者零副作用")
+
+    # ── 用例 3（GPT 表格第 3 行）：锁持有者异常退出,OS 回收锁 ──
+    def test_t4_lock_reclaimed_after_holder_killed(self):
+        sys.path.insert(0, os.path.join(HERE, "configs"))
+        import repair_gate as rg
+        holder = subprocess.Popen(
+            [PY, "-c",
+             "import sys, time, os\n"
+             "sys.path.insert(0, r'" + os.path.join(HERE, "configs") + "')\n"
+             "import repair_gate as rg\n"
+             "f = open(sys.argv[1], 'a+')\n"
+             "rg._lock_exclusive(f)\n"
+             "print('LOCKED', flush=True)\n"
+             "time.sleep(30)\n",
+             sys.argv[0], self.state + ".claim"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), b"LOCKED")
+            holder.stdout.close(); holder.stderr.close()
+            t0 = time.time()
+            holder.kill()                      # 异常退出（非正常释放）
+            holder.wait(timeout=10)
+            lf = open(self.state + ".claim", "a+")
+            try:
+                rg._lock_exclusive(lf)         # 必须能立即取得(OS 回收)
+                self.assertLess(time.time() - t0, 5.0, "异常退出后锁应立即可得")
+            finally:
+                rg._unlock(lf)
+                lf.close()
+        finally:
+            if holder.poll() is None:
+                holder.kill()
+
+    # ── 用例 4（GPT 表格第 4 行）：超 TTL executing 保留、报警、不重执行 ──
+    def test_t5_stale_executing_kept_not_reexecuted(self):
+        self._seed(ts=time.time() - 90000, executing=True)   # 超 24h
+        self._receipt()
+        bounce = self._gate()
+        self.assertIsNotNone(bounce, "executing 人工核 bounce")
+        st = self.st()
+        self.assertIn(self.HID, st, "条目保留不删（TTL 豁免）")
+        self.assertTrue(st[self.HID].get("stale_alarmed"))
+        self.assertNotIn("direct-exec-dryrun", self._log(), "不重执行")
+        with open(self.alarm, encoding="utf-8") as f:
+            self.assertIn("executing 超24h", f.read())
+
+    # ── 用例 5（GPT 表格第 5 行）：锁获取失败 → 零副作用、正常放行 ──
+    def test_t6_lock_busy_fail_closed(self):
+        self._seed()
+        self._receipt()
+        sys.path.insert(0, os.path.join(HERE, "configs"))
+        import repair_gate as rg
+        lf = open(self.state + ".claim", "a+")
+        try:
+            rg._lock_exclusive(lf)                       # 父进程持锁不放
+            child = self._spawn(self._child_env(RB_REPAIR_LOCK_WAIT="1.2"))
+            out, err = child.communicate(timeout=60)
+            self.assertEqual(child.returncode, 0)
+            self.assertEqual(out.strip(), b"", "锁忙=静默放行,无派发指令")
+            self.assertNotIn("direct-exec-dryrun", self._log(), "零副作用")
+            st = self.st()
+            self.assertNotIn("executing", st[self.HID], "未领取(未写执行中)")
+            self.assertNotIn("done", st[self.HID], "未销账")
+            self.assertIn("claim-lock-busy", self._log(), "锁忙留痕")
+        finally:
+            rg._unlock(lf)
+            lf.close()
 
 
 if __name__ == "__main__":

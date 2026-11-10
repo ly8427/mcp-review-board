@@ -195,18 +195,40 @@ def _save_failure_alarm() -> None:
 
 
 # ---- V2.2(GPT round-10 P1):跨进程互斥原语 ----
-# msvcrt.locking(LK_LOCK) = 阻塞重试约 10 秒后抛 OSError(Windows 主宿主);
-# fcntl.flock(LOCK_EX) = 阻塞等待(POSIX/WSL)。领取锁失败 = 本轮回不做任何
-# 副作用(fail-closed)——宁可推迟到下一轮,不可双执行。
+# V2.3(GPT round-11):双平台统一的有界等待——非阻塞请求 + 轮询,至多等
+# LOCK_WAIT_SECS(默认 8s,env RB_REPAIR_LOCK_WAIT 可调),超时抛 OSError →
+# 调用方 fail-closed 放行本回合、不做任何副作用。此前 Windows msvcrt.LK_LOCK
+# 原生重试 ~10s、POSIX fcntl.LOCK_EX 无限阻塞,两平台语义不一致(GPT round-11
+# 观察项);现统一为显式有界等待。宁可推迟到下一轮,不可双执行。
+LOCK_WAIT_SECS = float(os.environ.get("RB_REPAIR_LOCK_WAIT", "8"))
+
+
 def _lock_exclusive(f):
-    try:
-        import msvcrt
+    deadline = time.time() + LOCK_WAIT_SECS
+    while True:
         f.seek(0)
-        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
-        f.seek(0, 2)
-    except ImportError:
-        import fcntl
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            f.seek(0, 2)
+            return
+        except ImportError:
+            pass
+        except OSError:
+            pass
+        else:
+            return
+        try:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_NB | fcntl.LOCK_EX)
+            return
+        except ImportError:
+            pass
+        except OSError:
+            pass
+        if time.time() >= deadline:
+            raise OSError("claim lock busy (waited %.1fs)" % LOCK_WAIT_SECS)
+        time.sleep(0.25)
 
 
 def _unlock(f):
