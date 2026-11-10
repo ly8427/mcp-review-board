@@ -985,23 +985,81 @@ class V26Sessions(unittest.TestCase):
         self.assertTrue(st[hid].get("confirmed"), "嵌套回执被确认")
 
     # ── S4(P3):同 inode 原地截断(变小)→ 重锚,不按旧偏移误读 ──
-    def test_s4_shrink_reanchors(self):
+    # ── S4a(P3,可检测截断):终长 < 旧 size → scan-shrunk 重锚 + 被截区不消费 ──
+    def test_s4a_detectable_shrink_reanchors(self):
         self._run("sessS")                            # 首锚(文件未产生 → 0)
         with open(self._sess_file("sessS"), "a", encoding="utf-8") as f:
-            f.write("x" * 500 + "\n")                # 制造内容,扫描推进
+            f.write("x" * 500 + "\n")                 # 内容推进
         self._run("sessS")
         off_before = self._slot("sessS")["off"]
+        prev_size = self._slot("sessS")["size"]
         self.assertGreater(off_before, 0)
-        # 原地截断到旧偏移之前,再写入超过旧偏移的新内容
+        # 可检测截断:截断后**终长仍小于旧 size** → cur < prev_size → scan-shrunk
         with open(self._sess_file("sessS"), "r+b") as f:
-            f.truncate(max(0, off_before - 200))
+            f.truncate(off_before - 300)
         with open(self._sess_file("sessS"), "a", encoding="utf-8") as f:
-            f.write("y" * 300 + "\n")
+            f.write('修复单:: post_comment {"thread_id": 51, "body": "z"}\n')  # 落在被截区域
+        final = os.path.getsize(self._sess_file("sessS"))
+        self.assertLess(final, prev_size, "场景前提:终长 < 旧 size(可检测)")
         self._run("sessS")
         slot = self._slot("sessS")
-        self.assertLess(slot["off"], off_before + 300, "截断后重锚,不沿用旧偏移越界读")
+        with open(self.logp, encoding="utf-8") as f:
+            self.assertIn("scan-shrunk", f.read(), "触发 shrink 重锚并留痕")
+        self.assertEqual(slot["off"], final, "重锚=当前文件末尾")
+        self.assertEqual(len([k for k in self._st() if not k.startswith("_")]), 0,
+                         "被截区域内容不消费(保守语义,DEBT #10 同族)")
+
+    # ── S4b(P3,不可检测截断):终长 > 旧偏移 → 按旧偏移正常推进(如实断言
+    #    已接受的 DEBT 边界,不冒充"重锚成功") ──
+    def test_s4b_undetectable_truncate_regrow(self):
+        self._run("sessS")                            # 首锚
+        with open(self._sess_file("sessS"), "a", encoding="utf-8") as f:
+            f.write("x" * 500 + "\n")
+        self._run("sessS")
+        off_before = self._slot("sessS")["off"]
+        # 截断到旧偏移之前,再写入**跨过旧偏移**的内容 → 终长 > 旧偏移,不可检测
+        with open(self._sess_file("sessS"), "r+b") as f:
+            f.truncate(off_before - 200)
+        with open(self._sess_file("sessS"), "a", encoding="utf-8") as f:
+            f.write("y" * 500 + "\n")
+        final = os.path.getsize(self._sess_file("sessS"))
+        self.assertGreater(final, off_before, "场景前提:终长 > 旧偏移(不可检测)")
+        self._run("sessS")
+        slot = self._slot("sessS")
+        # 如实断言已接受的限制(DEBT #10):从旧偏移正常推进,
+        # (旧偏移-截断点)之间的新内容被静默跳过——不是"重锚成功"
+        self.assertEqual(slot["off"], final, "按旧偏移正常推进到文件末尾")
+        log_txt = ""
+        with open(self.logp, encoding="utf-8") as f:
+            log_txt = f.read()
+        self.assertNotIn("scan-shrunk", log_txt,
+                         "此窗口不触发 shrink(不可检测,已留账)")
+
+    # ── S5(GPT round-18 P2 回归):rollout 文件未产生时派发 → 锚 0 → 文件延迟
+    #    出现后,证据核验正常销账(旧缺陷:锚 -1 → seek(-1) 异常逃进 fail-open,
+    #    核验长期失效) ──
+    def test_s5_dispatch_before_rollout_exists(self):
+        # run1:登记(payload 文本面);此时 sessX 的 rollout 文件不存在
+        self._run("sessX", text=self.ORDER_CRON)
+        st = self._st()
+        self.assertFalse(os.path.exists(self._sess_file("sessX")),
+                         "场景前提:派发前文件尚未产生")
+        hid = [k for k in st if not k.startswith("_")][0]
+        # run2:回执走 payload 文本面(文件仍不产生)→ 确认 + 派发 → 锚必须是 0
+        self._run("sessX", text="执行 " + hid)
+        st = self._st()
+        self.assertTrue(st[hid].get("dispatched"))
+        self.assertEqual(st[hid].get("dispatch_offset"), 0,
+                         "文件缺失 → 锚 0(新文件从头即派发后记录)")
+        # 模型执行派发指令 → rollout 文件此刻才被创建,证据在文件头部
+        with open(self._sess_file("sessX"), "a", encoding="utf-8") as f:
+            f.write(_call("cron-s5", name="CronDelete", input={"id": "42"}) + "\n")
+            f.write(_res("cron-s5", '{"deleted": true}') + "\n")
+        # run3:跨会话钩子核验 → 读 sessX 文件(verify_session) → 正常销账
+        self._run("sessY")
+        st = self._st()
+        self.assertTrue(st[hid].get("done"), "延迟出现的文件正常核验销账")
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
     unittest.main(verbosity=2)

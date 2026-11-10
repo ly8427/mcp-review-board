@@ -323,7 +323,12 @@ def rollout_size(payload) -> int:
 def rollout_bytes_after(path, offset):
     """V2.6(GPT round-17 P2):锚点后到 EOF 的全部字节,分块读,**无 1 MiB 截断**——
     证据核验(verify_execution)此前沿用截断读取:>1MiB 之后才出现的调用+结果
-    会被误判为未核验而转人工。"""
+    会被误判为未核验而转人工。
+    V2.7(GPT round-18):负/无效锚点一律拒绝(返回空=保守不核),绝不带病 seek——
+    seek(-1) 抛 ValueError 会穿透 OSError 捕获、逃进顶层 fail-open,使核验
+    长期失效(GPT round-18 P2 实景)。"""
+    if not path or not isinstance(offset, int) or offset < 0:
+        return ""
     try:
         if os.path.getsize(path) <= offset:
             return ""
@@ -879,9 +884,13 @@ def main() -> None:
                     # 证据核验也将读同一文件(不随当前 hook 的会话漂移)
                     src_path = _rollout_file_for(payload, v.get("src_session"))
                     try:
-                        v["dispatch_offset"] = os.path.getsize(src_path) if src_path else -1
+                        v["dispatch_offset"] = os.path.getsize(src_path) if src_path else 0
+                    except FileNotFoundError:
+                        # V2.7(GPT round-18):文件尚未产生 → 新文件从头即派发后记录,
+                        # 锚 0(负锚点会让核验 seek(-1) 崩溃逃进 fail-open,核验长期失效)
+                        v["dispatch_offset"] = 0
                     except OSError:
-                        v["dispatch_offset"] = -1
+                        v["dispatch_offset"] = -1   # 其他 I/O 故障:无效锚,核验侧拒读
                     v["verify_session"] = v.get("src_session")
                     v["bounces"] = v.get("bounces", 0) + 1
                     msgs.append(dispatch_instruction(h, tool, args))
