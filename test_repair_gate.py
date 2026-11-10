@@ -412,20 +412,43 @@ class V22Concurrency(unittest.TestCase):
     def test_t3_two_real_processes_claim_exactly_once(self):
         self._seed()
         self._receipt()
-        # 同步屏障：父进程先持锁再放行——两个子进程必然在锁上排队后同时开跑,
-        # 而非靠启动时差碰运气（GPT round-11:要用真竞争,不靠时序运气）
+        # 确定性同步屏障（GPT round-12 P2:1.5s 定时不构成必然竞争）——
+        # 子进程先打 READY 再尝试取锁;父进程收齐两个 READY 才放行。
+        # 放行时两个子进程都已阻塞在锁请求上 = 必然真竞争。
         sys.path.insert(0, os.path.join(HERE, "configs"))
         import repair_gate as rg
+        cfg_dir = os.path.join(HERE, "configs")
+        wrapper = (
+            "import sys\n"
+            "sys.path.insert(0, r'" + cfg_dir.replace("\\", "/") + "')\n"
+            "print('READY', flush=True)\n"      # 取锁前就位信号
+            "import repair_gate\n"
+            "repair_gate.main()\n"
+        )
         lf = open(self.state + ".claim", "a+")
+        children = []
         try:
-            rg._lock_exclusive(lf)
-            c1, c2 = self._spawn(self._child_env()), self._spawn(self._child_env())
-            time.sleep(1.5)            # 两个子进程完成启动、进入锁等待队列
-            rg._unlock(lf)             # 同时放行——真竞争开始
+            rg._lock_exclusive(lf)             # 父进程持锁 = 屏障
+            for _ in range(2):
+                e = self._child_env()
+                cp = subprocess.Popen([PY, "-c", wrapper], stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=e)
+                cp.stdin.write(json.dumps({"hook_event_name": "PostToolUse",
+                                           "session_id": "v22", "tool_name": "Read",
+                                           "tool_input": {}}).encode("utf-8"))
+                cp.stdin.close()
+                children.append(cp)
+            for cp in children:                # 确定性握手:收齐两个 READY 才放行
+                self.assertEqual(cp.stdout.readline().strip(), b"READY",
+                                 "子进程未在取锁前就位")
+            rg._unlock(lf)                     # 双 READY 到齐 → 真竞争开始
         finally:
             lf.close()
-        for p in (c1, c2):
-            p.communicate(timeout=60)
+        for cp in children:
+            out, err = cp.communicate(timeout=60)
+            self.assertEqual(cp.returncode, 0, "子进程须正常退出(排除 fail-open 崩溃)")
+            self.assertEqual(err.decode("utf-8", "replace"), "",
+                             "stderr 须干净(排除被 fail-open 吞掉的异常)")
         log = self._log()
         self.assertEqual(log.count("order-direct-done"), 1, "恰一次执行")
         self.assertEqual(log.count("direct-exec-dryrun"), 1, "恰一次 _direct_exec")
