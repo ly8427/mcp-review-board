@@ -82,8 +82,37 @@ def _strings(obj):
             yield from _strings(v)
 
 
-def longest_text_in_tail(path):
-    """读 JSONL 文件尾 64KB，取其中最长的一段文本；读不到返回 None。
+def _assistant_text(rec):
+    """从一条 JSONL 记录提取 assistant 回复文本；非 assistant 记录返回 None。"""
+    if not isinstance(rec, dict):
+        return None
+    msg = rec.get("message") if isinstance(rec.get("message"), dict) else rec
+    role = msg.get("role") if isinstance(msg, dict) else None
+    if rec.get("type") != "assistant" and role != "assistant":
+        return None
+    content = msg.get("content") if isinstance(msg, dict) else None
+    parts = []
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text" \
+                    and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+    if isinstance(rec.get("text"), str):
+        parts.append(rec["text"])          # 简式记录（fixture/部分宿主）
+    text = "\n".join(p for p in parts if p)
+    return text or None
+
+
+def last_assistant_text_in_tail(path):
+    """读 JSONL 文件尾 64KB，返回**最后一条 assistant 回复**的文本；找不到返回 None。
+
+    V1.1.1 修（board #109，cursor [major]）：旧实现取尾段「最长字符串」——
+    旧黑话长文（或诊断命令回灌的同一段）永远比改写后的短回复长，
+    形成「改写 → 再扫旧文 → 再打回」死循环。现改为按记录序取最后一条
+    assistant 记录（Stop 触发时它就是本轮刚结束的回复）；user/tool 记录
+    一律跳过；尾段找不到 assistant 记录 → None（fail-open 放行，留日志）。
 
     zcode rollout 与 claude transcript（#713 §3/#714 收敛的第三条路）同一读法，
     收进同一函数，避免两份尾读逻辑漂移。
@@ -96,7 +125,7 @@ def longest_text_in_tail(path):
             tail = f.read().decode("utf-8", "replace")
     except OSError:
         return None
-    best, best_len = None, 30
+    last = None
     for line in tail.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -104,16 +133,18 @@ def longest_text_in_tail(path):
         try:
             rec = json.loads(line)
         except ValueError:
-            continue
-        for s in _strings(rec):
-            if len(s) > best_len and "```" not in s[:0]:
-                best, best_len = s, len(s)
-    return best
+            continue                      # 未写完的尾行/坏行：跳过
+        text = _assistant_text(rec)
+        if text:
+            last = text                   # 记录序在后 = 更新；只记不比长度
+    return last
 
 
 def extract_text(payload):
     """取"刚写完的回复"，三条路按序：payload 里名字像回复的字段 →
-    payload["transcript_path"]（claude 宿主 Stop 自带）→ 会话 rollout 日志尾段（zcode）。"""
+    payload["transcript_path"]（claude 宿主 Stop 自带）→ 会话 rollout 日志尾段（zcode）。
+    退读两条路都取**最后一条 assistant 回复**（V1.1.1，board #109）——
+    禁止用尾段最长串冒充当前回复（改写后仍被旧文反复打回的死循环根因）。"""
     keyed = []
     for k, v in (payload.items() if isinstance(payload, dict) else []):
         if re.search(r"response|preview|last|message|assistant|text|output", str(k), re.I):
@@ -124,10 +155,10 @@ def extract_text(payload):
     if not isinstance(payload, dict):
         return None
     # 第三条路（#713 §3 / #714 收敛）：claude 宿主 Stop payload 自带 transcript_path
-    # （本会话 JSONL 全量记录），读尾 64KB 取最长文本。
+    # （本会话 JSONL 全量记录），读尾 64KB 取最后一条 assistant 回复。
     tp = payload.get("transcript_path")
     if isinstance(tp, str) and tp:
-        best = longest_text_in_tail(tp)
+        best = last_assistant_text_in_tail(tp)
         if best:
             return best
     sid = payload.get("session_id")
@@ -136,7 +167,7 @@ def extract_text(payload):
         return None
     path = os.environ.get("AG_ROLLOUT") or os.path.join(
         os.path.expanduser("~"), ".zcode", "cli", "rollout", f"model-io-session_{sid}.jsonl")
-    return longest_text_in_tail(path)
+    return last_assistant_text_in_tail(path)
 
 
 def strip_code_and_urls(text: str) -> str:
@@ -176,6 +207,71 @@ def scan(text, words, regexes, allowset):
     return hits
 
 
+def _skip_for_cursor_host(payload: dict | None = None) -> bool:
+    """Cursor IDE opted out of this gate (2026-11-12 user request).
+
+    Cursor loads Claude Code Stop hooks from ~/.claude/settings.json (third-party
+    hooks). The hook child often lacks CURSOR_AGENT but still gets Cursor hook
+    env (CURSOR_VERSION / CURSOR_PROJECT_DIR / CURSOR_TRANSCRIPT_PATH, …) and/or
+    Cursor-native stop fields (status + loop_count). claude-code CLI and zcode
+    do not set those → they keep the gate. Force-on: REVIEWBOARD_PLAIN_SPEAK_FORCE=1.
+    """
+    if os.environ.get("REVIEWBOARD_PLAIN_SPEAK_FORCE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return False
+    # Agent worker
+    if os.environ.get("CURSOR_AGENT"):
+        return True
+    # Cursor hook runner env (documented for command hooks)
+    for key in (
+        "CURSOR_VERSION",
+        "CURSOR_PROJECT_DIR",
+        "CURSOR_TRANSCRIPT_PATH",
+        "CURSOR_CONVERSATION_ID",
+        "CURSOR_REQUEST_ID",
+        "CURSOR_PLUGIN_ROOT",
+    ):
+        if os.environ.get(key):
+            return True
+    # Cursor-native stop payload shape (Claude Stop uses hook_event_name instead)
+    if isinstance(payload, dict):
+        if payload.get("hook_event_name") in (None, "") and "loop_count" in payload:
+            if payload.get("status") in ("completed", "aborted", "error"):
+                return True
+        # Some builds expose transcript via env-mapped payload keys
+        if payload.get("cursor_version") or payload.get("generation_id"):
+            return True
+    return False
+
+
+def _skip_for_grok_host() -> bool:
+    """Grok CLI opted out of this gate (2026-11-12 user request).
+
+    Grok loads the same Claude Code Stop hook from ~/.claude/settings.json.
+    The hook child gets GROK_HOOK_EVENT / GROK_SESSION_ID / GROK_WORKSPACE_ROOT
+    / GROK_HOOK_NAME. claude-code, zcode, and Cursor do not set those, so they
+    keep the gate. Force-on: REVIEWBOARD_PLAIN_SPEAK_FORCE=1.
+    """
+    if os.environ.get("REVIEWBOARD_PLAIN_SPEAK_FORCE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return False
+    for key in (
+        "GROK_HOOK_EVENT",
+        "GROK_HOOK_NAME",
+        "GROK_SESSION_ID",
+        "GROK_WORKSPACE_ROOT",
+    ):
+        if os.environ.get(key):
+            return True
+    return False
+
+
 def main() -> None:
     raw = sys.stdin.read()
     try:
@@ -184,6 +280,8 @@ def main() -> None:
         allow()
     if not isinstance(payload, dict) or payload.get("stop_hook_active"):
         allow()  # 本轮已打回过一次：不再拦（配合宿主三次上限）
+    if _skip_for_cursor_host(payload) or _skip_for_grok_host():
+        allow()
     text = extract_text(payload)
     if not text:
         allow()
