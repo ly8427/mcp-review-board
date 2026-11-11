@@ -106,82 +106,102 @@ def _assistant_text(rec):
 
 
 def last_assistant_text_in_tail(path):
-    """读 JSONL 文件尾 64KB，返回**最后一条 assistant 回复**的文本；找不到返回 None。
+    """读 JSONL 尾窗，返回 (最后一条 assistant 回复文本 | None, 原因)。
 
-    V1.1.1 修（board #109，cursor [major]）：旧实现取尾段「最长字符串」——
-    旧黑话长文（或诊断命令回灌的同一段）永远比改写后的短回复长，
-    形成「改写 → 再扫旧文 → 再打回」死循环。现改为按记录序取最后一条
-    assistant 记录（Stop 触发时它就是本轮刚结束的回复）；user/tool 记录
-    一律跳过；尾段找不到 assistant 记录 → None（fail-open 放行，留日志）。
-    V1.1.3（GPT round-20 P1）：**最后一条非空行解析失败/非 JSON 开头 → 返回
-    None**——它可能就是本轮正被写入的回复，内容无法确认时禁止拿更早的
-    回复冒充（宁可漏检一轮，不错误打回）。
-
-    zcode rollout 与 claude transcript（#713 §3/#714 收敛的第三条路）同一读法，
-    收进同一函数，避免两份尾读逻辑漂移。
+    V1.1.4（board #109 五缺口收口，dsh #2041/pi #2042）：
+      * **渐进窗口**：从 64KB 起，找不到 assistant 记录且文件仍有更早内容时
+        窗口 ×4 倍增至 8MB 封顶——≥64KB 的单条长回复不再被窗口整条切掉
+        （pi #2042 执行实证：70KB 黑话回复旧版会漏检）。
+      * **出口可区分**：返回原因 found / no-assistant-in-file / tail-unparsed /
+        cap-reached / no-file / unreadable——V1.1.3 曾把三种病因压进同一个
+        None 出口（dsh #2041 §一），诊断从此可分。
+      * 尾行（最后一条非空行）解析失败/非 JSON 开头 → tail-unparsed
+        （V1.1.3 语义保留：内容无法确认时禁止拿更早回复冒充）。
+    zcode rollout 与 claude transcript（#713 §3/#714 收敛的第三条路）同一读法。
     """
     try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - 65536))
-            tail = f.read().decode("utf-8", "replace")
+        size = os.path.getsize(path)
     except OSError:
-        return None
-    lines = [l.strip() for l in tail.splitlines() if l.strip()]
-    if not lines:
-        return None
-    last = None
-    for i, line in enumerate(lines):
-        is_final = i == len(lines) - 1
-        if not line.startswith("{"):
-            if is_final:
-                # V1.1.3(GPT round-20 P1):最后一条非空行不是 JSON 开头——可能
-                # 正被写入/已损坏,内容无法确认 ⇒ 禁止拿更早的 assistant 回复
-                # 冒充当前回复,返回 None(fail-open,宁可漏检一轮不错误打回)
-                return None
-            continue
+        return None, "no-file"
+    window = 65536
+    while True:
+        start = max(0, size - window)
         try:
-            rec = json.loads(line)
-        except ValueError:
-            if is_final:
-                # GPT round-20 P1:尾行解析失败 → None,不再退回更早的回复
-                return None
-            continue                      # 非尾行的坏行：跳过(历史行为)
-        text = _assistant_text(rec)
-        if text:
-            last = text                   # 记录序在后 = 更新；只记不比长度
-    return last
+            with open(path, "rb") as f:
+                f.seek(start)
+                tail = f.read().decode("utf-8", "replace")
+        except OSError:
+            return None, "unreadable"
+        lines = [l.strip() for l in tail.splitlines() if l.strip()]
+        if not lines:
+            return None, "empty"
+        last = None
+        final_unparsed = False
+        # 窗口边界切出的首行（start>0 时可能是不完整记录的前半）：跳过
+        body = lines[1:] if start > 0 else lines
+        for i, line in enumerate(body):
+            last_line_of_file = i == len(body) - 1   # 窗口永远延伸到文件尾
+            if not line.startswith("{"):
+                if last_line_of_file:
+                    final_unparsed = True   # 尾行非 JSON 开头：无法确认
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                if last_line_of_file:
+                    final_unparsed = True   # 尾行解析失败：本轮不确认
+                continue
+            text = _assistant_text(rec)
+            if text:
+                last = text                 # 记录序在后 = 更新；只记不比长度
+        if last is not None and not final_unparsed:
+            return last, "found"
+        if start == 0:
+            # 全文件已消费仍无可用回复
+            if final_unparsed:
+                return None, "tail-unparsed"
+            return None, "no-assistant-in-file"
+        if window >= WINDOW_CAP or window >= size:
+            return None, "cap-reached"
+        window *= 4
 
 
 def extract_text(payload):
-    """取"刚写完的回复"，按权威级四路（V1.1.2，GPT round-19 P1 收口）：
-    ① payload["last_assistant_message"]——claude Stop 官方权威字段，**任意长度
-       都算**（GPT round-19：短回复被 30 字门槛丢弃会漏检当前轮、错扫旧轮）；
-    ② payload 里名字像回复的字段（zcode Stop 的 last_message 等，同样不限长度）；
-    ③ payload["transcript_path"]（claude 宿主自带）→ 尾读最后一条 assistant 回复；
-    ④ 会话 rollout 日志尾段（zcode）同一语义。
-    ③④ 都取不到 → stderr 留诊断痕后 fail-open 放行（GPT round-19：fail-open
-    必须可见，不许无声）。退读两条路都取**最后一条 assistant 回复**
-    （V1.1.1，board #109）——禁止用尾段最长串冒充当前回复。"""
+    """取"刚写完的回复"，按权威级四路（V1.1.4，board #109 五缺口收口）：
+    ① payload["last_assistant_message"]——claude Stop 官方权威字段，任意长度都算；
+    ② payload 里名字像回复的字段——**显式"最近一条"键优先于最长串**
+       （last_message > response > text > output；dsh 缺口②：最长串会让旧
+       诊断回文冒充当前回复），各键内仍取最长；
+    ③ payload["transcript_path"]（claude 宿主自带）→ 尾窗读最后一条 assistant 回复；
+    ④ 会话 rollout 日志尾窗（zcode）同一语义。
+    ③④ 都取不到 → stderr 留**可区分原因**的诊断痕后 fail-open 放行
+    （V1.1.4：found/no-assistant-in-file/tail-unparsed/cap-reached 不再合流）。
+    尾读两条路都取**最后一条 assistant 回复**（V1.1.1，board #109）——
+    禁止用尾段最长串冒充当前回复。"""
     if not isinstance(payload, dict):
         return None
     lam = payload.get("last_assistant_message")
     if isinstance(lam, str) and lam.strip():
         return lam
-    keyed = []
+    keyed = {}
     for k, v in payload.items():
         if re.search(r"response|preview|last|message|assistant|text|output", str(k), re.I):
-            keyed += [s for s in _strings(v)]
-    if keyed:
-        return max(keyed, key=len)
+            keyed[k] = [s for s in _strings(v)]
+    # V1.1.4(board #109 dsh 缺口②):显式"最近一条"键优先于最长串——
+    # 最长串会让旧诊断回文冒充当前回复(last_message > response > text > output)
+    for pref in ("last_message", "response", "text", "output"):
+        if pref in keyed and keyed[pref]:
+            return max(keyed[pref], key=len)
+    flat = [s for strs in keyed.values() for s in strs]
+    if flat:
+        return max(flat, key=len)
     diag = []
     tp = payload.get("transcript_path")
     if isinstance(tp, str) and tp:
-        best = last_assistant_text_in_tail(tp)
+        best, reason = last_assistant_text_in_tail(tp)
         if best:
             return best
-        diag.append(f"transcript 尾段无 assistant 回复: {tp}")
+        diag.append(f"transcript 尾读未取得回复({reason}): {tp}")
     sid = payload.get("session_id")
     sid = sid or os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("ZCODE_SESSION_ID")
     if not sid:
@@ -191,10 +211,10 @@ def extract_text(payload):
         return None
     path = os.environ.get("AG_ROLLOUT") or os.path.join(
         os.path.expanduser("~"), ".zcode", "cli", "rollout", f"model-io-session_{sid}.jsonl")
-    best = last_assistant_text_in_tail(path)
+    best, reason = last_assistant_text_in_tail(path)
     if best:
         return best
-    diag.append(f"rollout 尾段无 assistant 回复: {path}")
+    diag.append(f"rollout 尾读未取得回复({reason}): {path}")
     sys.stderr.write("[plain-speak] fail-open（无当前轮文本可查）: " + "; ".join(diag) + "\n")
     return None
 

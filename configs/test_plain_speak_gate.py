@@ -58,11 +58,15 @@ class Harness(unittest.TestCase):
         with open(self.transcript, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    def gate(self, payload):
+    def gate(self, payload, env_extra=None):
+        # 缺口①(环境洗):AG_ROLLOUT 不摘除会让 transcript 路测试读到开发机环境文件
+        e = dict(os.environ, **{"RB_REPAIR_DRYRUN": "1"})
+        e.pop("AG_ROLLOUT", None)
+        if env_extra:
+            e.update(env_extra)
         p = subprocess.run([PY, GATE],
                            input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                           capture_output=True, env=dict(os.environ, **{
-                               "RB_REPAIR_DRYRUN": "1"}), timeout=30)
+                           capture_output=True, env=e, timeout=30)
         out = p.stdout.decode("utf-8", "replace").strip()
         try:
             return p.returncode, (json.loads(out) if out else None), \
@@ -158,7 +162,9 @@ class TestGateEndToEnd(Harness):
         self.assertIsNotNone(b, "payload 回复字段（第一路）仍生效")
 
     def test_f_zcode_rollout_third_path_last_assistant(self):
-        rollout = os.path.join(self.d, "model-io-session_z.jsonl")
+        # 缺口④(dsh #2037):原实现 fixture 写的文件不在第三条路读路径上=空过;
+        # 现以 AG_ROLLOUT 显式指向 fixture——第三条路真读、真判
+        rollout = os.path.join(self.d, "rollout-fixture.jsonl")
         with open(rollout, "w", encoding="utf-8") as f:
             f.write(json.dumps({"type": "assistant",
                                 "message": {"role": "assistant", "content": JARGON}},
@@ -168,8 +174,18 @@ class TestGateEndToEnd(Harness):
                                ensure_ascii=False) + "\n")
         payload = {"hook_event_name": "Stop", "session_id": "z",
                    "transcript_path": os.path.join(self.d, "missing.jsonl")}
-        rc, b, _ = self.gate(payload)
+        rc, b, _ = self.gate(payload, env_extra={"AG_ROLLOUT": rollout})
         self.assertIsNone(b, "第三条路（rollout）同样取最后一条 assistant：干净 → 放行")
+        # 反例:乱序(JARGON 在最后)→ 必须拦(证明 fixture 真被读了)
+        with open(rollout, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "assistant",
+                                "message": {"role": "assistant", "content": CLEAN}},
+                               ensure_ascii=False) + "\n")
+            f.write(json.dumps({"type": "assistant",
+                                "message": {"role": "assistant", "content": JARGON}},
+                               ensure_ascii=False) + "\n")
+        rc, b, _ = self.gate(payload, env_extra={"AG_ROLLOUT": rollout})
+        self.assertIsNotNone(b, "乱序 fixture 真被读取并拦截(反空过)")
 
 
     # ── GPT round-19 P1 子项：短回复不得丢弃 / last_assistant_message 权威 ──
@@ -224,6 +240,66 @@ class TestGateEndToEnd(Harness):
         rc, b, _ = self.gate(self.stop_payload())
         self.assertIsNone(b, "尾行不完整 → fail-open 放行，不得拿旧黑话文打回")
         self.assertEqual(rc, 0)
+
+
+    # ── GPT round-20 后续(dsh #2041/pi #2042 五缺口收口验证) ──
+
+    def test_g6_window_grows_for_large_reply(self):
+        # 缺口⑤(dsh #2041 §一):≥64KB 单条长回复被窗口整条切掉 → 漏检;
+        # 渐进窗口(64KB→×4→8MB 封顶)必须把它找回来
+        big = "这批改动的说明已经用日常语言写清楚，没有需要解释的词。" * 1200  # ≈ 66KB+
+        self.write_transcript([
+            {"type": "assistant", "message": {"role": "assistant", "content": JARGON}},
+            {"type": "assistant", "message": {"role": "assistant", "content": big}},
+        ])
+        rc, b, _ = self.gate(self.stop_payload())
+        self.assertIsNone(b, "≥64KB 的干净长回复必须被找到并放行(不因窗口切尾漏检)")
+
+    def test_g7_explicit_reply_keys_beat_longer_output(self):
+        # 缺口②(dsh):键优先于最长串——response 是当前回复,output 是旧诊断回文
+        self.write_transcript([
+            {"type": "assistant", "message": {"role": "assistant", "content": CLEAN}},
+        ])
+        payload = {**self.stop_payload(),
+                   "response": {"text": CLEAN},
+                   "output": JARGON}          # 更长的旧文在另一键里
+        rc, b, _ = self.gate(payload)
+        self.assertIsNone(b, "显式回复键优先:不得被另一键里的更长旧文冒充")
+
+    def test_g8_distinct_reasons(self):
+        # 缺口③(dsh):三种病因不再合流同一个 None——原因可区分
+        import importlib.util
+        s = importlib.util.spec_from_file_location("psg_tail", GATE)
+        m = importlib.util.module_from_spec(s)
+        s.loader.exec_module(m)
+        f1 = os.path.join(self.d, "a.jsonl")   # 只有人话/用户记录
+        with open(f1, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "user",
+                                "message": {"role": "user", "content": JARGON}},
+                               ensure_ascii=False) + "\n")
+        self.assertEqual(m.last_assistant_text_in_tail(f1)[1], "no-assistant-in-file")
+        f2 = os.path.join(self.d, "b.jsonl")   # 尾行坏 JSON
+        with open(f2, "w", encoding="utf-8") as f:
+            f.write(CLEAN_ASSISTANT + "\n")
+            f.write('{"broken')
+        self.assertEqual(m.last_assistant_text_in_tail(f2)[1], "tail-unparsed")
+        f3 = os.path.join(self.d, "c.jsonl")   # 空文件
+        open(f3, "w", encoding="utf-8").close()
+        self.assertEqual(m.last_assistant_text_in_tail(f3)[1], "empty")
+        f4 = os.path.join(self.d, "d.jsonl")   # 正常:found
+        with open(f4, "w", encoding="utf-8") as f:
+            f.write(CLEAN_ASSISTANT + "\n")
+        self.assertEqual(m.last_assistant_text_in_tail(f4)[1], "found")
+
+    def test_g9_fail_open_diagnostic_carries_reason(self):
+        # fail-open 的 stderr 诊断痕带可区分原因(GPT round-19:可见;round-20:可分)
+        self.write_transcript([
+            {"type": "user", "message": {"role": "user", "content": JARGON}},
+        ])
+        rc, b, err = self.gate(self.stop_payload())
+        self.assertIsNone(b)
+        self.assertIn("no-assistant-in-file", err,
+                      "诊断痕必须带原因代码(不再合流)")
 
 
 if __name__ == "__main__":
