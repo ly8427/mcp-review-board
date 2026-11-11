@@ -82,6 +82,15 @@ def _strings(obj):
             yield from _strings(v)
 
 
+# 渐进窗口（V1.1.4）：起始 64KB，找不到 assistant 记录时 ×4 倍增至 CAP——
+# ≥64KB 单条长回复不再被切掉（dsh #2041 §一 / pi #2042 执行实证的漏检）。
+# GPT round-21 P1：WINDOW_CAP 常量此前漏定义——渐进分支一进扩展即 NameError、
+# 被 fail-open 吞成静默放行，长回复漏检路径形同未修；本常量为该路径的生效前提。
+WINDOW_START = 65536
+WINDOW_CAP = 8 * 1024 * 1024
+WINDOW_GROWTH = 4
+
+
 def _assistant_text(rec):
     """从一条 JSONL 记录提取 assistant 回复文本；非 assistant 记录返回 None。"""
     if not isinstance(rec, dict):
@@ -123,7 +132,7 @@ def last_assistant_text_in_tail(path):
         size = os.path.getsize(path)
     except OSError:
         return None, "no-file"
-    window = 65536
+    window = WINDOW_START
     while True:
         start = max(0, size - window)
         try:
@@ -163,7 +172,7 @@ def last_assistant_text_in_tail(path):
             return None, "no-assistant-in-file"
         if window >= WINDOW_CAP or window >= size:
             return None, "cap-reached"
-        window *= 4
+        window *= WINDOW_GROWTH
 
 
 def extract_text(payload):

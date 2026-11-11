@@ -59,9 +59,16 @@ class Harness(unittest.TestCase):
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def gate(self, payload, env_extra=None):
-        # 缺口①(环境洗):AG_ROLLOUT 不摘除会让 transcript 路测试读到开发机环境文件
+        # 缺口①(环境洗):AG_ROLLOUT 不摘除会让 transcript 路测试读到开发机环境文件;
+        # Cursor/Grok 宿主标记同理——不摘会让宿主跳过逻辑在测试里静默生效
         e = dict(os.environ, **{"RB_REPAIR_DRYRUN": "1"})
         e.pop("AG_ROLLOUT", None)
+        for k in ("CURSOR_AGENT", "CURSOR_VERSION", "CURSOR_PROJECT_DIR",
+                  "CURSOR_TRANSCRIPT_PATH", "CURSOR_CONVERSATION_ID",
+                  "CURSOR_REQUEST_ID", "CURSOR_PLUGIN_ROOT",
+                  "GROK_HOOK_EVENT", "GROK_HOOK_NAME", "GROK_SESSION_ID",
+                  "GROK_WORKSPACE_ROOT", "REVIEWBOARD_PLAIN_SPEAK_FORCE"):
+            e.pop(k, None)
         if env_extra:
             e.update(env_extra)
         p = subprocess.run([PY, GATE],
@@ -246,14 +253,37 @@ class TestGateEndToEnd(Harness):
 
     def test_g6_window_grows_for_large_reply(self):
         # 缺口⑤(dsh #2041 §一):≥64KB 单条长回复被窗口整条切掉 → 漏检;
-        # 渐进窗口(64KB→×4→8MB 封顶)必须把它找回来
+        # 渐进窗口(64KB→×4→8MB 封顶)必须把它找回来。
+        # GPT round-21 三层验证:①直接调用断言 (text,reason)=(big,"found")——
+        # NameError/fail-open 在这一层就会现形;②端到端 stderr 无 fail-open 痕;
+        # ③≥64KB 且末尾含黑话的回复必须真拦截(不是异常放行)。
         big = "这批改动的说明已经用日常语言写清楚，没有需要解释的词。" * 1200  # ≈ 66KB+
         self.write_transcript([
             {"type": "assistant", "message": {"role": "assistant", "content": JARGON}},
             {"type": "assistant", "message": {"role": "assistant", "content": big}},
         ])
+        import importlib.util
+        s = importlib.util.spec_from_file_location("psg_g6", GATE)
+        m = importlib.util.module_from_spec(s)
+        s.loader.exec_module(m)
+        text, reason = m.last_assistant_text_in_tail(self.transcript)
+        self.assertEqual(reason, "found", "渐进窗口必须找到长回复")
+        self.assertTrue(text.startswith("这批改动的说明"), "找到的必须是长回复本体")
+        rc, b, err = self.gate(self.stop_payload())
+        self.assertIsNone(b, "≥64KB 的干净长回复必须被找到并放行")
+        self.assertNotIn("fail-open", err, "放行路径不得留 fail-open 诊断痕")
+
+    def test_g6b_large_reply_ending_with_jargon_is_blocked(self):
+        # ≥64KB 且末尾含黑话 → 必须真拦截(证明是检查在拦,不是异常放行)
+        big_jargon = ("这段说明先落盘再走治理链路。" * 60) + \
+            "最终把挂进主干的形态定下来。" * 800   # ≈ 64KB+,末尾黑话
+        self.write_transcript([
+            {"type": "assistant",
+             "message": {"role": "assistant", "content": big_jargon}},
+        ])
         rc, b, _ = self.gate(self.stop_payload())
-        self.assertIsNone(b, "≥64KB 的干净长回复必须被找到并放行(不因窗口切尾漏检)")
+        self.assertIsNotNone(b, "≥64KB 且末尾黑话 → 必须拦截")
+        self.assertIn("落盘", b["reason"])
 
     def test_g7_explicit_reply_keys_beat_longer_output(self):
         # 缺口②(dsh):键优先于最长串——response 是当前回复,output 是旧诊断回文
@@ -300,6 +330,72 @@ class TestGateEndToEnd(Harness):
         self.assertIsNone(b)
         self.assertIn("no-assistant-in-file", err,
                       "诊断痕必须带原因代码(不再合流)")
+
+
+class TestHostSkip(unittest.TestCase):
+    """GPT round-21 P2:宿主跳过逻辑(Cursor/Grok)独立测试。"""
+
+    ORDER = '修复单:: post_comment {"thread_id": 9, "body": "hi"}'
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.d = self._dir.name
+        self.transcript = os.path.join(self.d, "transcript.jsonl")
+        with open(self.transcript, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "assistant",
+                                "message": {"role": "assistant",
+                                            "content": "这段改动把配置读写收进一个入口，退出时统一落盘。"}},
+                               ensure_ascii=False) + "\n")
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def _run(self, env_extra):
+        payload = {"hook_event_name": "Stop", "stop_hook_active": False,
+                   "session_id": "hs", "transcript_path": self.transcript}
+        e = dict(os.environ)
+        e.pop("AG_ROLLOUT", None)
+        for k in ("CURSOR_AGENT", "CURSOR_VERSION", "CURSOR_PROJECT_DIR",
+                  "CURSOR_TRANSCRIPT_PATH", "CURSOR_CONVERSATION_ID",
+                  "CURSOR_REQUEST_ID", "CURSOR_PLUGIN_ROOT",
+                  "GROK_HOOK_EVENT", "GROK_HOOK_NAME", "GROK_SESSION_ID",
+                  "GROK_WORKSPACE_ROOT", "REVIEWBOARD_PLAIN_SPEAK_FORCE"):
+            e.pop(k, None)
+        e.update(env_extra)
+        r = subprocess.run([PY, GATE],
+                           input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                           capture_output=True, env=e, timeout=30)
+        out = r.stdout.decode("utf-8", "replace").strip()
+        try:
+            return json.loads(out) if out else None
+        except ValueError:
+            return None
+
+    def test_plain_env_gate_runs(self):
+        b = self._run({})
+        self.assertIsNotNone(b, "普通环境(Claude Code)闸必须在岗")
+
+    def test_cursor_env_skips(self):
+        b = self._run({"CURSOR_AGENT": "1"})
+        self.assertIsNone(b, "Cursor 宿主跳过(用户已要求 cursor 不做该检查)")
+
+    def test_cursor_hook_env_skips(self):
+        b = self._run({"CURSOR_TRANSCRIPT_PATH": "x"})
+        self.assertIsNone(b, "Cursor hook 环境标记同样跳过")
+
+    def test_grok_env_skips(self):
+        b = self._run({"GROK_SESSION_ID": "x"})
+        self.assertIsNone(b, "Grok 宿主跳过")
+
+    def test_force_overrides_skip(self):
+        b = self._run({"CURSOR_AGENT": "1",
+                       "REVIEWBOARD_PLAIN_SPEAK_FORCE": "1"})
+        self.assertIsNotNone(b, "FORCE=1 强制启用(覆盖宿主跳过)")
+
+    def test_both_markers_force_wins(self):
+        b = self._run({"CURSOR_AGENT": "1", "GROK_SESSION_ID": "x",
+                       "REVIEWBOARD_PLAIN_SPEAK_FORCE": "1"})
+        self.assertIsNotNone(b, "双宿主标记同时存在:FORCE 仍强制启用(行为明确)")
 
 
 if __name__ == "__main__":
