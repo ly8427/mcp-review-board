@@ -119,13 +119,14 @@ def last_assistant_text_in_tail(path):
 
     V1.1.4（board #109 五缺口收口，dsh #2041/pi #2042）：
       * **渐进窗口**：从 64KB 起，找不到 assistant 记录且文件仍有更早内容时
-        窗口 ×4 倍增至 8MB 封顶——≥64KB 的单条长回复不再被窗口整条切掉
-        （pi #2042 执行实证：70KB 黑话回复旧版会漏检）。
-      * **出口可区分**：返回原因 found / no-assistant-in-file / tail-unparsed /
-        cap-reached / no-file / unreadable——V1.1.3 曾把三种病因压进同一个
-        None 出口（dsh #2041 §一），诊断从此可分。
-      * 尾行（最后一条非空行）解析失败/非 JSON 开头 → tail-unparsed
-        （V1.1.3 语义保留：内容无法确认时禁止拿更早回复冒充）。
+        窗口按 WINDOW_GROWTH 倍增、min 夹到 WINDOW_CAP——≥64KB 的单条长回复
+        不再被窗口整条切掉（pi #2042 执行实证：70KB 黑话回复旧版会漏检）。
+      * **出口可区分（7 态）**：found / no-assistant-in-file / tail-unparsed /
+        cap-reached / no-file / unreadable / empty——V1.1.3 曾把三种病因压进
+        同一个 None 出口（dsh #2041 §一），诊断从此可分。
+      * 尾行（最后一条非空行）解析失败/非 JSON 开头 → **立即** tail-unparsed
+        （V1.1.6，dsh #2052 §二.4：扩窗解不开尾行不完整——它在文件尾，
+        与窗口大小无关；禁止拿更早回复冒充）。
     zcode rollout 与 claude transcript（#713 §3/#714 收敛的第三条路）同一读法。
     """
     try:
@@ -172,7 +173,7 @@ def last_assistant_text_in_tail(path):
             return None, "no-assistant-in-file"
         if window >= WINDOW_CAP or window >= size:
             return None, "cap-reached"
-        window *= WINDOW_GROWTH
+        window = min(window * WINDOW_GROWTH, WINDOW_CAP)
 
 
 def extract_text(payload):
@@ -180,7 +181,8 @@ def extract_text(payload):
     ① payload["last_assistant_message"]——claude Stop 官方权威字段，任意长度都算；
     ② payload 里名字像回复的字段——**显式"最近一条"键优先于最长串**
        （last_message > response > text > output；dsh 缺口②：最长串会让旧
-       诊断回文冒充当前回复），各键内仍取最长；
+       诊断回文冒充当前回复），同键内按文档序取**首个非空串**
+       （V1.1.6，dsh #2052 §二.2：同键 diagnostics 长文不得冒充 text 正文）；
     ③ payload["transcript_path"]（claude 宿主自带）→ 尾窗读最后一条 assistant 回复；
     ④ 会话 rollout 日志尾窗（zcode）同一语义。
     ③④ 都取不到 → stderr 留**可区分原因**的诊断痕后 fail-open 放行
@@ -195,15 +197,16 @@ def extract_text(payload):
     keyed = {}
     for k, v in payload.items():
         if re.search(r"response|preview|last|message|assistant|text|output", str(k), re.I):
-            keyed[k] = [s for s in _strings(v)]
-    # V1.1.4(board #109 dsh 缺口②):显式"最近一条"键优先于最长串——
-    # 最长串会让旧诊断回文冒充当前回复(last_message > response > text > output)
+            # V1.1.6(dsh #2052 §二.2):同键内按文档序取**首个非空 str**——
+            # 不再收全部嵌套串按长度选(同键 diagnostics 长文不得冒充 text 正文)
+            first = next((x for x in _strings(v) if x.strip()), None)
+            if first:
+                keyed[k] = first
+    # 显式"最近一条"键优先于其余(V1.1.4 ②;flat 兜底已删——同键内长度选择
+    # 正是冒充通道,dsh #2052 §二.3)
     for pref in ("last_message", "response", "text", "output"):
-        if pref in keyed and keyed[pref]:
-            return max(keyed[pref], key=len)
-    flat = [s for strs in keyed.values() for s in strs]
-    if flat:
-        return max(flat, key=len)
+        if pref in keyed:
+            return keyed[pref]
     diag = []
     tp = payload.get("transcript_path")
     if isinstance(tp, str) and tp:

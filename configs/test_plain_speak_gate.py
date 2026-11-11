@@ -271,16 +271,19 @@ class TestGateEndToEnd(Harness):
         self.assertTrue(text.startswith("这批改动的说明"), "找到的必须是长回复本体")
         rc, b, err = self.gate(self.stop_payload())
         self.assertIsNone(b, "≥64KB 的干净长回复必须被找到并放行")
-        self.assertNotIn("fail-open", err, "放行路径不得留 fail-open 诊断痕")
+        self.assertEqual(err, "", "干净放行路径本应零 stderr（GPT round-20 §一.2）")
 
     def test_g6b_large_reply_ending_with_jargon_is_blocked(self):
         # ≥64KB 且末尾含黑话 → 必须真拦截(证明是检查在拦,不是异常放行)
-        big_jargon = ("这段说明先落盘再走治理链路。" * 60) + \
-            "最终把挂进主干的形态定下来。" * 800   # ≈ 64KB+,末尾黑话
+        # V1.1.6(dsh #2052 §三.1):fixture 抬到 ≥64KB——旧 36.1KB 从未进渐进窗口
+        big_jargon = ("这段说明先落盘再走治理链路。" * 2200) + \
+            "最终把挂进主干的形态定下来。"   # ≈ 92KB,末尾黑话
         self.write_transcript([
             {"type": "assistant",
              "message": {"role": "assistant", "content": big_jargon}},
         ])
+        self.assertGreater(os.path.getsize(self.transcript), 65536,
+                           "场景前提:fixture ≥ 64KB(进渐进窗口)")
         rc, b, _ = self.gate(self.stop_payload())
         self.assertIsNotNone(b, "≥64KB 且末尾黑话 → 必须拦截")
         self.assertIn("落盘", b["reason"])
@@ -332,10 +335,70 @@ class TestGateEndToEnd(Harness):
                       "诊断痕必须带原因代码(不再合流)")
 
 
-class TestHostSkip(unittest.TestCase):
-    """GPT round-21 P2:宿主跳过逻辑(Cursor/Grok)独立测试。"""
+class TestTailReasonsAndWash(unittest.TestCase):
+    """GPT round-20/21 §三:七态原因、形状族、洗环境表派生(dsh #2052 §三)。"""
 
-    ORDER = '修复单:: post_comment {"thread_id": 9, "body": "hi"}'
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.d = self._dir.name
+        sys.path.insert(0, HERE)
+        import importlib.util
+        s = importlib.util.spec_from_file_location("psg_rw", GATE)
+        self.m = importlib.util.module_from_spec(s)
+        s.loader.exec_module(self.m)
+        self._old_cap = self.m.WINDOW_CAP
+
+    def tearDown(self):
+        self.m.WINDOW_CAP = self._old_cap
+        self._dir.cleanup()
+
+    def test_g10_cap_reached_reason(self):
+        # WINDOW_CAP 压到 64KB + 92KB 文件 → 扩窗在 cap 处停下 → cap-reached
+        self.m.WINDOW_CAP = 65536
+        f1 = os.path.join(self.d, "cap.jsonl")
+        with open(f1, "w", encoding="utf-8") as f:
+            f.write(CLEAN_ASSISTANT + "\n")
+            f.write('{"type":"assistant","message":{"content":"' + "y" * 91000 + '"}}\n')
+        text, reason = self.m.last_assistant_text_in_tail(f1)
+        self.assertEqual(reason, "cap-reached")
+        self.assertIsNone(text)
+
+    def test_g11_no_file_reason(self):
+        missing = os.path.join(self.d, "missing.jsonl")
+        self.assertEqual(self.m.last_assistant_text_in_tail(missing)[1], "no-file")
+
+    def test_g12_unreadable_reason(self):
+        dpath = os.path.join(self.d, "adir")   # 传目录:open 必失败
+        os.makedirs(dpath, exist_ok=True)
+        self.assertEqual(self.m.last_assistant_text_in_tail(dpath)[1], "unreadable")
+
+    def test_g13_shape_family_cursor_native(self):
+        # cursor 原生形状(无 hook_event_name + status/loop_count)→ 跳过
+        self.assertTrue(self.m._skip_for_cursor_host(
+            {"loop_count": 1, "status": "completed"}))
+        # 同形状 + 显式 hook_event_name=Stop → 不跳过(闸在岗)
+        self.assertFalse(self.m._skip_for_cursor_host(
+            {"hook_event_name": "Stop", "loop_count": 1, "status": "completed"}))
+
+    def test_g14_wash_list_derived_from_gate_source(self):
+        # GPT round-20 §三.5/round-21:洗环境表必须覆盖闸源码里读的每一个
+        # 环境名——从源码派生(而非手抄),新读一个名字而洗表没跟 = 测试红
+        import re as _re
+        src = open(GATE, encoding="utf-8").read()
+        names = set(_re.findall(r'os\.environ(?:\.get\(|\[)["\']([A-Za-z_]+)["\']', src))
+        wash = {"AG_ROLLOUT", "CLAUDE_SESSION_ID", "ZCODE_SESSION_ID",
+                "REVIEWBOARD_PLAIN_SPEAK_FORCE", "CURSOR_AGENT", "CURSOR_VERSION",
+                "CURSOR_PROJECT_DIR", "CURSOR_TRANSCRIPT_PATH",
+                "CURSOR_CONVERSATION_ID", "CURSOR_REQUEST_ID", "CURSOR_PLUGIN_ROOT",
+                "GROK_HOOK_EVENT", "GROK_HOOK_NAME", "GROK_SESSION_ID",
+                "GROK_WORKSPACE_ROOT"}
+        self.assertTrue(names <= wash,
+                        f"闸新读的环境名未进洗表: {sorted(names - wash)}")
+        self.assertEqual(len(wash), 15, "洗表 15 名(dsh #2052 §一:闸实读 15 枚)")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
 
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
