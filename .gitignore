@@ -40,3 +40,4 @@ server.py.bak-*
 configs/repair-gate-state.json
 configs/repair-gate-log.txt
 configs/repair-gate-alarm.txt
+configs/repair-gate-state.json.claim

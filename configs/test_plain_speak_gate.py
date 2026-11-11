@@ -63,6 +63,8 @@ class Harness(unittest.TestCase):
         # Cursor/Grok 宿主标记同理——不摘会让宿主跳过逻辑在测试里静默生效
         e = dict(os.environ, **{"RB_REPAIR_DRYRUN": "1"})
         e.pop("AG_ROLLOUT", None)
+        e.pop("CLAUDE_SESSION_ID", None)   # session_id 为空的载荷会退读这两个宿主会话名
+        e.pop("ZCODE_SESSION_ID", None)
         for k in ("CURSOR_AGENT", "CURSOR_VERSION", "CURSOR_PROJECT_DIR",
                   "CURSOR_TRANSCRIPT_PATH", "CURSOR_CONVERSATION_ID",
                   "CURSOR_REQUEST_ID", "CURSOR_PLUGIN_ROOT",
@@ -381,20 +383,48 @@ class TestTailReasonsAndWash(unittest.TestCase):
             {"hook_event_name": "Stop", "loop_count": 1, "status": "completed"}))
 
     def test_g14_wash_list_derived_from_gate_source(self):
-        # GPT round-20 §三.5/round-21:洗环境表必须覆盖闸源码里读的每一个
-        # 环境名——从源码派生(而非手抄),新读一个名字而洗表没跟 = 测试红
+        # GPT round-20 §三.5 / dsh #2065 §2:洗环境表从**闸源码 ast 派生**——
+        # 旧正则只捕直读字面量(5 枚),循环键族 os.environ.get(key) 是动态名捕不到。
+        # 收三类:①os.environ.get("X")/os.environ["X"] 直读字面量
+        # ②For 循环绑定的常量元组(cursor/grok 键族) ③.pop("X") 显式洗名;
+        # 全大写形状过滤普通字符串。断言:闸真读集 ⊆ 本测试文件洗表——
+        # 闸新读一个名字而洗表没跟 = 测试红;数目漂移同样红(钉 dsh #2052 §一)。
+        import ast as _ast
         import re as _re
-        src = open(GATE, encoding="utf-8").read()
-        names = set(_re.findall(r'os\.environ(?:\.get\(|\[)["\']([A-Za-z_]+)["\']', src))
-        wash = {"AG_ROLLOUT", "CLAUDE_SESSION_ID", "ZCODE_SESSION_ID",
-                "REVIEWBOARD_PLAIN_SPEAK_FORCE", "CURSOR_AGENT", "CURSOR_VERSION",
-                "CURSOR_PROJECT_DIR", "CURSOR_TRANSCRIPT_PATH",
-                "CURSOR_CONVERSATION_ID", "CURSOR_REQUEST_ID", "CURSOR_PLUGIN_ROOT",
-                "GROK_HOOK_EVENT", "GROK_HOOK_NAME", "GROK_SESSION_ID",
-                "GROK_WORKSPACE_ROOT"}
-        self.assertTrue(names <= wash,
-                        f"闸新读的环境名未进洗表: {sorted(names - wash)}")
-        self.assertEqual(len(wash), 15, "洗表 15 名(dsh #2052 §一:闸实读 15 枚)")
+
+        def _env_names(src):
+            names = set()
+            for node in _ast.walk(_ast.parse(src)):
+                if isinstance(node, _ast.For) and isinstance(node.iter, _ast.Tuple):
+                    names.update(e.value for e in node.iter.elts
+                                 if isinstance(e, _ast.Constant)
+                                 and isinstance(e.value, str))
+                if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute) \
+                        and node.func.attr == "pop" and node.args \
+                        and isinstance(node.args[0], _ast.Constant) \
+                        and isinstance(node.args[0].value, str):
+                    names.add(node.args[0].value)
+                if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute) \
+                        and node.func.attr == "get" \
+                        and isinstance(node.func.value, _ast.Attribute) \
+                        and node.func.value.attr == "environ" and node.args \
+                        and isinstance(node.args[0], _ast.Constant) \
+                        and isinstance(node.args[0].value, str):
+                    names.add(node.args[0].value)
+                elif isinstance(node, _ast.Subscript) \
+                        and isinstance(node.value, _ast.Attribute) \
+                        and node.value.attr == "environ" \
+                        and isinstance(node.slice, _ast.Constant) \
+                        and isinstance(node.slice.value, str):
+                    names.add(node.slice.value)
+            return {n for n in names if _re.fullmatch(r"[A-Z][A-Z0-9_]*", n)}
+
+        gate_names = _env_names(open(GATE, encoding="utf-8").read())
+        test_names = _env_names(open(os.path.abspath(__file__), encoding="utf-8").read())
+        self.assertTrue(gate_names <= test_names,
+                        f"闸新读的环境名未进测试洗表: {sorted(gate_names - test_names)}")
+        self.assertEqual(len(gate_names), 15,
+                         f"闸实读环境名数漂移(dsh #2052 §一 = 15): {sorted(gate_names)}")
 
 
 class TestHostSkip(unittest.TestCase):
@@ -405,20 +435,30 @@ class TestHostSkip(unittest.TestCase):
         self._dir = tempfile.TemporaryDirectory()
         self.d = self._dir.name
         self.transcript = os.path.join(self.d, "transcript.jsonl")
+        fixture = ("这段改动把配置读写收进一个入口，退出时统一落盘。")
+        # V1.1.7(dsh #2065 §1 闭合点①):牙钉——fixture 必含词典词「落盘」且
+        # 无解释标记,三条 skip 用例的 assertIsNone 才有判别力;fixture 换成
+        # 干净正文时本断言立即红,防六用例退化成空过
+        self.assertIn("落盘", fixture)
         with open(self.transcript, "w", encoding="utf-8") as f:
             f.write(json.dumps({"type": "assistant",
                                 "message": {"role": "assistant",
-                                            "content": "这段改动把配置读写收进一个入口，退出时统一落盘。"}},
+                                            "content": fixture}},
                                ensure_ascii=False) + "\n")
 
     def tearDown(self):
         self._dir.cleanup()
 
     def _run(self, env_extra):
+        # V1.1.7(dsh #2065 §1 闭合点②):改回全返回 (rc, b, err)——b=None 有
+        # 两种病因(宿主跳过生效 / 取文失败 fail-open),只回 body 分不开;
+        # 与 Harness.gate 同一返回形状,第三份洗表随本表并入 gate() 后消灭
         payload = {"hook_event_name": "Stop", "stop_hook_active": False,
                    "session_id": "hs", "transcript_path": self.transcript}
         e = dict(os.environ)
         e.pop("AG_ROLLOUT", None)
+        e.pop("CLAUDE_SESSION_ID", None)   # 本载荷 session_id 非空用不到;洗齐 15 名(g14 ast 断言)
+        e.pop("ZCODE_SESSION_ID", None)
         for k in ("CURSOR_AGENT", "CURSOR_VERSION", "CURSOR_PROJECT_DIR",
                   "CURSOR_TRANSCRIPT_PATH", "CURSOR_CONVERSATION_ID",
                   "CURSOR_REQUEST_ID", "CURSOR_PLUGIN_ROOT",
@@ -430,35 +470,41 @@ class TestHostSkip(unittest.TestCase):
                            input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                            capture_output=True, env=e, timeout=30)
         out = r.stdout.decode("utf-8", "replace").strip()
+        err = r.stderr.decode("utf-8", "replace")
         try:
-            return json.loads(out) if out else None
+            return r.returncode, (json.loads(out) if out else None), err
         except ValueError:
-            return None
+            return r.returncode, None, err
 
     def test_plain_env_gate_runs(self):
-        b = self._run({})
+        rc, b, err = self._run({})
         self.assertIsNotNone(b, "普通环境(Claude Code)闸必须在岗")
+        self.assertEqual(rc, 0)
 
     def test_cursor_env_skips(self):
-        b = self._run({"CURSOR_AGENT": "1"})
+        rc, b, err = self._run({"CURSOR_AGENT": "1"})
         self.assertIsNone(b, "Cursor 宿主跳过(用户已要求 cursor 不做该检查)")
+        self.assertEqual(err, "", "跳过=原样放过去,零 stderr")
 
     def test_cursor_hook_env_skips(self):
-        b = self._run({"CURSOR_TRANSCRIPT_PATH": "x"})
+        rc, b, err = self._run({"CURSOR_TRANSCRIPT_PATH": "x"})
         self.assertIsNone(b, "Cursor hook 环境标记同样跳过")
+        self.assertEqual(err, "")
 
     def test_grok_env_skips(self):
-        b = self._run({"GROK_SESSION_ID": "x"})
+        rc, b, err = self._run({"GROK_SESSION_ID": "x"})
         self.assertIsNone(b, "Grok 宿主跳过")
+        self.assertEqual(err, "")
 
     def test_force_overrides_skip(self):
-        b = self._run({"CURSOR_AGENT": "1",
-                       "REVIEWBOARD_PLAIN_SPEAK_FORCE": "1"})
+        rc, b, err = self._run({"CURSOR_AGENT": "1",
+                                "REVIEWBOARD_PLAIN_SPEAK_FORCE": "1"})
         self.assertIsNotNone(b, "FORCE=1 强制启用(覆盖宿主跳过)")
+        self.assertEqual(rc, 0)
 
     def test_both_markers_force_wins(self):
-        b = self._run({"CURSOR_AGENT": "1", "GROK_SESSION_ID": "x",
-                       "REVIEWBOARD_PLAIN_SPEAK_FORCE": "1"})
+        rc, b, err = self._run({"CURSOR_AGENT": "1", "GROK_SESSION_ID": "x",
+                                "REVIEWBOARD_PLAIN_SPEAK_FORCE": "1"})
         self.assertIsNotNone(b, "双宿主标记同时存在:FORCE 仍强制启用(行为明确)")
 
 

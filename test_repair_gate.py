@@ -834,12 +834,16 @@ class V25ScanAndExec(unittest.TestCase):
                     with open(rollout, "a", encoding="utf-8") as f:
                         f.write(json.dumps({"type": "assistant", "text": "执行 " + hid},
                                            ensure_ascii=False) + "\n")
-                    run()
+                    b2 = run()
                     st = json.load(open(env["RB_REPAIR_STATE"], encoding="utf-8"))
+                    diag = "bounce=%r scan=%r entry=%r" % (
+                        (b2 or {}).get("reason", "")[:220],
+                        st.get("_scan"), st[hid])
                     self.assertEqual(bool(st[hid].get("done")), expect_done,
-                                     "out=%r done 期望 %s" % (out_json, expect_done))
+                                     "out=%r done 期望 %s; %s" % (out_json, expect_done, diag))
                     if not expect_done:
-                        self.assertTrue(st[hid].get("executing"), "未确认→executing 人工核")
+                        self.assertTrue(st[hid].get("executing"),
+                                        "未确认→executing 人工核; %s" % diag)
                 finally:
                     shutil.rmtree(d, ignore_errors=True)
 
