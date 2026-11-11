@@ -113,6 +113,9 @@ def last_assistant_text_in_tail(path):
     形成「改写 → 再扫旧文 → 再打回」死循环。现改为按记录序取最后一条
     assistant 记录（Stop 触发时它就是本轮刚结束的回复）；user/tool 记录
     一律跳过；尾段找不到 assistant 记录 → None（fail-open 放行，留日志）。
+    V1.1.3（GPT round-20 P1）：**最后一条非空行解析失败/非 JSON 开头 → 返回
+    None**——它可能就是本轮正被写入的回复，内容无法确认时禁止拿更早的
+    回复冒充（宁可漏检一轮，不错误打回）。
 
     zcode rollout 与 claude transcript（#713 §3/#714 收敛的第三条路）同一读法，
     收进同一函数，避免两份尾读逻辑漂移。
@@ -125,15 +128,26 @@ def last_assistant_text_in_tail(path):
             tail = f.read().decode("utf-8", "replace")
     except OSError:
         return None
+    lines = [l.strip() for l in tail.splitlines() if l.strip()]
+    if not lines:
+        return None
     last = None
-    for line in tail.splitlines():
-        line = line.strip()
+    for i, line in enumerate(lines):
+        is_final = i == len(lines) - 1
         if not line.startswith("{"):
+            if is_final:
+                # V1.1.3(GPT round-20 P1):最后一条非空行不是 JSON 开头——可能
+                # 正被写入/已损坏,内容无法确认 ⇒ 禁止拿更早的 assistant 回复
+                # 冒充当前回复,返回 None(fail-open,宁可漏检一轮不错误打回)
+                return None
             continue
         try:
             rec = json.loads(line)
         except ValueError:
-            continue                      # 未写完的尾行/坏行：跳过
+            if is_final:
+                # GPT round-20 P1:尾行解析失败 → None,不再退回更早的回复
+                return None
+            continue                      # 非尾行的坏行：跳过(历史行为)
         text = _assistant_text(rec)
         if text:
             last = text                   # 记录序在后 = 更新；只记不比长度

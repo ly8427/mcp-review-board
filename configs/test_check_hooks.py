@@ -103,6 +103,13 @@ class TestCheckHooks(unittest.TestCase):
         self.assertEqual(out.count("[OK ] ALIVE"), 3,
                          "三闸各一行 OK(本配置形状;不含 ZCode 回归行)")
 
+    def test_n5_hooks_field_null_is_fatal(self):
+        # GPT round-20 P2：hooks 缺失/null 不再静默当空列表——结构错误必须显式报
+        self._write({"hooks": {"Stop": [{"matcher": None, "hooks": None}]}})
+        rc, out, _ = self._run()
+        self.assertEqual(rc, 2)
+        self.assertIn("hooks 缺失或为空", out)
+
     def test_p2_missing_gate_is_bad(self):
         shape = _claude_shape(with_gates=True)
         # 拆掉 automation_guard 接线

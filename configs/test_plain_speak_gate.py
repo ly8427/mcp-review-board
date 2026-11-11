@@ -109,8 +109,9 @@ class TestTailExtraction(Harness):
             {"type": "user", "message": {"role": "user", "content": JARGON}},
         ]))
 
-    def test_a4_incomplete_tail_line_skipped(self):
-        # 未写完的尾行：跳过（不崩），取前面完整的 assistant 记录
+    def test_a4_incomplete_tail_line_fails_open(self):
+        # V1.1.3（GPT round-20 P1）预期翻转：尾行不完整（可能正被写入）→
+        # 返回 None（fail-open），**禁止**拿前面完整的 assistant 回复冒充当前轮
         with open(self.transcript, "w", encoding="utf-8") as f:
             f.write(CLEAN_ASSISTANT + "\n")
             f.write('{"type":"assistant","message":{"content":"半截')   # 无换行，坏 JSON
@@ -119,7 +120,7 @@ class TestTailExtraction(Harness):
         s = importlib.util.spec_from_file_location("psg_extract2", GATE)
         m = importlib.util.module_from_spec(s)
         s.loader.exec_module(m)
-        self.assertEqual(m.extract_text(payload), CLEAN)
+        self.assertIsNone(m.extract_text(payload))
 
 
 class TestGateEndToEnd(Harness):
@@ -210,6 +211,19 @@ class TestGateEndToEnd(Harness):
         rc, b, err = self.gate(self.stop_payload())
         self.assertIsNone(b)
         self.assertIn("fail-open", err, "fail-open 必须留 stderr 诊断痕（GPT 要求可见）")
+
+
+    # ── GPT round-20 P1 验收：旧黑话 assistant 在前 + 尾行不完整 → 不得拿旧文打回 ──
+    def test_g5_incomplete_tail_fails_open_not_blocked_with_old_jargon(self):
+        self.write_transcript([
+            {"type": "assistant",
+             "message": {"role": "assistant", "content": JARGON}},   # 旧黑话长文
+        ])
+        with open(self.transcript, "a", encoding="utf-8") as f:
+            f.write('{"type":"assistant","message":{"content":"这半截')   # 无换行，坏 JSON
+        rc, b, _ = self.gate(self.stop_payload())
+        self.assertIsNone(b, "尾行不完整 → fail-open 放行，不得拿旧黑话文打回")
+        self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":

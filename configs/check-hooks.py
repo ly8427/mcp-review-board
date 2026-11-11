@@ -62,8 +62,13 @@ def load_commands(cfg_path: pathlib.Path):
         for entry in entries or []:
             if not isinstance(entry, dict):
                 raise ValueError(f"事件 {event} 的条目不是对象")
+            hooks_list = entry.get("hooks")
+            # V1.1.4(GPT round-20 P2):hooks 缺失/null/空列表 = 结构错误,
+            # 不再静默当空列表——不完整检查会伪装成「全部在岗」
+            if not isinstance(hooks_list, list) or not hooks_list:
+                raise ValueError(f"事件 {event} 的 hooks 缺失或为空")
             matcher = entry.get("matcher")
-            for hook in entry.get("hooks") or []:
+            for hook in hooks_list:
                 if not isinstance(hook, dict):
                     raise ValueError(f"事件 {event} 的 hook 条目不是对象")
                 out.append({"event": event, "matcher": matcher,
