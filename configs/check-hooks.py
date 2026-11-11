@@ -43,22 +43,37 @@ def load_commands(cfg_path: pathlib.Path):
     - ZCode cli：hooks.events.<Event> = [{matcher, hooks:[{command, timeoutMs}]}]
     - claude-code settings.json：hooks.<Event> = [{matcher, hooks:[{command, timeout(秒)}]}]
       ——claude 形状没有 events 中间层，把 hooks 本身当事件表遍历即可。
+    V2（GPT round-19 P2-1）：结构不识别/条目形状错 → 抛 ValueError（main 落
+    [FATAL] rc=2），不再静默跳过——「没检查到」绝不能解释为「检查通过」。
     """
     data = json.loads(cfg_path.read_text(encoding="utf-8"))
-    hooks = data.get("hooks") or {}
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        raise ValueError("hooks 段缺失或不是对象")
     events = hooks.get("events")
-    if not isinstance(events, dict):
-        events = hooks  # claude-code 形状：事件名直接是键
+    if events is None:
+        events = hooks              # claude-code 形状：事件名直接是键
+    elif not isinstance(events, dict):
+        raise ValueError("hooks.events 不是对象")
     out = []
     for event, entries in events.items():
         if not isinstance(entries, list):
-            continue
+            raise ValueError(f"事件 {event} 的条目不是列表（形状不识别）")
         for entry in entries or []:
+            if not isinstance(entry, dict):
+                raise ValueError(f"事件 {event} 的条目不是对象")
             matcher = entry.get("matcher")
             for hook in entry.get("hooks") or []:
-                out.append({"event": event, "matcher": matcher, "command": hook.get("command") or "",
+                if not isinstance(hook, dict):
+                    raise ValueError(f"事件 {event} 的 hook 条目不是对象")
+                out.append({"event": event, "matcher": matcher,
+                            "command": hook.get("command") or "",
                             "timeout_ms": hook.get("timeoutMs")})
     return out
+
+
+# 票8 三道闸（GPT round-19：配置里至少要能看到这三条接线，缺一即 BAD）
+EXPECTED_GATES = ("quorum_guard_hook.py", "automation_guard_hook.py", "plain_speak_gate.py")
 
 
 def smoke_payload(command: str) -> bytes:
@@ -169,15 +184,28 @@ def main() -> int:
         return 2
     try:
         cmds = load_commands(cfg)
-    except Exception as e:  # JSON 坏了也算致命
-        print(f"[FATAL] 配置不是合法 JSON: {e}")
+    except Exception as e:  # JSON 坏了/结构不识别也算致命（GPT round-19 P2-1）
+        print(f"[FATAL] 配置不可用: {e}")
         return 2
 
     if args.hook:
         cmds = [c for c in cmds if args.hook in c["command"]]
+    elif not cmds:
+        # GPT round-19 P2-1：空配置/没解析到任何钩子 = 检查器失职的伪装成功，必须失败
+        print("[FATAL] 没有解析到任何钩子（配置为空或结构不识别）——"
+              "「没检查到」不能解释为「检查通过」")
+        return 2
+
+    bad = 0
+    if not args.hook:
+        # 票8 三道闸接线完整性：缺一即 BAD（对两种配置形状同样生效）
+        joined = " ".join(c["command"] for c in cmds)
+        for gate in EXPECTED_GATES:
+            if gate not in joined:
+                print(f"[BAD] 预期闸未接线   {gate} — 配置里看不到这条闸的 command")
+                bad += 1
 
     print(f"检查 {len(cmds)} 条钩子（配置: {cfg}）\n")
-    bad = 0
     for c in cmds:
         rc, out, err = run_command(c["command"], smoke_payload(c["command"]))
         state, detail = classify(rc, out, err)

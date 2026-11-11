@@ -1,0 +1,42 @@
+{
+  "_说明": "claude 宿主（claude 命令行工具 ~/.claude/settings.json）装闸模板——批次4.2（票8 #71）。把 <PYTHON>、<REPO>、<你> 三类占位替换为本机实际值后，将 hooks 段与 env 两键合并进 ~/.claude/settings.json（现有键全保留，勿整文件替换）。合并后必须验证：python -c \"import json;json.load(open(r'C:/Users/<你>/.claude/settings.json',encoding='utf-8'))\" 且 python configs/check-hooks.py --config <settings 路径> 三条全 ALIVE。逐键说明见 configs/onboarding.md「逐宿主定档」节。zcode 键故意缺席：claude 宿主无法核实 zcode watcher 健康，缺文件 ⇒ fail-closed 拒绝并给指引（票8 验收③特性）。",
+  "env": {
+    "RB_WATCHER_GATES_JSON": "{\"claude\":\"C:/Users/<你>/.rb-wake/claude-watcher.fails\",\"dsh\":\"C:/Users/<你>/.rb-wake/dsh-watcher.fails\",\"pi\":\"C:/Users/<你>/.rb-wake/pi-watcher.fails\"}",
+    "RB_POLL_MARKER": "C:/Users/<你>/.zcode/rb-claude-poll-heartbeat"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__review-board__(create_thread|set_quorum|set_verdict)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"<PYTHON>\" \"<REPO>/configs/quorum_guard_hook.py\"",
+            "timeout": 20
+          }
+        ]
+      },
+      {
+        "matcher": "CronCreate|CronUpdate|OffPeakCreate",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"<PYTHON>\" \"<REPO>/configs/automation_guard_hook.py\"",
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"<PYTHON>\" \"<REPO>/configs/plain_speak_gate.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

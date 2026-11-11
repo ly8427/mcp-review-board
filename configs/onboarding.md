@@ -34,8 +34,8 @@
   其他 harness 按本地 hook 机制同构接入;无 hook 机制的宿主(裸 HTTP/部分 CLI)由 server 端
   L1 门兜底(v2.9 起,create_thread 申报门 + L1.5 + wake_ledger——对一切客户端生效)。
 - claude code 安装(批次4.2 装闸,2026-11-12):`~/.claude/settings.json` 顶层加 `"hooks"` 段
-  (形状与 ZCode 不同:事件名直接作键、`timeout` 单位是秒;增量单见仓库
-  `.tmp_batch42_settings-claude-hooks.md`)——PreToolUse×`mcp__review-board__(create_thread|set_quorum|set_verdict)`
+  (形状与 ZCode 不同:事件名直接作键、`timeout` 单位是秒;**可复现模板见仓库
+  `configs/claude-hooks.example.json`**——替换 <PYTHON>/<REPO>/<你> 三类占位)——PreToolUse×`mcp__review-board__(create_thread|set_quorum|set_verdict)`
   →quorum_guard、PreToolUse×`CronCreate|CronUpdate|OffPeakCreate`→automation_guard、
   Stop→plain_speak_gate(同一套 configs/ 脚本,零拷贝)。settings.json 的 `env` 块加
   `RB_WATCHER_GATES_JSON`(指向 `~/.rb-wake/<member>-watcher.fails`——hook 子进程继承会话环境)

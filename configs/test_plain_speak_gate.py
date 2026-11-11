@@ -171,5 +171,46 @@ class TestGateEndToEnd(Harness):
         self.assertIsNone(b, "第三条路（rollout）同样取最后一条 assistant：干净 → 放行")
 
 
+    # ── GPT round-19 P1 子项：短回复不得丢弃 / last_assistant_message 权威 ──
+    def test_g_short_reply_via_payload_not_dropped(self):
+        # 旧实现 len>=30 门槛会把短回复丢进尾读 → 错扫旧轮（GPT round-19 P1）
+        self.write_transcript([
+            {"type": "assistant",
+             "message": {"role": "assistant", "content": JARGON}},   # 旧长文
+        ])
+        payload = {**self.stop_payload(), "last_message": "好的。"}   # 短回复
+        rc, b, _ = self.gate(payload)
+        self.assertIsNone(b, "短回复也必须被检查（这次它是干净的→放行）")
+
+    def test_g2_short_jargon_reply_still_blocked(self):
+        self.write_transcript([
+            {"type": "assistant",
+             "message": {"role": "assistant", "content": CLEAN}},
+        ])
+        payload = {**self.stop_payload(), "last_message": "先落盘再说。"}  # 短黑话
+        rc, b, _ = self.gate(payload)
+        self.assertIsNotNone(b, "短黑话回复同样要拦（门槛不得放走它）")
+        self.assertIn("落盘", b["reason"])
+
+    def test_g3_last_assistant_message_is_authoritative(self):
+        # claude Stop 官方字段：任意长度、优先于尾读
+        self.write_transcript([
+            {"type": "assistant",
+             "message": {"role": "assistant", "content": JARGON}},   # 尾读会选中它
+        ])
+        payload = {**self.stop_payload(),
+                   "last_assistant_message": CLEAN}                  # 短而干净
+        rc, b, _ = self.gate(payload)
+        self.assertIsNone(b, "官方字段优先于尾读，短干净回复放行")
+
+    def test_g4_fail_open_leaves_diagnostic_on_stderr(self):
+        self.write_transcript([
+            {"type": "user", "message": {"role": "user", "content": JARGON}},
+        ])
+        rc, b, err = self.gate(self.stop_payload())
+        self.assertIsNone(b)
+        self.assertIn("fail-open", err, "fail-open 必须留 stderr 诊断痕（GPT 要求可见）")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

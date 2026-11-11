@@ -141,33 +141,48 @@ def last_assistant_text_in_tail(path):
 
 
 def extract_text(payload):
-    """取"刚写完的回复"，三条路按序：payload 里名字像回复的字段 →
-    payload["transcript_path"]（claude 宿主 Stop 自带）→ 会话 rollout 日志尾段（zcode）。
-    退读两条路都取**最后一条 assistant 回复**（V1.1.1，board #109）——
-    禁止用尾段最长串冒充当前回复（改写后仍被旧文反复打回的死循环根因）。"""
-    keyed = []
-    for k, v in (payload.items() if isinstance(payload, dict) else []):
-        if re.search(r"response|preview|last|message|assistant|text|output", str(k), re.I):
-            keyed += [s for s in _strings(v)]
-    keyed = [s for s in keyed if len(s) >= 30]
-    if keyed:
-        return max(keyed, key=len)
+    """取"刚写完的回复"，按权威级四路（V1.1.2，GPT round-19 P1 收口）：
+    ① payload["last_assistant_message"]——claude Stop 官方权威字段，**任意长度
+       都算**（GPT round-19：短回复被 30 字门槛丢弃会漏检当前轮、错扫旧轮）；
+    ② payload 里名字像回复的字段（zcode Stop 的 last_message 等，同样不限长度）；
+    ③ payload["transcript_path"]（claude 宿主自带）→ 尾读最后一条 assistant 回复；
+    ④ 会话 rollout 日志尾段（zcode）同一语义。
+    ③④ 都取不到 → stderr 留诊断痕后 fail-open 放行（GPT round-19：fail-open
+    必须可见，不许无声）。退读两条路都取**最后一条 assistant 回复**
+    （V1.1.1，board #109）——禁止用尾段最长串冒充当前回复。"""
     if not isinstance(payload, dict):
         return None
-    # 第三条路（#713 §3 / #714 收敛）：claude 宿主 Stop payload 自带 transcript_path
-    # （本会话 JSONL 全量记录），读尾 64KB 取最后一条 assistant 回复。
+    lam = payload.get("last_assistant_message")
+    if isinstance(lam, str) and lam.strip():
+        return lam
+    keyed = []
+    for k, v in payload.items():
+        if re.search(r"response|preview|last|message|assistant|text|output", str(k), re.I):
+            keyed += [s for s in _strings(v)]
+    if keyed:
+        return max(keyed, key=len)
+    diag = []
     tp = payload.get("transcript_path")
     if isinstance(tp, str) and tp:
         best = last_assistant_text_in_tail(tp)
         if best:
             return best
+        diag.append(f"transcript 尾段无 assistant 回复: {tp}")
     sid = payload.get("session_id")
     sid = sid or os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("ZCODE_SESSION_ID")
     if not sid:
+        if diag:
+            sys.stderr.write("[plain-speak] fail-open（无当前轮文本可查）: "
+                             + "; ".join(diag) + "\n")
         return None
     path = os.environ.get("AG_ROLLOUT") or os.path.join(
         os.path.expanduser("~"), ".zcode", "cli", "rollout", f"model-io-session_{sid}.jsonl")
-    return last_assistant_text_in_tail(path)
+    best = last_assistant_text_in_tail(path)
+    if best:
+        return best
+    diag.append(f"rollout 尾段无 assistant 回复: {path}")
+    sys.stderr.write("[plain-speak] fail-open（无当前轮文本可查）: " + "; ".join(diag) + "\n")
+    return None
 
 
 def strip_code_and_urls(text: str) -> str:
