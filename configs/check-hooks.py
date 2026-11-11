@@ -7,6 +7,12 @@ r"""check-hooks：把 config.json 里每条 hook command 原样执行一次，�
 
 用法：python check-hooks.py [--config <path>] [--hook <substr>]
 退出码：0 = 全部在岗；1 = 有闸不在岗；2 = 配置本身读不出来。
+
+runner 约束（pi #745-2，票8 验收②必须注明）：本脚本"原样执行"的命令含 cmd.exe /c +
+Windows 宿主 python.exe ⇒ 只在 Windows 宿主跑得动；WSL 内跑会全部 [BAD] DEAD
+（rc=None 命令无法执行）——那是环境差异，不是闸死。配置一律给绝对路径：
+默认 ~/.zcode/cli/config.json 是 ZCode cli 形状；--config ~/.claude/settings.json
+读 claude-code 形状（4.2 装闸起本机两份并存，形状差异见 load_commands）。
 """
 from __future__ import annotations
 
@@ -33,9 +39,20 @@ SMOKE = {
 
 
 def load_commands(cfg_path: pathlib.Path):
+    """两种配置形状都读（票8 起本机两份并存，判形状的依据是有没有 events 中间层）：
+    - ZCode cli：hooks.events.<Event> = [{matcher, hooks:[{command, timeoutMs}]}]
+    - claude-code settings.json：hooks.<Event> = [{matcher, hooks:[{command, timeout(秒)}]}]
+      ——claude 形状没有 events 中间层，把 hooks 本身当事件表遍历即可。
+    """
     data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    hooks = data.get("hooks") or {}
+    events = hooks.get("events")
+    if not isinstance(events, dict):
+        events = hooks  # claude-code 形状：事件名直接是键
     out = []
-    for event, entries in (data.get("hooks") or {}).get("events", {}).items():
+    for event, entries in events.items():
+        if not isinstance(entries, list):
+            continue
         for entry in entries or []:
             matcher = entry.get("matcher")
             for hook in entry.get("hooks") or []:
@@ -177,4 +194,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

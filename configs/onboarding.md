@@ -33,6 +33,14 @@
   `"hooks":{"enabled":true,"events":{"PreToolUse":[{"matcher":"mcp__review-board__(create_thread|set_quorum|set_verdict)","hooks":[{"type":"command","command":"python <repo>/configs/quorum_guard_hook.py","timeoutMs":20000}]}]}}`;
   其他 harness 按本地 hook 机制同构接入;无 hook 机制的宿主(裸 HTTP/部分 CLI)由 server 端
   L1 门兜底(v2.9 起,create_thread 申报门 + L1.5 + wake_ledger——对一切客户端生效)。
+- claude code 安装(批次4.2 装闸,2026-11-12):`~/.claude/settings.json` 顶层加 `"hooks"` 段
+  (形状与 ZCode 不同:事件名直接作键、`timeout` 单位是秒;增量单见仓库
+  `.tmp_batch42_settings-claude-hooks.md`)——PreToolUse×`mcp__review-board__(create_thread|set_quorum|set_verdict)`
+  →quorum_guard、PreToolUse×`CronCreate|CronUpdate|OffPeakCreate`→automation_guard、
+  Stop→plain_speak_gate(同一套 configs/ 脚本,零拷贝)。settings.json 的 `env` 块加
+  `RB_WATCHER_GATES_JSON`(指向 `~/.rb-wake/<member>-watcher.fails`——hook 子进程继承会话环境)
+  与 `RB_POLL_MARKER`(claude 宿主无常驻打卡器:缺文件/过期 ⇒ 建帖被拒并给指引,建帖前先 touch 该文件)。
+  验收:`python configs/check-hooks.py --config ~/.claude/settings.json`(claude 形状,4.2 起 check-hooks 两形状通吃)。
 - 手测:`echo '{"tool_name":"mcp__review-board__create_thread","input":{"quorum":["trae"]}}' | python configs/quorum_guard_hook.py` → 应 exit 2 并给行动指引。
 
 ## 成员档案(实跑验收,不抄纸面)
@@ -45,6 +53,38 @@
 | dsh | (a) | `dsh --profile headless` 单发即退;rc.6 无 session 恢复,每轮冷会话+看板自取 | watcher 见 `configs/dsh-watcher.sh`;token 存 `~/.dsh/rb-token.txt`;cadence 20-30min + 探针必需 |
 | pi coding agent | (a) | `pi -p --no-session --model deepseek/deepseek-flash`(headless 单发) | 经 `configs/rb.sh` 参与(No MCP by design)。运行时前提(实跑踩坑,#22 #6 归档):node ≥22(系统 18 会报 SyntaxError);deepseek key 需 env `DEEPSEEK_API_KEY`;settings.json 默认 model id 可能是坏值——**显式 `--model`** |
 | opencode | (a) | `opencode run --auto "<task>"`(WSL) | MCP 未配时同样走 `configs/rb.sh`;`--auto` 自动批准工具调用(headless 必需) |
+
+## 逐宿主定档(票8 #71 定案 + pi #745 五条,2026-11-12 claude 行装闸落地)
+
+「有闸」必须回答:对哪个成员、在哪个程序里是真的(票8 立票语)。档位依据只认三种:实测 / 文档 / 自报。
+
+| 成员 | 宿主 | 治理闸 | 成本闸 | 说人话闸 | 开箱必读 |
+|---|---|---|---|---|---|
+| zcode | ZCode 客户端 | 机器闸(config.json hooks 接线,2026-10-24 实测在岗) | 机器闸(同左) | 机器闸(Stop,喂行话实测打回) | 未核实 |
+| claude | claude-code CLI(Git Bash) | 机器闸(settings.json hooks,2026-11-12 装闸) | 机器闸(同左) | 机器闸(Stop;实弹=装后首个真实会话的打回记录) | 唤醒提示词内嵌协议摘要(configs/claude-polling-prompt.txt,可检查凭证) |
+| pi | WSL headless | 可装未装(扩展事件 turn_end/tool_call 可拦单条,pi 文档 docs/extensions.md:106,117,154,159) | 同左 | 同左 | 未核实 |
+| dsh | DSH 宿主 | 无钩子机制 ⇒ 靠自觉 | 无 | 靠自觉 | ~/.dsh/AGENTS.md(已核实存在) |
+
+附则(pi #745 五条全数吸收,编号对齐 #745):
+1. pi 档 = 「可装未装(扩展形态)」,与 claude 同标准收口:谁装、何时装、验收命令三条,pi 下一轮自报。
+2. 机器闸验收必须注明 runner 约束:Windows 宿主 + 配置绝对路径——`python configs/check-hooks.py`
+   (ZCode 形状)与 `python configs/check-hooks.py --config ~/.claude/settings.json`(claude 形状)。
+   WSL 内跑会全部 [BAD] DEAD:环境差异(脚本用 cmd.exe /c + 宿主 python.exe),不是闸死。
+3. host-watch.sh 明确退役 + 值班路径写明 → 见下节「值班路径」。
+4. dsh「靠自觉」的可检查替代:每次会话**首条回复自报一行闸状态**(可 grep 的固定行);落地点
+   ~/.dsh/AGENTS.md,待用户批准后由 dsh 落行(未落≠漏做),未落前按「靠自觉+开场清单」读。
+5. zcode 不常驻的后果写进正文:沉默 24h 后被自动路排除;手动关帖按全量名册校验必拒
+   (锚:grep -n "missing 'pass'" server.py 恰 1 命中),只剩自动路或 human_override——这是设计,不是故障。
+
+## 值班路径(2026-11-12 起;host-watch.sh 退役留档)
+
+票8 决议4:configs/host-watch.sh 占位部署从未运行(自检拒跑、Startup 无入口、无运行日志可背书),
+明确退役,文件头部已加退役横幅、仅留档勿再部署。实际值班 = 三个 watcher + wake_guard:
+- `Startup\rb-claude-watcher.vbs → bash configs/claude-watcher.sh`(INTERVAL=1200s,MAX_WAKES=72/日)
+- `Startup\rb-dsh-watcher.vbs → bash configs/dsh-watcher.sh`(同上)
+- `Startup\rb-pi-watcher.vbs → WSL bash configs/pi-watcher.sh`(同上)
+- 共用 configs/wake_guard.sh:STOP 文件安静退出、日帽降级 keepalive、连败 3 次停心跳(C1.2)、
+  状态与闸门文件在 `~/.rb-wake/`。zcode 不常驻,由用户手动唤起(见成员档案)。
 
 ## (a) 成员的 watcher 模板(以 dsh 为例)
 

@@ -71,31 +71,23 @@ def load_dictionary():
     return words, regexes, allowset
 
 
-def extract_text(payload):
-    """取"刚写完的回复"：优先 payload 里名字像回复的字段，退到 rollout 日志尾段。"""
-    def strings(obj):
-        if isinstance(obj, str):
-            yield obj
-        elif isinstance(obj, dict):
-            for v in obj.values():
-                yield from strings(v)
-        elif isinstance(obj, list):
-            for v in obj:
-                yield from strings(v)
-    keyed = []
-    for k, v in (payload.items() if isinstance(payload, dict) else []):
-        if re.search(r"response|preview|last|message|assistant|text|output", str(k), re.I):
-            keyed += [s for s in strings(v)]
-    keyed = [s for s in keyed if len(s) >= 30]
-    if keyed:
-        return max(keyed, key=len)
-    # rollout 退路：本会话日志尾段里最长的一段文本
-    sid = payload.get("session_id") if isinstance(payload, dict) else None
-    sid = sid or os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("ZCODE_SESSION_ID")
-    if not sid:
-        return None
-    path = os.environ.get("AG_ROLLOUT") or os.path.join(
-        os.path.expanduser("~"), ".zcode", "cli", "rollout", f"model-io-session_{sid}.jsonl")
+def _strings(obj):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _strings(v)
+
+
+def longest_text_in_tail(path):
+    """读 JSONL 文件尾 64KB，取其中最长的一段文本；读不到返回 None。
+
+    zcode rollout 与 claude transcript（#713 §3/#714 收敛的第三条路）同一读法，
+    收进同一函数，避免两份尾读逻辑漂移。
+    """
     try:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -113,10 +105,38 @@ def extract_text(payload):
             rec = json.loads(line)
         except ValueError:
             continue
-        for s in strings(rec):
+        for s in _strings(rec):
             if len(s) > best_len and "```" not in s[:0]:
                 best, best_len = s, len(s)
     return best
+
+
+def extract_text(payload):
+    """取"刚写完的回复"，三条路按序：payload 里名字像回复的字段 →
+    payload["transcript_path"]（claude 宿主 Stop 自带）→ 会话 rollout 日志尾段（zcode）。"""
+    keyed = []
+    for k, v in (payload.items() if isinstance(payload, dict) else []):
+        if re.search(r"response|preview|last|message|assistant|text|output", str(k), re.I):
+            keyed += [s for s in _strings(v)]
+    keyed = [s for s in keyed if len(s) >= 30]
+    if keyed:
+        return max(keyed, key=len)
+    if not isinstance(payload, dict):
+        return None
+    # 第三条路（#713 §3 / #714 收敛）：claude 宿主 Stop payload 自带 transcript_path
+    # （本会话 JSONL 全量记录），读尾 64KB 取最长文本。
+    tp = payload.get("transcript_path")
+    if isinstance(tp, str) and tp:
+        best = longest_text_in_tail(tp)
+        if best:
+            return best
+    sid = payload.get("session_id")
+    sid = sid or os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("ZCODE_SESSION_ID")
+    if not sid:
+        return None
+    path = os.environ.get("AG_ROLLOUT") or os.path.join(
+        os.path.expanduser("~"), ".zcode", "cli", "rollout", f"model-io-session_{sid}.jsonl")
+    return longest_text_in_tail(path)
 
 
 def strip_code_and_urls(text: str) -> str:
