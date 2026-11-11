@@ -397,8 +397,9 @@ class TestTailReasonsAndWash(unittest.TestCase):
         self.assertEqual(len(wash), 15, "洗表 15 名(dsh #2052 §一:闸实读 15 枚)")
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+class TestHostSkip(unittest.TestCase):
+    """GPT round-21 P2:宿主跳过逻辑(Cursor/Grok)独立测试——六用例。
+    (此前该类头在提交中丢失,六用例沦为模块级死代码——本轮补回。)"""
 
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
