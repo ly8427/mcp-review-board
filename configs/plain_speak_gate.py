@@ -71,52 +71,202 @@ def load_dictionary():
     return words, regexes, allowset
 
 
+# 渐进窗口（V1.1.4）：起始 64KB，找不到 assistant 记录时 ×4 倍增至 CAP——
+# ≥64KB 单条长回复不再被切掉（dsh #2041 §一 / pi #2042 执行实证的漏检）。
+# GPT round-21 P1：WINDOW_CAP 常量此前漏定义——渐进分支一进扩展即 NameError、
+# 被 fail-open 吞成静默放行，长回复漏检路径形同未修；本常量为该路径的生效前提。
+WINDOW_START = 65536
+WINDOW_CAP = 8 * 1024 * 1024
+WINDOW_GROWTH = 4
+
+
+def _assistant_text(rec):
+    """从一条 JSONL 记录提取 assistant 回复文本；非 assistant 记录返回 None。"""
+    if not isinstance(rec, dict):
+        return None
+    msg = rec.get("message") if isinstance(rec.get("message"), dict) else rec
+    role = msg.get("role") if isinstance(msg, dict) else None
+    if rec.get("type") != "assistant" and role != "assistant":
+        return None
+    content = msg.get("content") if isinstance(msg, dict) else None
+    parts = []
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text" \
+                    and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+    if isinstance(rec.get("text"), str):
+        parts.append(rec["text"])          # 简式记录（fixture/部分宿主）
+    text = "\n".join(p for p in parts if p)
+    return text or None
+
+
+def last_assistant_text_in_tail(path):
+    """读 JSONL 尾窗，返回 (最后一条 assistant 回复文本 | None, 原因)。
+
+    V1.1.4（board #109 五缺口收口，dsh #2041/pi #2042）：
+      * **渐进窗口**：从 64KB 起，找不到 assistant 记录且文件仍有更早内容时
+        窗口按 WINDOW_GROWTH 倍增、min 夹到 WINDOW_CAP——≥64KB 的单条长回复
+        不再被窗口整条切掉（pi #2042 执行实证：70KB 黑话回复旧版会漏检）。
+      * **出口可区分（7 态）**：found / no-assistant-in-file / tail-unparsed /
+        cap-reached / no-file / unreadable / empty——V1.1.3 曾把三种病因压进
+        同一个 None 出口（dsh #2041 §一），诊断从此可分。
+      * 尾行（最后一条非空行）解析失败/非 JSON 开头 → **立即** tail-unparsed
+        （V1.1.6，dsh #2052 §二.4：扩窗解不开尾行不完整——它在文件尾，
+        与窗口大小无关；禁止拿更早回复冒充）。
+    zcode rollout 与 claude transcript（#713 §3/#714 收敛的第三条路）同一读法。
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None, "no-file"
+    window = WINDOW_START
+    while True:
+        start = max(0, size - window)
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                tail = f.read().decode("utf-8", "replace")
+        except OSError:
+            return None, "unreadable"
+        lines = [l.strip() for l in tail.splitlines() if l.strip()]
+        if not lines:
+            return None, "empty"
+        last = None
+        final_unparsed = False
+        # 窗口边界切出的首行：仅当它真的是被截断的半条记录时才跳过。
+        # V1.1.9（GPT round-5 P2）：旧实现 start>0 一律丢 lines[0]——窗口恰好
+        # 落在记录边界（start-1 处是换行）时首行本为完整记录，白白丢掉可能
+        # 让最新 assistant 记录在 cap 处不可见（fail-open）。判据：读 start-1
+        # 一个字节，是 \n = 边界完整（保留首行）；否则首行确为半条（跳过）。
+        first_line_complete = True
+        if start > 0:
+            try:
+                with open(path, "rb") as f:
+                    f.seek(start - 1)
+                    first_line_complete = f.read(1) == b"\n"
+            except OSError:
+                first_line_complete = False
+        body = lines if first_line_complete else lines[1:]
+        for i, line in enumerate(body):
+            last_line_of_file = i == len(body) - 1   # 窗口永远延伸到文件尾
+            if not line.startswith("{"):
+                if last_line_of_file:
+                    final_unparsed = True   # 尾行非 JSON 开头：无法确认
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                if last_line_of_file:
+                    final_unparsed = True   # 尾行解析失败：本轮不确认
+                continue
+            text = _assistant_text(rec)
+            if text:
+                last = text                 # 记录序在后 = 更新；只记不比长度
+        if last is not None and not final_unparsed:
+            return last, "found"
+        if start == 0:
+            # 全文件已消费仍无可用回复
+            if final_unparsed:
+                return None, "tail-unparsed"
+            return None, "no-assistant-in-file"
+        if window >= WINDOW_CAP or window >= size:
+            return None, "cap-reached"
+        window = min(window * WINDOW_GROWTH, WINDOW_CAP)
+
+
+def _body_text(v):
+    """回复键值的正文提取（V1.1.8，GPT round-4 P2 + 板 #2078 定稿形状）：
+    裸串 → 原样返回（「首个非空」只留给裸串，板 #2078）；
+    容器(dict/list) → 只收 text/content 字段里的正文（text 串、content 串或
+    块列表、message 包装递归一层），id/status/type/role 等元数据一律不取，
+    多块按文档序 join（与 _assistant_text 同语义）；取不到（纯元数据/
+    未知形状）→ None。"""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, dict):
+        parts = []
+        for bk in ("text", "content", "message"):
+            if bk in v:
+                t = _body_text(v[bk])
+                if t and t.strip():
+                    parts.append(t)
+        return "\n".join(parts) or None
+    if isinstance(v, list):
+        parts = [t for x in v if (t := _body_text(x)) and t.strip()]
+        return "\n".join(parts) or None
+    return None
+
+
 def extract_text(payload):
-    """取"刚写完的回复"：优先 payload 里名字像回复的字段，退到 rollout 日志尾段。"""
-    def strings(obj):
-        if isinstance(obj, str):
-            yield obj
-        elif isinstance(obj, dict):
-            for v in obj.values():
-                yield from strings(v)
-        elif isinstance(obj, list):
-            for v in obj:
-                yield from strings(v)
-    keyed = []
-    for k, v in (payload.items() if isinstance(payload, dict) else []):
+    """取"刚写完的回复"，按权威级四路（V1.1.4，board #109 五缺口收口）：
+    ① payload["last_assistant_message"]——claude Stop 官方权威字段，任意长度都算；
+    ② payload 里名字像回复的字段——**显式"最近一条"键优先**
+       （last_message > response > text > output；dsh 缺口②：最长串会让旧
+       诊断回文冒充当前回复）；值是裸串 → 取该串；值是容器 → 只取
+       text/content 正文字段、元数据（id/status/type 等）不冒充正文
+       （V1.1.8，GPT round-4 P2），未识别形状 fail-open 且留 stderr 诊断；
+    ③ payload["transcript_path"]（claude 宿主自带）→ 尾窗读最后一条 assistant 回复；
+    ④ 会话 rollout 日志尾窗（zcode）同一语义。
+    ③④ 都取不到 → stderr 留**可区分原因**的诊断痕后 fail-open 放行
+    （V1.1.4：found/no-assistant-in-file/tail-unparsed/cap-reached 不再合流）。
+    尾读两条路都取**最后一条 assistant 回复**（V1.1.1，board #109）——
+    禁止用尾段最长串冒充当前回复。"""
+    if not isinstance(payload, dict):
+        return None
+    lam = payload.get("last_assistant_message")
+    if isinstance(lam, str) and lam.strip():
+        return lam
+    keyed = {}
+    meta_only = []   # 有回复键但容器里只有元数据/未识别形状（V1.1.8，GPT round-4 P2）
+    for k, v in payload.items():
         if re.search(r"response|preview|last|message|assistant|text|output", str(k), re.I):
-            keyed += [s for s in strings(v)]
-    keyed = [s for s in keyed if len(s) >= 30]
-    if keyed:
-        return max(keyed, key=len)
-    # rollout 退路：本会话日志尾段里最长的一段文本
-    sid = payload.get("session_id") if isinstance(payload, dict) else None
+            # V1.1.8（GPT round-4 P2 + 板 #2078 定稿）：容器里只取 text/content
+            # 正文字段——id/status/type 等元数据不得冒充正文（dict 插入序在前的
+            # "id":"abc123" 旧实现会被 _strings 先取到）；「首个非空」只留给裸串
+            body = _body_text(v)
+            if body and body.strip():
+                keyed[k] = body
+            elif isinstance(v, (dict, list)) and v:
+                meta_only.append(k)
+    # 显式"最近一条"键优先于其余(V1.1.4 ②;flat 兜底已删——同键内长度选择
+    # 正是冒充通道,dsh #2052 §二.3)
+    for pref in ("last_message", "response", "text", "output"):
+        if pref in keyed:
+            return keyed[pref]
+    diag = []
+    if meta_only:
+        diag.append("回复键存在但未识别出正文（只含元数据/未知形状，不扫描元数据）: "
+                    + ", ".join(sorted(set(meta_only))))
+    # 板 ⑤b（dsh #2073 定稿）：收集面键族比消费面（4 个 pref 键）宽——正文取到了
+    # 却不在消费面 = 旧实现静默丢弃。修法一行：进 diag 可见；**不改消费面**——
+    # 按插入序盲选非 pref 键=「键序定成败」（dsh #2070 反例，claude #2072 已撤回）
+    if keyed and not any(p in keyed for p in ("last_message", "response", "text", "output")):
+        diag.append("回复键有正文但不在消费面（last_message/response/text/output 之外，"
+                    "不盲选防键序定成败）: " + ", ".join(sorted(keyed)))
+    tp = payload.get("transcript_path")
+    if isinstance(tp, str) and tp:
+        best, reason = last_assistant_text_in_tail(tp)
+        if best:
+            return best
+        diag.append(f"transcript 尾读未取得回复({reason}): {tp}")
+    sid = payload.get("session_id")
     sid = sid or os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("ZCODE_SESSION_ID")
     if not sid:
+        if diag:
+            sys.stderr.write("[plain-speak] fail-open（无当前轮文本可查）: "
+                             + "; ".join(diag) + "\n")
         return None
     path = os.environ.get("AG_ROLLOUT") or os.path.join(
         os.path.expanduser("~"), ".zcode", "cli", "rollout", f"model-io-session_{sid}.jsonl")
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - 65536))
-            tail = f.read().decode("utf-8", "replace")
-    except OSError:
-        return None
-    best, best_len = None, 30
-    for line in tail.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        for s in strings(rec):
-            if len(s) > best_len and "```" not in s[:0]:
-                best, best_len = s, len(s)
-    return best
+    best, reason = last_assistant_text_in_tail(path)
+    if best:
+        return best
+    diag.append(f"rollout 尾读未取得回复({reason}): {path}")
+    sys.stderr.write("[plain-speak] fail-open（无当前轮文本可查）: " + "; ".join(diag) + "\n")
+    return None
 
 
 def strip_code_and_urls(text: str) -> str:
@@ -156,6 +306,71 @@ def scan(text, words, regexes, allowset):
     return hits
 
 
+def _skip_for_cursor_host(payload: dict | None = None) -> bool:
+    """Cursor IDE opted out of this gate (2026-11-12 user request).
+
+    Cursor loads Claude Code Stop hooks from ~/.claude/settings.json (third-party
+    hooks). The hook child often lacks CURSOR_AGENT but still gets Cursor hook
+    env (CURSOR_VERSION / CURSOR_PROJECT_DIR / CURSOR_TRANSCRIPT_PATH, …) and/or
+    Cursor-native stop fields (status + loop_count). claude-code CLI and zcode
+    do not set those → they keep the gate. Force-on: REVIEWBOARD_PLAIN_SPEAK_FORCE=1.
+    """
+    if os.environ.get("REVIEWBOARD_PLAIN_SPEAK_FORCE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return False
+    # Agent worker
+    if os.environ.get("CURSOR_AGENT"):
+        return True
+    # Cursor hook runner env (documented for command hooks)
+    for key in (
+        "CURSOR_VERSION",
+        "CURSOR_PROJECT_DIR",
+        "CURSOR_TRANSCRIPT_PATH",
+        "CURSOR_CONVERSATION_ID",
+        "CURSOR_REQUEST_ID",
+        "CURSOR_PLUGIN_ROOT",
+    ):
+        if os.environ.get(key):
+            return True
+    # Cursor-native stop payload shape (Claude Stop uses hook_event_name instead)
+    if isinstance(payload, dict):
+        if payload.get("hook_event_name") in (None, "") and "loop_count" in payload:
+            if payload.get("status") in ("completed", "aborted", "error"):
+                return True
+        # Some builds expose transcript via env-mapped payload keys
+        if payload.get("cursor_version") or payload.get("generation_id"):
+            return True
+    return False
+
+
+def _skip_for_grok_host() -> bool:
+    """Grok CLI opted out of this gate (2026-11-12 user request).
+
+    Grok loads the same Claude Code Stop hook from ~/.claude/settings.json.
+    The hook child gets GROK_HOOK_EVENT / GROK_SESSION_ID / GROK_WORKSPACE_ROOT
+    / GROK_HOOK_NAME. claude-code, zcode, and Cursor do not set those, so they
+    keep the gate. Force-on: REVIEWBOARD_PLAIN_SPEAK_FORCE=1.
+    """
+    if os.environ.get("REVIEWBOARD_PLAIN_SPEAK_FORCE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return False
+    for key in (
+        "GROK_HOOK_EVENT",
+        "GROK_HOOK_NAME",
+        "GROK_SESSION_ID",
+        "GROK_WORKSPACE_ROOT",
+    ):
+        if os.environ.get(key):
+            return True
+    return False
+
+
 def main() -> None:
     raw = sys.stdin.read()
     try:
@@ -164,6 +379,8 @@ def main() -> None:
         allow()
     if not isinstance(payload, dict) or payload.get("stop_hook_active"):
         allow()  # 本轮已打回过一次：不再拦（配合宿主三次上限）
+    if _skip_for_cursor_host(payload) or _skip_for_grok_host():
+        allow()
     text = extract_text(payload)
     if not text:
         allow()

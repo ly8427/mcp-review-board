@@ -7,6 +7,12 @@ r"""check-hooks：把 config.json 里每条 hook command 原样执行一次，�
 
 用法：python check-hooks.py [--config <path>] [--hook <substr>]
 退出码：0 = 全部在岗；1 = 有闸不在岗；2 = 配置本身读不出来。
+
+runner 约束（pi #745-2，票8 验收②必须注明）：本脚本"原样执行"的命令含 cmd.exe /c +
+Windows 宿主 python.exe ⇒ 只在 Windows 宿主跑得动；WSL 内跑会全部 [BAD] DEAD
+（rc=None 命令无法执行）——那是环境差异，不是闸死。配置一律给绝对路径：
+默认 ~/.zcode/cli/config.json 是 ZCode cli 形状；--config ~/.claude/settings.json
+读 claude-code 形状（4.2 装闸起本机两份并存，形状差异见 load_commands）。
 """
 from __future__ import annotations
 
@@ -33,15 +39,101 @@ SMOKE = {
 
 
 def load_commands(cfg_path: pathlib.Path):
+    """两种配置形状都读（票8 起本机两份并存，判形状的依据是有没有 events 中间层）：
+    - ZCode cli：hooks.events.<Event> = [{matcher, hooks:[{command, timeoutMs}]}]
+    - claude-code settings.json：hooks.<Event> = [{matcher, hooks:[{command, timeout(秒)}]}]
+      ——claude 形状没有 events 中间层，把 hooks 本身当事件表遍历即可。
+    V2（GPT round-19 P2-1）：结构不识别/条目形状错 → 抛 ValueError（main 落
+    [FATAL] rc=2），不再静默跳过——「没检查到」绝不能解释为「检查通过」。
+    """
     data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        raise ValueError("hooks 段缺失或不是对象")
+    events = hooks.get("events")
+    if events is None:
+        events = hooks              # claude-code 形状：事件名直接是键
+    elif not isinstance(events, dict):
+        raise ValueError("hooks.events 不是对象")
     out = []
-    for event, entries in (data.get("hooks") or {}).get("events", {}).items():
+    for event, entries in events.items():
+        if not isinstance(entries, list):
+            raise ValueError(f"事件 {event} 的条目不是列表（形状不识别）")
         for entry in entries or []:
+            if not isinstance(entry, dict):
+                raise ValueError(f"事件 {event} 的条目不是对象")
+            hooks_list = entry.get("hooks")
+            # V1.1.4(GPT round-20 P2):hooks 缺失/null/空列表 = 结构错误,
+            # 不再静默当空列表——不完整检查会伪装成「全部在岗」
+            if not isinstance(hooks_list, list) or not hooks_list:
+                raise ValueError(f"事件 {event} 的 hooks 缺失或为空")
             matcher = entry.get("matcher")
-            for hook in entry.get("hooks") or []:
-                out.append({"event": event, "matcher": matcher, "command": hook.get("command") or "",
+            for hook in hooks_list:
+                if not isinstance(hook, dict):
+                    raise ValueError(f"事件 {event} 的 hook 条目不是对象")
+                out.append({"event": event, "matcher": matcher,
+                            "type": hook.get("type"),
+                            "command": hook.get("command") or "",
                             "timeout_ms": hook.get("timeoutMs")})
     return out
+
+
+# 票8 三道闸（GPT round-19：配置里至少要能看到这三条接线，缺一即 BAD；
+# GPT round-4 P1：从「文件名出现」升级为**结构化接线规则**——脚本能运行
+# ≠ 宿主会在正确的事件调用它。每条规则 = (闸脚本名, 必须在的事件,
+# matcher 必须覆盖的工具名)。覆盖语义与宿主一致：re.search(matcher, 工具名)
+# 命中即算覆盖（模板形状 "mcp__review-board__(create_thread|...)"、宽正则、
+# catch-all 无 matcher 都按宿主语义判）；matcher 缺失/空 = 全部工具。
+# GPT round-6 P1：type 必须 == "command"——宿主 hook 还有 prompt/agent/http
+# 等类型，command 字段在位不等于宿主会按命令执行它。
+EXPECTED_WIRING = (
+    ("quorum_guard_hook.py", "PreToolUse",
+     ("mcp__review-board__create_thread", "mcp__review-board__set_quorum",
+      "mcp__review-board__set_verdict")),
+    ("automation_guard_hook.py", "PreToolUse",
+     ("CronCreate", "CronUpdate", "OffPeakCreate")),
+    ("plain_speak_gate.py", "Stop", ()),
+)
+
+
+def _matcher_covers(matcher, tool: str) -> bool:
+    """宿主语义：PreToolUse matcher 是对工具名做正则匹配；空/缺失 = catch-all。
+    GPT round-5 P1-1：非法正则 = 不覆盖（BAD）——**禁止**退化成子串包含判断
+    （未闭合括号的 matcher 里含全部工具名的子串会假绿，正是本检查器要抓的
+    「看起来接线、实际不触发」）；matcher 类型不是字符串 = 不覆盖。"""
+    if matcher is None or matcher == "":
+        return True
+    if not isinstance(matcher, str):
+        return False
+    try:
+        return re.search(matcher, tool) is not None
+    except re.error:
+        return False   # 非法正则：宿主侧无法匹配 → 判 BAD，不退化
+
+
+def check_wiring(cmds) -> int:
+    """结构化接线验证（GPT round-4 P1）：每道闸必须在正确事件、matcher 覆盖
+    其管辖工具。三脚本都在但事件接错 = 全 BAD——负向测试（test_check_hooks
+    N6）钉死「脚本都能跑、检查器仍必须报非零」。"""
+    bad = 0
+    for script, event, tools in EXPECTED_WIRING:
+        entries = [c for c in cmds if script in c["command"]]
+        if not entries:
+            print(f"[BAD] 预期闸未接线   {script} — 配置里看不到这条闸的 command")
+            bad += 1
+            continue
+        ok = any(c["event"] == event
+                 and c["type"] == "command"
+                 and all(_matcher_covers(c["matcher"], t) for t in tools)
+                 for c in entries)
+        if not ok:
+            where = ", ".join(f"{c['event']}(type={c['type']!r},"
+                              f" matcher={c['matcher']!r})" for c in entries)
+            need = f"，matcher 须覆盖 {'、'.join(tools)}" if tools else ""
+            print(f"[BAD] 接线不正确     {script} — 应接在 {event}、type=command{need}；"
+                  f"实际: {where}")
+            bad += 1
+    return bad
 
 
 def smoke_payload(command: str) -> bytes:
@@ -131,6 +223,18 @@ def check_watcher_texts(texts: dict | None = None) -> int:
             if n_chain != 1 or _PRIORITY_OLD in text:
                 miss.append(f"优先级链(期望唯一含 verdict_stale 全序, 实际 {n_chain} 处)"
                             if n_chain != 1 else "旧优先级链残留")
+            # GPT PR#32 四轮 P2 + 五轮 P1-2 + 六轮 P2：打卡必须是轮询的真自动
+            # 心跳，路径与 settings 的 RB_POLL_MARKER 同源；缺省必须与
+            # quorum_guard 默认同一文件（rb-zcode-poll-heartbeat，env 未生效时
+            # 两边落同一处）；写死具体用户名路径 = BAD
+            if "rb-zcode-poll-heartbeat" not in text:
+                miss.append("打卡缺省路径(须与 quorum_guard 默认 rb-zcode-poll-heartbeat 同文件)")
+            if "RB_POLL_MARKER" not in text:
+                miss.append("打卡路径同源(须按 RB_POLL_MARKER 取路径,禁写死用户名)")
+            if "mkdir -p" not in text:
+                miss.append("打卡写前建父目录(mkdir -p)")
+            if re.search(r">>\s*[\"']?C:/Users/[^/\"'\s]+/", text):
+                miss.append("打卡命令写死了用户名路径(改 ${RB_POLL_MARKER:-...})")
         if miss or inv:
             print(f"[BAD] 载体断言     {name} — 缺 {miss or ''} "
                   f"{'机制层出现 claim_token 调用: ' + inv.group(0)[:60] if inv else ''}")
@@ -152,15 +256,24 @@ def main() -> int:
         return 2
     try:
         cmds = load_commands(cfg)
-    except Exception as e:  # JSON 坏了也算致命
-        print(f"[FATAL] 配置不是合法 JSON: {e}")
+    except Exception as e:  # JSON 坏了/结构不识别也算致命（GPT round-19 P2-1）
+        print(f"[FATAL] 配置不可用: {e}")
         return 2
 
     if args.hook:
         cmds = [c for c in cmds if args.hook in c["command"]]
+    elif not cmds:
+        # GPT round-19 P2-1：空配置/没解析到任何钩子 = 检查器失职的伪装成功，必须失败
+        print("[FATAL] 没有解析到任何钩子（配置为空或结构不识别）——"
+              "「没检查到」不能解释为「检查通过」")
+        return 2
+
+    bad = 0
+    if not args.hook:
+        # 票8 三道闸 + GPT round-4 P1 结构化接线验证（对两种配置形状同样生效）
+        bad += check_wiring(cmds)
 
     print(f"检查 {len(cmds)} 条钩子（配置: {cfg}）\n")
-    bad = 0
     for c in cmds:
         rc, out, err = run_command(c["command"], smoke_payload(c["command"]))
         state, detail = classify(rc, out, err)
@@ -177,4 +290,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

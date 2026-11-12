@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# *** RETIRED 2026-11-12（票8 #71 决议4 + pi #745-3）***：本机为占位部署、从未运行
+#   （自检拒跑、Startup 无入口、无运行日志可背书）。实际值班路径 =
+#   三个 watcher + wake_guard.sh，见 configs/onboarding.md「值班路径」一节。
+#   本文件仅留档，勿再部署、勿再接入调度。
 # host-watch.sh — the HOST-side orchestrator (batch 1, thread #22 #1/#4/#5).
 #
 # Field-proven shape (threads #21/#22: four reviewers woken, voted, flipped
