@@ -24,6 +24,24 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 GATE = os.path.join(HERE, "plain_speak_gate.py")
 PY = sys.executable
 
+
+def _clean_env(extra=None):
+    """测试唯一洗表（V1.1.11，板 #2077 §二-4）：原先 Harness.gate 与
+    TestHostSkip._run 各抄一份、g14 只取并集——任一调用点单独漂移仍绿
+    的后门；现全部调用点共用本函数。名单 = 闸源码实读 15 名（g14 ast
+    派生 + g14b 单一入口计数共同钉死）。"""
+    e = dict(os.environ, **{"RB_REPAIR_DRYRUN": "1"})
+    for k in ("AG_ROLLOUT", "CLAUDE_SESSION_ID", "ZCODE_SESSION_ID",
+              "CURSOR_AGENT", "CURSOR_VERSION", "CURSOR_PROJECT_DIR",
+              "CURSOR_TRANSCRIPT_PATH", "CURSOR_CONVERSATION_ID",
+              "CURSOR_REQUEST_ID", "CURSOR_PLUGIN_ROOT",
+              "GROK_HOOK_EVENT", "GROK_HOOK_NAME", "GROK_SESSION_ID",
+              "GROK_WORKSPACE_ROOT", "REVIEWBOARD_PLAIN_SPEAK_FORCE"):
+        e.pop(k, None)
+    if extra:
+        e.update(extra)
+    return e
+
 JARGON = ("把这次变更落盘固化，走完治理链路后把挂进主干的形态定下来，"
           "quorum 收敛口径按帖子里的决议对齐。") * 3     # 长 + 含词典词
 CLEAN = "这次改动已经用日常语言重新说明：改了什么、为什么改、影响哪些文件。"
@@ -59,20 +77,9 @@ class Harness(unittest.TestCase):
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def gate(self, payload, env_extra=None):
-        # 缺口①(环境洗):AG_ROLLOUT 不摘除会让 transcript 路测试读到开发机环境文件;
-        # Cursor/Grok 宿主标记同理——不摘会让宿主跳过逻辑在测试里静默生效
-        e = dict(os.environ, **{"RB_REPAIR_DRYRUN": "1"})
-        e.pop("AG_ROLLOUT", None)
-        e.pop("CLAUDE_SESSION_ID", None)   # session_id 为空的载荷会退读这两个宿主会话名
-        e.pop("ZCODE_SESSION_ID", None)
-        for k in ("CURSOR_AGENT", "CURSOR_VERSION", "CURSOR_PROJECT_DIR",
-                  "CURSOR_TRANSCRIPT_PATH", "CURSOR_CONVERSATION_ID",
-                  "CURSOR_REQUEST_ID", "CURSOR_PLUGIN_ROOT",
-                  "GROK_HOOK_EVENT", "GROK_HOOK_NAME", "GROK_SESSION_ID",
-                  "GROK_WORKSPACE_ROOT", "REVIEWBOARD_PLAIN_SPEAK_FORCE"):
-            e.pop(k, None)
-        if env_extra:
-            e.update(env_extra)
+        # 环境洗收进 _clean_env 单一来源（板 #2077 §二-4；V1.1.4 缺口①的
+        # 洗名单不再在此处逐个抄）
+        e = _clean_env(env_extra)
         p = subprocess.run([PY, GATE],
                            input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                            capture_output=True, env=e, timeout=30)
@@ -372,6 +379,69 @@ class TestGateEndToEnd(Harness):
         self.assertIsNone(b, "非消费面键不盲选 → 走尾读/fail-open")
         self.assertIn("不在消费面", err, "正文在非标准键必须留 stderr 诊断（板 ⑤b）")
 
+    # ── 板 #109 终版形状（V1.1.11：dsh #2073 §二/§四 + #2077 §三 + #2078 定稿） ──
+    def test_i_b_key_preview_never_bounced(self):
+        # ③a（保护性）：B 档键 conversation_preview 永不打回——防实现者把旧文
+        # 键请回消费面（修前修后双绿、理由不同；不许单独当判据，板 #2074 §1）
+        self.write_transcript([
+            {"type": "user", "message": {"role": "user", "content": JARGON}},
+        ])
+        payload = {**self.stop_payload(), "conversation_preview": JARGON}
+        rc, b, _ = self.gate(payload)
+        self.assertIsNone(b, "B 档键永不进消费面（板 #2073 §二）")
+        self.assertEqual(rc, 0)
+
+    def test_i2_b_key_failopen_diag_visible(self):
+        # ③b（判别器）：同形状 stderr 必含 fail-open（修前红/修后绿；
+        # 只钉子串——旧出口文案两处拷贝，禁整句，板 #2073 §二）
+        self.write_transcript([
+            {"type": "user", "message": {"role": "user", "content": JARGON}},
+        ])
+        payload = {**self.stop_payload(), "conversation_preview": JARGON}
+        rc, b, err = self.gate(payload)
+        self.assertIsNone(b)
+        self.assertIn("fail-open", err, "B 档必须有诊断痕（板 ③b）")
+        self.assertIn("不在消费面", err, "B 档诊断必须点名键与档位")
+
+    def test_i3_structured_label_never_scanned(self):
+        # ⑦ 标签案（dsh #2070 定稿）：{"type":"text","text":J} 不得取到标签
+        # "text"——内容键 text 被取、元数据键被跳过（修后必拦）
+        self.write_transcript([
+            {"type": "assistant", "message": {"role": "assistant", "content": CLEAN}},
+        ])
+        payload = {**self.stop_payload(),
+                   "response": {"type": "text", "text": JARGON}}
+        rc, b, _ = self.gate(payload)
+        self.assertIsNotNone(b, "结构化值取正文不为标签（板 ⑦ 修后必拦）")
+        self.assertIn("落盘", b["reason"])
+
+    def test_i4_multiblock_joined_like_transcript_path(self):
+        # 多块 join（板 #2077 §三/#2078 §2 定稿）：容器内全部 text 块 join，
+        # 与 transcript 路同判——后块黑话必拦（「首个非空」修法下本案仍漏，
+        # 是三条路里唯一能区分二者的判别器，pi #2078 §3）
+        self.write_transcript([
+            {"type": "assistant", "message": {"role": "assistant", "content": CLEAN}},
+        ])
+        payload = {**self.stop_payload(),
+                   "response": {"content": [
+                       {"type": "text", "text": CLEAN},
+                       {"type": "text", "text": JARGON}]}}
+        rc, b, _ = self.gate(payload)
+        self.assertIsNotNone(b, "多块 join 后块黑话必拦（两路判决一致）")
+        self.assertIn("落盘", b["reason"])
+
+    def test_i5_nonmetadata_string_fallback_scanned(self):
+        # ⑦ 其余串兜底（pi #2074 §3 定稿）：内容键缺席时，非元数据串按文档序
+        # 首个非空兜底进扫描；元数据键（id 等）依旧跳过
+        self.write_transcript([
+            {"type": "assistant", "message": {"role": "assistant", "content": CLEAN}},
+        ])
+        payload = {**self.stop_payload(),
+                   "response": {"id": "abc123", "note": "先落盘再说。"}}
+        rc, b, _ = self.gate(payload)
+        self.assertIsNotNone(b, "非元数据串兜底可被扫描（元数据不冒充）")
+        self.assertIn("落盘", b["reason"])
+
 
 class TestTailReasonsAndWash(unittest.TestCase):
     """GPT round-20/21 §三:七态原因、形状族、洗环境表派生(dsh #2052 §三)。"""
@@ -443,6 +513,24 @@ class TestTailReasonsAndWash(unittest.TestCase):
         self.assertEqual(self.m.last_assistant_text_in_tail(dpath)[1], "unreadable")
 
     def test_g13_shape_family_cursor_native(self):
+        # 进程内直调 _skip_for_cursor_host 读的是本进程真实 os.environ——
+        # CURSOR_AGENT=1 的机器会沿 env 路径误跳过,"显式 Stop 不跳过"断言必红
+        # (PR#35 评审 follow-up 1,pre-existing)。先按 _clean_env 同名单清场,
+        # 结束恢复;名单须与 _clean_env 一致(g14 派生钉死 15 名)。
+        saved = {}
+        for k in ("AG_ROLLOUT", "CLAUDE_SESSION_ID", "ZCODE_SESSION_ID",
+                  "CURSOR_AGENT", "CURSOR_VERSION", "CURSOR_PROJECT_DIR",
+                  "CURSOR_TRANSCRIPT_PATH", "CURSOR_CONVERSATION_ID",
+                  "CURSOR_REQUEST_ID", "CURSOR_PLUGIN_ROOT",
+                  "GROK_HOOK_EVENT", "GROK_HOOK_NAME", "GROK_SESSION_ID",
+                  "GROK_WORKSPACE_ROOT", "REVIEWBOARD_PLAIN_SPEAK_FORCE"):
+            saved[k] = os.environ.pop(k, None)
+
+        def _restore():
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+        self.addCleanup(_restore)
         # cursor 原生形状(无 hook_event_name + status/loop_count)→ 跳过
         self.assertTrue(self.m._skip_for_cursor_host(
             {"loop_count": 1, "status": "completed"}))
@@ -479,6 +567,11 @@ class TestTailReasonsAndWash(unittest.TestCase):
                         and isinstance(node.args[0], _ast.Constant) \
                         and isinstance(node.args[0].value, str):
                     names.add(node.args[0].value)
+                if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name) \
+                        and node.func.id == "_gate_env" and node.args \
+                        and isinstance(node.args[0], _ast.Constant) \
+                        and isinstance(node.args[0].value, str):
+                    names.add(node.args[0].value)   # V1.1.11 唯一环境入口
                 elif isinstance(node, _ast.Subscript) \
                         and isinstance(node.value, _ast.Attribute) \
                         and node.value.attr == "environ" \
@@ -487,12 +580,38 @@ class TestTailReasonsAndWash(unittest.TestCase):
                     names.add(node.slice.value)
             return {n for n in names if _re.fullmatch(r"[A-Z][A-Z0-9_]*", n)}
 
-        gate_names = _env_names(open(GATE, encoding="utf-8").read())
-        test_names = _env_names(open(os.path.abspath(__file__), encoding="utf-8").read())
+        with open(GATE, encoding="utf-8") as f:
+            gate_names = _env_names(f.read())
+        with open(os.path.abspath(__file__), encoding="utf-8") as f:
+            test_names = _env_names(f.read())
         self.assertTrue(gate_names <= test_names,
                         f"闸新读的环境名未进测试洗表: {sorted(gate_names - test_names)}")
         self.assertEqual(len(gate_names), 15,
                          f"闸实读环境名数漂移(dsh #2052 §一 = 15): {sorted(gate_names)}")
+
+    def test_g14b_environ_confined_to_gate_env(self):
+        # 板 #2073 §四-4（#2070 §四 方向定稿）：闸源码 os.environ 只准出现在
+        # _gate_env() 单一入口——函数体内与**模块级**（含嵌套语句块）出现
+        # os.environ / environ.pop / environ.update 即红；洗表派生从此有
+        # 单一锚点（V1.1.11）
+        import ast as _ast
+        with open(GATE, encoding="utf-8") as f:
+            tree = _ast.parse(f.read())
+        funcs = [n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef)]
+        inside_fn = {id(n) for fn in funcs
+                     if fn.name == "_gate_env" for n in _ast.walk(fn)}
+        bad = []
+        for node in _ast.walk(tree):
+            if id(node) in inside_fn:
+                continue
+            if isinstance(node, _ast.Attribute) and node.attr == "environ":
+                bad.append("os.environ 出现在 _gate_env 之外（模块级或非入口函数）")
+            if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute) \
+                    and node.func.attr in ("pop", "update") \
+                    and isinstance(node.func.value, _ast.Attribute) \
+                    and node.func.value.attr == "environ":
+                bad.append(f"environ.{node.func.attr}() 出现在 _gate_env 之外")
+        self.assertEqual(bad, [], "环境读取必须收进 _gate_env() 单一入口")
 
 
 class TestHostSkip(unittest.TestCase):
@@ -520,20 +639,11 @@ class TestHostSkip(unittest.TestCase):
     def _run(self, env_extra):
         # V1.1.7(dsh #2065 §1 闭合点②):改回全返回 (rc, b, err)——b=None 有
         # 两种病因(宿主跳过生效 / 取文失败 fail-open),只回 body 分不开;
-        # 与 Harness.gate 同一返回形状,第三份洗表随本表并入 gate() 后消灭
+        # 与 Harness.gate 同一返回形状。洗表并入 _clean_env(板 #2077 §二-4,
+        # 第三份洗表消灭——原「随本表并入 gate() 后消灭」注释兑现)
         payload = {"hook_event_name": "Stop", "stop_hook_active": False,
                    "session_id": "hs", "transcript_path": self.transcript}
-        e = dict(os.environ)
-        e.pop("AG_ROLLOUT", None)
-        e.pop("CLAUDE_SESSION_ID", None)   # 本载荷 session_id 非空用不到;洗齐 15 名(g14 ast 断言)
-        e.pop("ZCODE_SESSION_ID", None)
-        for k in ("CURSOR_AGENT", "CURSOR_VERSION", "CURSOR_PROJECT_DIR",
-                  "CURSOR_TRANSCRIPT_PATH", "CURSOR_CONVERSATION_ID",
-                  "CURSOR_REQUEST_ID", "CURSOR_PLUGIN_ROOT",
-                  "GROK_HOOK_EVENT", "GROK_HOOK_NAME", "GROK_SESSION_ID",
-                  "GROK_WORKSPACE_ROOT", "REVIEWBOARD_PLAIN_SPEAK_FORCE"):
-            e.pop(k, None)
-        e.update(env_extra)
+        e = _clean_env(env_extra)
         r = subprocess.run([PY, GATE],
                            input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                            capture_output=True, env=e, timeout=30)

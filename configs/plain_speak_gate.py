@@ -26,6 +26,13 @@ HASH_CTX = re.compile(r"[\w-]")
 MAX_HITS_REPORTED = 6
 
 
+def _gate_env(name: str, default=None):
+    """宿主环境键的唯一读入口（V1.1.11，板 #2073 §四-4/#2070 §四）：
+    所有 os.environ 读取收进本函数——测试侧 g14b 用 ast 计数钉死
+    「_gate_env 之外 os.environ 出现次数 = 0」，洗表派生从此有单一锚点。"""
+    return os.environ.get(name, default)
+
+
 def allow() -> None:
     sys.exit(0)
 
@@ -177,23 +184,38 @@ def last_assistant_text_in_tail(path):
         window = min(window * WINDOW_GROWTH, WINDOW_CAP)
 
 
+# ⑦ 值侧键名分档（V1.1.11，板 #2070 §二 / #2074 §3 定稿）：
+# 元数据键一律跳过（不为标签打回）；内容键优先；其余非元数据串按文档序
+# 首个非空兜底（V1.1.6「长文不冒充正文」不受损——它钉的是跨键 max(len) 通道）。
+_METADATA_KEYS = ("type", "role", "id", "index", "stop_reason", "name", "status")
+_CONTENT_KEYS = ("text", "content", "body")
+
+
 def _body_text(v):
-    """回复键值的正文提取（V1.1.8，GPT round-4 P2 + 板 #2078 定稿形状）：
-    裸串 → 原样返回（「首个非空」只留给裸串，板 #2078）；
-    容器(dict/list) → 只收 text/content 字段里的正文（text 串、content 串或
-    块列表、message 包装递归一层），id/status/type/role 等元数据一律不取，
-    多块按文档序 join（与 _assistant_text 同语义）；取不到（纯元数据/
-    未知形状）→ None。"""
+    """回复键值的正文提取（V1.1.11 终版形状，板 #2074 §3/#2077 §三/#2078 定稿）：
+    裸串 → 原样返回（「首个非空」只留给裸串/跨键）；
+    容器(dict/list) → 内容键（text/content/body，含 message 包装递归）的
+    正文**全部 join**（镜像 transcript 路 _assistant_text 合并语义——多块的
+    后块含黑话同样拦，两路判决一致，板 #2077 §三）；内容键取不到 →
+    其余**非元数据**串按文档序首个非空兜底；type/role/id 等元数据键一律
+    不取；取不到（纯元数据/未知形状）→ None。"""
     if isinstance(v, str):
         return v
     if isinstance(v, dict):
         parts = []
-        for bk in ("text", "content", "message"):
+        for bk in _CONTENT_KEYS + ("message",):
             if bk in v:
                 t = _body_text(v[bk])
                 if t and t.strip():
                     parts.append(t)
-        return "\n".join(parts) or None
+        if parts:
+            return "\n".join(parts)
+        for sk, sv in v.items():   # 兜底：非元数据串，文档序首个非空
+            if sk in _METADATA_KEYS or sk in _CONTENT_KEYS or sk == "message":
+                continue
+            if isinstance(sv, str) and sv.strip():
+                return sv
+        return None
     if isinstance(v, list):
         parts = [t for x in v if (t := _body_text(x)) and t.strip()]
         return "\n".join(parts) or None
@@ -203,11 +225,13 @@ def _body_text(v):
 def extract_text(payload):
     """取"刚写完的回复"，按权威级四路（V1.1.4，board #109 五缺口收口）：
     ① payload["last_assistant_message"]——claude Stop 官方权威字段，任意长度都算；
-    ② payload 里名字像回复的字段——**显式"最近一条"键优先**
-       （last_message > response > text > output；dsh 缺口②：最长串会让旧
-       诊断回文冒充当前回复）；值是裸串 → 取该串；值是容器 → 只取
-       text/content 正文字段、元数据（id/status/type 等）不冒充正文
-       （V1.1.8，GPT round-4 P2），未识别形状 fail-open 且留 stderr 诊断；
+    ② payload 里名字像回复的字段——**A/B 档分诊**（V1.1.11，板 #2073 §二/§三
+       定稿）：A 档（last_message > response > text > output 精确消费名单）
+       取到正文才消费——值是裸串取该串；值是容器按 _body_text 取
+       text/content/body 正文字段（多块 join，元数据 id/status/type 不冒充
+       正文，V1.1.8 起未识别形状 fail-open 且留 stderr 诊断）；
+       B 档（其余命中键名的字段，如 conversation_preview）**永不打回**，
+       只在 fail-open 出口留一行诊断（不盲选防键序定成败）；
     ③ payload["transcript_path"]（claude 宿主自带）→ 尾窗读最后一条 assistant 回复；
     ④ 会话 rollout 日志尾窗（zcode）同一语义。
     ③④ 都取不到 → stderr 留**可区分原因**的诊断痕后 fail-open 放行
@@ -220,32 +244,30 @@ def extract_text(payload):
     if isinstance(lam, str) and lam.strip():
         return lam
     keyed = {}
-    meta_only = []   # 有回复键但容器里只有元数据/未识别形状（V1.1.8，GPT round-4 P2）
+    diag = []   # 只在 fail-open 出口落笔（板 #2073 §三：成功路径不写 stderr）
     for k, v in payload.items():
         if re.search(r"response|preview|last|message|assistant|text|output", str(k), re.I):
-            # V1.1.8（GPT round-4 P2 + 板 #2078 定稿）：容器里只取 text/content
-            # 正文字段——id/status/type 等元数据不得冒充正文（dict 插入序在前的
-            # "id":"abc123" 旧实现会被 _strings 先取到）；「首个非空」只留给裸串
             body = _body_text(v)
-            if body and body.strip():
-                keyed[k] = body
-            elif isinstance(v, (dict, list)) and v:
-                meta_only.append(k)
+            if k in ("last_message", "response", "text", "output"):
+                # A 档（板 #2073 §二定稿）：精确消费名单，取到正文才进 keyed；
+                # 容器只含元数据/未识别形状 → 留诊断（V1.1.8 h2 同款）
+                if body and body.strip():
+                    keyed[k] = body
+                elif isinstance(v, (dict, list)) and v:
+                    diag.append(f"回复键 {k} 存在但未识别出正文"
+                                "（只含元数据/未知形状，不扫描元数据）")
+            elif (body and body.strip()) or (isinstance(v, (dict, list)) and v) \
+                    or (isinstance(v, str) and v.strip()):
+                # B 档（板 #2073 §二/§三定稿）：命中回复键名但不在消费面
+                # （conversation_preview 等）——永不打回、不盲选（防键序定成败，
+                # dsh #2070 反例），只留一行诊断；成功路径不落笔
+                diag.append(f"回复键 {k} 不在消费面（last_message/response/text/output "
+                            "之外；B 档永不打回，板 #2073 §二/§三）")
     # 显式"最近一条"键优先于其余(V1.1.4 ②;flat 兜底已删——同键内长度选择
     # 正是冒充通道,dsh #2052 §二.3)
     for pref in ("last_message", "response", "text", "output"):
         if pref in keyed:
             return keyed[pref]
-    diag = []
-    if meta_only:
-        diag.append("回复键存在但未识别出正文（只含元数据/未知形状，不扫描元数据）: "
-                    + ", ".join(sorted(set(meta_only))))
-    # 板 ⑤b（dsh #2073 定稿）：收集面键族比消费面（4 个 pref 键）宽——正文取到了
-    # 却不在消费面 = 旧实现静默丢弃。修法一行：进 diag 可见；**不改消费面**——
-    # 按插入序盲选非 pref 键=「键序定成败」（dsh #2070 反例，claude #2072 已撤回）
-    if keyed and not any(p in keyed for p in ("last_message", "response", "text", "output")):
-        diag.append("回复键有正文但不在消费面（last_message/response/text/output 之外，"
-                    "不盲选防键序定成败）: " + ", ".join(sorted(keyed)))
     tp = payload.get("transcript_path")
     if isinstance(tp, str) and tp:
         best, reason = last_assistant_text_in_tail(tp)
@@ -253,13 +275,13 @@ def extract_text(payload):
             return best
         diag.append(f"transcript 尾读未取得回复({reason}): {tp}")
     sid = payload.get("session_id")
-    sid = sid or os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("ZCODE_SESSION_ID")
+    sid = sid or _gate_env("CLAUDE_SESSION_ID") or _gate_env("ZCODE_SESSION_ID")
     if not sid:
         if diag:
             sys.stderr.write("[plain-speak] fail-open（无当前轮文本可查）: "
                              + "; ".join(diag) + "\n")
         return None
-    path = os.environ.get("AG_ROLLOUT") or os.path.join(
+    path = _gate_env("AG_ROLLOUT") or os.path.join(
         os.path.expanduser("~"), ".zcode", "cli", "rollout", f"model-io-session_{sid}.jsonl")
     best, reason = last_assistant_text_in_tail(path)
     if best:
@@ -315,14 +337,14 @@ def _skip_for_cursor_host(payload: dict | None = None) -> bool:
     Cursor-native stop fields (status + loop_count). claude-code CLI and zcode
     do not set those → they keep the gate. Force-on: REVIEWBOARD_PLAIN_SPEAK_FORCE=1.
     """
-    if os.environ.get("REVIEWBOARD_PLAIN_SPEAK_FORCE", "").strip().lower() in (
+    if _gate_env("REVIEWBOARD_PLAIN_SPEAK_FORCE", "").strip().lower() in (
         "1",
         "true",
         "yes",
     ):
         return False
     # Agent worker
-    if os.environ.get("CURSOR_AGENT"):
+    if _gate_env("CURSOR_AGENT"):
         return True
     # Cursor hook runner env (documented for command hooks)
     for key in (
@@ -333,7 +355,7 @@ def _skip_for_cursor_host(payload: dict | None = None) -> bool:
         "CURSOR_REQUEST_ID",
         "CURSOR_PLUGIN_ROOT",
     ):
-        if os.environ.get(key):
+        if _gate_env(key):
             return True
     # Cursor-native stop payload shape (Claude Stop uses hook_event_name instead)
     if isinstance(payload, dict):
@@ -354,7 +376,7 @@ def _skip_for_grok_host() -> bool:
     / GROK_HOOK_NAME. claude-code, zcode, and Cursor do not set those, so they
     keep the gate. Force-on: REVIEWBOARD_PLAIN_SPEAK_FORCE=1.
     """
-    if os.environ.get("REVIEWBOARD_PLAIN_SPEAK_FORCE", "").strip().lower() in (
+    if _gate_env("REVIEWBOARD_PLAIN_SPEAK_FORCE", "").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -366,7 +388,7 @@ def _skip_for_grok_host() -> bool:
         "GROK_SESSION_ID",
         "GROK_WORKSPACE_ROOT",
     ):
-        if os.environ.get(key):
+        if _gate_env(key):
             return True
     return False
 
