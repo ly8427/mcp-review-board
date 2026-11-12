@@ -513,6 +513,24 @@ class TestTailReasonsAndWash(unittest.TestCase):
         self.assertEqual(self.m.last_assistant_text_in_tail(dpath)[1], "unreadable")
 
     def test_g13_shape_family_cursor_native(self):
+        # 进程内直调 _skip_for_cursor_host 读的是本进程真实 os.environ——
+        # CURSOR_AGENT=1 的机器会沿 env 路径误跳过,"显式 Stop 不跳过"断言必红
+        # (PR#35 评审 follow-up 1,pre-existing)。先按 _clean_env 同名单清场,
+        # 结束恢复;名单须与 _clean_env 一致(g14 派生钉死 15 名)。
+        saved = {}
+        for k in ("AG_ROLLOUT", "CLAUDE_SESSION_ID", "ZCODE_SESSION_ID",
+                  "CURSOR_AGENT", "CURSOR_VERSION", "CURSOR_PROJECT_DIR",
+                  "CURSOR_TRANSCRIPT_PATH", "CURSOR_CONVERSATION_ID",
+                  "CURSOR_REQUEST_ID", "CURSOR_PLUGIN_ROOT",
+                  "GROK_HOOK_EVENT", "GROK_HOOK_NAME", "GROK_SESSION_ID",
+                  "GROK_WORKSPACE_ROOT", "REVIEWBOARD_PLAIN_SPEAK_FORCE"):
+            saved[k] = os.environ.pop(k, None)
+
+        def _restore():
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+        self.addCleanup(_restore)
         # cursor 原生形状(无 hook_event_name + status/loop_count)→ 跳过
         self.assertTrue(self.m._skip_for_cursor_host(
             {"loop_count": 1, "status": "completed"}))
@@ -562,8 +580,10 @@ class TestTailReasonsAndWash(unittest.TestCase):
                     names.add(node.slice.value)
             return {n for n in names if _re.fullmatch(r"[A-Z][A-Z0-9_]*", n)}
 
-        gate_names = _env_names(open(GATE, encoding="utf-8").read())
-        test_names = _env_names(open(os.path.abspath(__file__), encoding="utf-8").read())
+        with open(GATE, encoding="utf-8") as f:
+            gate_names = _env_names(f.read())
+        with open(os.path.abspath(__file__), encoding="utf-8") as f:
+            test_names = _env_names(f.read())
         self.assertTrue(gate_names <= test_names,
                         f"闸新读的环境名未进测试洗表: {sorted(gate_names - test_names)}")
         self.assertEqual(len(gate_names), 15,
@@ -575,7 +595,8 @@ class TestTailReasonsAndWash(unittest.TestCase):
         # os.environ / environ.pop / environ.update 即红；洗表派生从此有
         # 单一锚点（V1.1.11）
         import ast as _ast
-        tree = _ast.parse(open(GATE, encoding="utf-8").read())
+        with open(GATE, encoding="utf-8") as f:
+            tree = _ast.parse(f.read())
         funcs = [n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef)]
         inside_fn = {id(n) for fn in funcs
                      if fn.name == "_gate_env" for n in _ast.walk(fn)}
