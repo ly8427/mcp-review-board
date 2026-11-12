@@ -2024,10 +2024,21 @@ def _audit_meta_unparsable(conn, author: str, raw: str | None,
     _audit(conn, author, "meta_unparsable", note=note)
 
 
+# 批次1 1.1b/1.1c (#112 冻结面 ②, DEBT #3/#4): the creator-suspended skip branch
+# shares the blocked-once dedup — the reason enum AND the note prefix come from
+# this ONE module-level literal (dsh #2164 §一: 命名=DEBT #3 建议值, 不另议).
+_SKIP_REASON = "creator_delivery_skip_suspended"
+
+
 def _audit_blocked_once(conn, thread_id: int, revision: int, reason: str,
-                        note: str) -> bool:
+                        note: str,
+                        action: str = "auto_resolve_blocked") -> bool:
     """v2.9.3 (thread #55 ③, rev2 口径 from dsh #667/#654): suppress only
-    *redundant* auto_resolve_blocked rows.
+    *redundant* blocked-once rows (default action="auto_resolve_blocked";
+    批次1 1.1c: the skip branch reuses this with action="delivery_gate_skipped" —
+    its note is constant (only the thread author interpolates) ⇒ exactly one row
+    per (thread, revision); the `delivered=`/`max_id=` clause below does NOT
+    apply to that branch (no watermark carrier — DEBT #4 销账注记).
 
     A row is redundant when the previous blocked row for this (thread, revision,
     reason) is IDENTICAL and no state transition happened in between:
@@ -2041,8 +2052,8 @@ def _audit_blocked_once(conn, thread_id: int, revision: int, reason: str,
     """
     prev = conn.execute(
         "SELECT id, note FROM verdict_events WHERE thread_id=? AND revision=?"
-        " AND action='auto_resolve_blocked' AND note LIKE ? ORDER BY id DESC LIMIT 1",
-        (thread_id, revision, f"reason={reason}%"),
+        " AND action=? AND note LIKE ? ORDER BY id DESC LIMIT 1",
+        (thread_id, revision, action, f"reason={reason}%"),
     ).fetchone()
     if prev is not None:
         transitioned = conn.execute(
@@ -2052,7 +2063,7 @@ def _audit_blocked_once(conn, thread_id: int, revision: int, reason: str,
         ).fetchone()
         if not transitioned and prev["note"] == note:
             return True
-    _audit(conn, "system", "auto_resolve_blocked", thread_id=thread_id,
+    _audit(conn, "system", action, thread_id=thread_id,
            revision=revision, note=note)
     return False
 
@@ -3414,10 +3425,16 @@ def request_form_b(
             return f"ERROR: thread #{thread_id} does not exist"
         if t["author"] != author:
             return f"ERROR: request_form_b is creator-only (creator: {t['author']!r})"
-        if not _token_ok(conn, author, token):
-            # v2.12.0 batch2 (dsh #1435 §一): corrupt row gets the named state,
-            # never the normal-issue text (that would rebuild + replace the hash).
-            return _token_err(conn, author, "request_form_b")
+        # 批次1 1.1c (#112 冻结面 ③): this was the last bare _token_ok governance
+        # call — route through the shared gate so a mismatched presentation latches
+        # 档B (thread_id passed) like every other governance tool.  Corrupt rows
+        # keep the named state + reset exit (dsh #1435 §一), now reported as
+        # request_form_b (where=), not token_gate.  Position unchanged: the
+        # status gate below stays where it was (不提前).
+        _tok_err = _token_gate(conn, author, token, thread_id=thread_id,
+                               where="request_form_b")
+        if _tok_err:
+            return _tok_err
         if t["status"] != "open":
             return f"ERROR: thread is {t['status']} — (b) admission is open-thread-only"
         if not names or not all(isinstance(n, str) and n.strip() for n in names):
@@ -3522,7 +3539,9 @@ def register_meta(
         _begin_write(conn)
         # v2.12.0 batch2: use the shared gate so a corrupt row gets the named
         # state (and reset exit) instead of the false normal-issue instruction.
-        _tok_err = _token_gate(conn, author, token)
+        # 批次1 ⑦: where="register_meta" — the site reports itself (matches the
+        # unreachable-in-practice defensive branch below; batch2 intent).
+        _tok_err = _token_gate(conn, author, token, where="register_meta")
         if _tok_err:
             return _tok_err
         # v2.12.0 batch2: parse BEFORE _touch so the batch1 invariant
@@ -3805,7 +3824,8 @@ def _comment_due_face(conn: sqlite3.Connection, author: str) -> list[dict]:
 
 
 def _token_gate(conn: sqlite3.Connection, author: str, token: str | None,
-                thread_id: int | None = None) -> str | None:
+                thread_id: int | None = None, *,
+                where: str = "token_gate") -> str | None:
     """v2.10 (#77): the governance token check WITH both signal faces.
     Returns None when the token is fine — and clears any standing
     token_blocked latch (a correct presentation IS proof of possession,
@@ -3827,7 +3847,7 @@ def _token_gate(conn: sqlite3.Connection, author: str, token: str | None,
         # normal-issue text and do NOT latch 档B — a corrupt row has no
         # readable hash, so the only correct exit is the audited reset path.
         # P3: reuse this parse for the text (no third participants.meta read).
-        return _meta_unparsable_error(meta_state, "token_gate")
+        return _meta_unparsable_error(meta_state, where)
     if meta and meta.get("token_hash") and thread_id is not None:
         rev = conn.execute(
             "SELECT revision FROM threads WHERE id=?", (thread_id,)
@@ -3849,7 +3869,7 @@ def _token_gate(conn: sqlite3.Connection, author: str, token: str | None,
                    revision=rev_n,
                    note=("reason=token_unusable: meta 有 hash 而出示失配; "
                          "出口=reset_token(human_override=True) | 正确 token 一次治理调用"))
-    return _token_err(conn, author, "token_gate", state=meta_state)
+    return _token_err(conn, author, where, state=meta_state)
 
 
 def _tier_out(e: dict) -> str:
@@ -4040,10 +4060,16 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
                     (t["author"],)
                 ).fetchone()
                 if crow is None or not _is_active(crow["last_seen"]):
-                    _audit(conn, "system", "delivery_gate_skipped", thread_id=thread_id,
-                           revision=t["revision"],
-                           note=f"creator {t['author']} suspended/absent (C1) — "
-                                f"门不挂死人(#48; dsh #516②/pi #518§2)")
+                    # 批次1 1.1b/1.1c (#112 冻结面 ②): blocked-once dedup, note
+                    # gains the machine-readable reason= prefix (DEBT #3).  No
+                    # return here (unchanged): the ledger gate and auto-resolve
+                    # below stay reachable for an active-quorum-otherwise case.
+                    _audit_blocked_once(
+                        conn, thread_id, t["revision"], _SKIP_REASON,
+                        action="delivery_gate_skipped",
+                        note=f"reason={_SKIP_REASON}: creator {t['author']} "
+                             f"suspended/absent (C1) — "
+                             f"门不挂死人(#48; dsh #516②/pi #518§2)")
                 else:
                     maxid = conn.execute(
                         "SELECT COALESCE(MAX(id),0) FROM comments WHERE thread_id=? AND author<>?",
