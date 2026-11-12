@@ -175,6 +175,32 @@ class TestCheckHooks(unittest.TestCase):
         self.assertEqual(rc, 1, out[-600:])
         self.assertIn("接线不正确", out)
 
+    def test_n10_hook_type_not_command_is_bad(self):
+        # GPT round-6 P1 负向：事件/matcher/command 全对，但 hook type 不是
+        # "command"（宿主还有 prompt/agent/http 类型）——检查器必须判 BAD；
+        # type 缺失同样走 None != "command" 判 BAD（同一条代码路径）
+        shape = _claude_shape(with_gates=True)
+        shape["hooks"]["PreToolUse"][0]["hooks"][0]["type"] = "prompt"
+        self._write(shape)
+        rc, out, _ = self._run()
+        self.assertEqual(rc, 1, out[-600:])
+        self.assertIn("接线不正确", out)
+        self.assertIn("type=command", out)
+        self.assertIn("quorum_guard_hook.py", out)
+
+    def test_p3_prompt_and_hook_default_marker_paths_match(self):
+        # GPT round-6 P2：轮询提示词的打卡缺省路径必须与 quorum_guard 的
+        # 缺省一致（env 未生效时两边落同一文件，F6 门不空转）+ 写前建父目录
+        prompt = open(os.path.join(HERE, "claude-polling-prompt.txt"),
+                      encoding="utf-8").read()
+        hook_src = open(os.path.join(HERE, "quorum_guard_hook.py"),
+                        encoding="utf-8").read()
+        self.assertIn("${RB_POLL_MARKER:-$HOME/.zcode/rb-zcode-poll-heartbeat}",
+                      prompt, "提示词缺省路径必须与 hook 默认同文件")
+        self.assertIn('os.path.expanduser("~/.zcode/rb-zcode-poll-heartbeat")',
+                      hook_src, "测试前提:hook 默认路径在位(漂移时先对齐此断言)")
+        self.assertIn("mkdir -p", prompt, "打卡写入前必须先建父目录")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

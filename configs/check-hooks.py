@@ -72,6 +72,7 @@ def load_commands(cfg_path: pathlib.Path):
                 if not isinstance(hook, dict):
                     raise ValueError(f"事件 {event} 的 hook 条目不是对象")
                 out.append({"event": event, "matcher": matcher,
+                            "type": hook.get("type"),
                             "command": hook.get("command") or "",
                             "timeout_ms": hook.get("timeoutMs")})
     return out
@@ -83,6 +84,8 @@ def load_commands(cfg_path: pathlib.Path):
 # matcher 必须覆盖的工具名)。覆盖语义与宿主一致：re.search(matcher, 工具名)
 # 命中即算覆盖（模板形状 "mcp__review-board__(create_thread|...)"、宽正则、
 # catch-all 无 matcher 都按宿主语义判）；matcher 缺失/空 = 全部工具。
+# GPT round-6 P1：type 必须 == "command"——宿主 hook 还有 prompt/agent/http
+# 等类型，command 字段在位不等于宿主会按命令执行它。
 EXPECTED_WIRING = (
     ("quorum_guard_hook.py", "PreToolUse",
      ("mcp__review-board__create_thread", "mcp__review-board__set_quorum",
@@ -120,13 +123,15 @@ def check_wiring(cmds) -> int:
             bad += 1
             continue
         ok = any(c["event"] == event
+                 and c["type"] == "command"
                  and all(_matcher_covers(c["matcher"], t) for t in tools)
                  for c in entries)
         if not ok:
-            where = ", ".join(f"{c['event']}(matcher={c['matcher']!r})"
-                              for c in entries)
+            where = ", ".join(f"{c['event']}(type={c['type']!r},"
+                              f" matcher={c['matcher']!r})" for c in entries)
             need = f"，matcher 须覆盖 {'、'.join(tools)}" if tools else ""
-            print(f"[BAD] 接线不正确     {script} — 应接在 {event}{need}；实际: {where}")
+            print(f"[BAD] 接线不正确     {script} — 应接在 {event}、type=command{need}；"
+                  f"实际: {where}")
             bad += 1
     return bad
 
@@ -218,14 +223,16 @@ def check_watcher_texts(texts: dict | None = None) -> int:
             if n_chain != 1 or _PRIORITY_OLD in text:
                 miss.append(f"优先级链(期望唯一含 verdict_stale 全序, 实际 {n_chain} 处)"
                             if n_chain != 1 else "旧优先级链残留")
-            # GPT PR#32 四轮 P2 + 五轮 P1-2：打卡必须是轮询的真自动心跳，且
-            # 路径与 settings 的 RB_POLL_MARKER 同源——提示词必须含 RB_POLL_MARKER
-            # （环境变量同源）与打卡文件名；写死具体用户名路径 = 与模板 <你> 占位
-            # 脱节（换用户名安装即错位），一律 BAD
-            if "rb-claude-poll-heartbeat" not in text:
-                miss.append("打卡步骤(rb-claude-poll-heartbeat:每轮成功轮询后必须刷新)")
+            # GPT PR#32 四轮 P2 + 五轮 P1-2 + 六轮 P2：打卡必须是轮询的真自动
+            # 心跳，路径与 settings 的 RB_POLL_MARKER 同源；缺省必须与
+            # quorum_guard 默认同一文件（rb-zcode-poll-heartbeat，env 未生效时
+            # 两边落同一处）；写死具体用户名路径 = BAD
+            if "rb-zcode-poll-heartbeat" not in text:
+                miss.append("打卡缺省路径(须与 quorum_guard 默认 rb-zcode-poll-heartbeat 同文件)")
             if "RB_POLL_MARKER" not in text:
                 miss.append("打卡路径同源(须按 RB_POLL_MARKER 取路径,禁写死用户名)")
+            if "mkdir -p" not in text:
+                miss.append("打卡写前建父目录(mkdir -p)")
             if re.search(r">>\s*[\"']?C:/Users/[^/\"'\s]+/", text):
                 miss.append("打卡命令写死了用户名路径(改 ${RB_POLL_MARKER:-...})")
         if miss or inv:
