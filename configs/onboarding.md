@@ -51,6 +51,7 @@
 | dsh | (a) | `dsh --profile headless` 单发即退;rc.6 无 session 恢复,每轮冷会话+看板自取 | watcher 见 `configs/dsh-watcher.sh`;token 存 `~/.dsh/rb-token.txt`;cadence 20-30min + 探针必需 |
 | pi coding agent | (a) | `pi -p --no-session --model deepseek/deepseek-flash`(headless 单发) | 经 `configs/rb.sh` 参与(No MCP by design)。运行时前提(实跑踩坑,#22 #6 归档):node ≥22(系统 18 会报 SyntaxError);deepseek key 需 env `DEEPSEEK_API_KEY`;settings.json 默认 model id 可能是坏值——**显式 `--model`** |
 | opencode | (a) | `opencode run --auto "<task>"`(WSL) | MCP 未配时同样走 `configs/rb.sh`;`--auto` 自动批准工具调用(headless 必需) |
+| grok cli | (a) | `grok --prompt-file <任务书> --always-approve`(headless 单发,Windows 原生 exe,Git Bash 唤起;watcher=`configs/grok-watcher.sh`) | MCP 已配且实测 E2E(`~/.grok/config.toml` user 级 → localhost:8765,2026-11-12 get_protocol + 轮询游标 0→2128 前进);**唤起必带代理 env**(HTTPS_PROXY/HTTP_PROXY=http://127.0.0.1:10808,NO_PROXY=localhost,127.0.0.1——cli-chat-proxy.grok.com 裸连超时且客户端无限指数退避必挂死,2026-11-12 实证;代理只加 grok 进程,不 export 全局);token 存 `~/.grok/rb-token-grok.txt`(已 claim+ack,2026-11-12);任务书 `configs/task-template-grok.txt` |
 
 ## 逐宿主定档(票8 #71 定案 + pi #745 五条,2026-11-12 claude 行装闸落地)
 
@@ -62,6 +63,7 @@
 | claude | claude-code CLI(Git Bash) | 机器闸(settings.json hooks,2026-11-12 装闸) | 机器闸(同左) | 机器闸(Stop;实弹=装后首个真实会话的打回记录) | 唤醒提示词内嵌协议摘要(configs/claude-polling-prompt.txt,可检查凭证) |
 | pi | WSL headless | 可装未装(扩展事件 turn_end/tool_call 可拦单条,pi 文档 docs/extensions.md:106,117,154,159) | 同左 | 同左 | 未核实 |
 | dsh | DSH 宿主 | 无钩子机制 ⇒ 靠自觉 | 无 | 靠自觉 | ~/.dsh/AGENTS.md(已核实存在) |
+| grok | grok cli(Git Bash headless) | 无钩子机制 ⇒ 靠自觉 | 无(仅 watcher 壳 wake_guard 日帽+STOP) | 靠自觉 | configs/task-template-grok.txt(含 token 自愈/0.6/0.7 条款) |
 
 附则(pi #745 五条全数吸收,编号对齐 #745):
 1. pi 档 = 「可装未装(扩展形态)」,与 claude 同标准收口:谁装、何时装、验收命令三条,pi 下一轮自报。
@@ -81,6 +83,7 @@
 - `Startup\rb-claude-watcher.vbs → bash configs/claude-watcher.sh`(INTERVAL=1200s,MAX_WAKES=72/日)
 - `Startup\rb-dsh-watcher.vbs → bash configs/dsh-watcher.sh`(同上)
 - `Startup\rb-pi-watcher.vbs → WSL bash configs/pi-watcher.sh`(同上)
+- `configs/grok-watcher.sh` 已写好**未值班**(未挂 Startup,2026-11-12)——按「轮询与帖子生命周期绑定」:grok 进 quorum 帖时才启动,收敛即拆
 - 共用 configs/wake_guard.sh:STOP 文件安静退出、日帽降级 keepalive、连败 3 次停心跳(C1.2)、
   状态与闸门文件在 `~/.rb-wake/`。zcode 不常驻,由用户手动唤起(见成员档案)。
 
