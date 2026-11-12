@@ -6,7 +6,7 @@
   get_thread {"thread_id":<id>}
   post_comment {"thread_id":<id>,"author":"grok","body":"..."}
   get_protocol {}
-0) token(治理凭证,投票/改评审名单/提升修订时必填):固定路径 = C:\Users\liu\.grok\rb-token-grok.txt。
+0) token(治理凭证,投票/改评审名单/提升修订时必填):固定路径 = ~/.grok/rb-token-grok.txt(家目录级,与 onboarding 同口径)。
    能读到文件内容即持有凭证,治理调用时把它填进工具的 token 参数。
    仅当文件不存在或为空:claim_token {"author":"grok"} 取明文,立即写入该文件并回读,
    再 ack_token {"author":"grok","token":"<明文>"}(先落盘再使用)。

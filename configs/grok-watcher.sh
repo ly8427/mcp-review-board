@@ -21,7 +21,14 @@
 #      静默 180s 即杀——防 1) 的无限重试挂死占住单飞锁、停摆心跳。
 #
 # 运行(Git Bash): bash configs/grok-watcher.sh
+#
+# 安审姿态(GPT PR#34 review,2026-11-12):不加 --always-approve,改 --allow 白名单
+# (mcp__review-board__* + Read + Write;兼容别名 --allowedTools 实测可用)——板上他人
+# 写的内容是不可信输入,提示注入只能落在限权面内;另 --disable-web-search 收窄内建面。
+# 事件文件含 streaming-json 工具参数(可能带 token 明文):umask 077 + $HOME/.rb-wake/
+# + 每轮唤醒后截断。
 set -u
+umask 077
 
 BOARD="${BOARD:-http://localhost:8765}"
 AUTHOR="${AUTHOR:-grok}"
@@ -33,13 +40,19 @@ MAX_WAKES="${MAX_WAKES:-72}"                       # 20min × 72 = 24h 满打满
   echo "[wake-guard] 找不到 wake_guard.sh，拒绝无上限启动（票3）"; exit 2; }
 wg_preflight grok-watcher "$INTERVAL"
 GROK_BIN="${GROK_BIN:-$HOME/.grok/bin/grok.exe}"
-WAKE_PROXY="${WAKE_PROXY:-http://127.0.0.1:10808}"   # 见头注 1)；换代理面时只改这里
+WAKE_PROXY="${WAKE_PROXY:-}"   # 本机代理面经 env 注入(头注 1);不写死机器地址(PR#34 review Low)
+if [ -z "$WAKE_PROXY" ]; then
+  echo "[preflight] WAKE_PROXY 未设置——grok 唤起必带代理 env(裸连 cli-chat-proxy.grok.com 无限退避挂死,2026-11-12 实证)。"
+  echo "  示例: export WAKE_PROXY=http://127.0.0.1:10808   # 换代理面时只改这里"
+  exit 2
+fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROMPT_TEMPLATE="$SCRIPT_DIR/task-template-grok.txt"
-TASK_FILE="${TASK_FILE:-/tmp/rb-grok-wake.txt}"
+TASK_FILE="${TASK_FILE:-$HOME/.rb-wake/grok-wake.txt}"   # 任务书(含注入行),077 权限面
 LOCK="${LOCK:-/tmp/rb-grok-watcher.lock.d}"
 FAILS="${FAILS:-$HOME/.rb-wake/grok-watcher.fails}"  # 持久面,同 pi/claude/dsh(batch3 修复)
-EV="${EV:-/tmp/rb-grok-events.log}"
+EV="${EV:-$HOME/.rb-wake/grok-events.log}"   # 事件文件可能含工具参数里的 token 明文(PR#34 Medium)
+mkdir -p "$HOME/.rb-wake" 2>/dev/null || true
 GATE_TRIP_LOG="${GATE_TRIP_LOG:-$HOME/.rb-wake/GATE-TRIP.log}"
 
 gate=$(cat "$FAILS" 2>/dev/null || echo 0)
@@ -97,15 +110,18 @@ cycle() {
     echo "(本次唤醒探针注入: reason=$reason, threads=$threads)"
   } > "$TASK_FILE"
 
-  # 唤起:代理 env 只作用于 grok 进程(探针保持直连);streaming-json 使事件文件在
-  # 工作期间持续增长——停滞看门狗才有判据(头注 3)。
+  # 唤起:代理 env 只作用于 grok 进程(探针保持直连);工具白名单见头注「安审姿态」
+  # (--allow 实测:get_protocol 在白名单下真执行,无审批卡壳,2026-11-12);streaming-json
+  # 使事件文件在工作期间持续增长——停滞看门狗才有判据(头注 3)。
   # 后台只放 grok 本体(不能把 cd&&grok 整体后台:杀外壳会留孤儿 grok 继续跑,
   # 「取消≠死亡」事故同形);WPID 即 grok 自身,kill 直达。
   : > "$EV"
   if ( cd "$HOME"
        env HTTPS_PROXY="$WAKE_PROXY" HTTP_PROXY="$WAKE_PROXY" \
            NO_PROXY="localhost,127.0.0.1" \
-           "$GROK_BIN" --prompt-file "$TASK_FILE" --always-approve --max-turns 40 \
+           "$GROK_BIN" --prompt-file "$TASK_FILE" \
+           --allow "mcp__review-board__*" --allow "Read" --allow "Write" \
+           --disable-web-search --max-turns 40 \
            --output-format streaming-json --no-alt-screen > "$EV" 2>&1 &
        WPID=$!
        while kill -0 $WPID 2>/dev/null; do
@@ -139,6 +155,7 @@ cycle() {
     echo "$(date +%T) wake FAILED ($n/3)"
     [ "$n" -ge 3 ] && { echo "$(date '+%F %T') gate tripped (C1.2): stopping heartbeat; member will suspend after 24h idle."; printf '%s\n' "$(date '+%F %T') [grok-watcher] gate tripped (3 consecutive wake failures) — watcher stopped; recovery: rm $FAILS && restart." >> "$GATE_TRIP_LOG" 2>/dev/null || true; exit 1; }
   fi
+  : > "$EV"   # PR#34 review Medium:每轮唤醒后截断事件文件(内含工具参数,可能带 token 明文)
 }
 
 cycle
