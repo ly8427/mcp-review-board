@@ -188,6 +188,17 @@ class TestCheckHooks(unittest.TestCase):
         self.assertIn("type=command", out)
         self.assertIn("quorum_guard_hook.py", out)
 
+    def test_n10b_hook_type_missing_is_bad(self):
+        # GPT round-7 ④①（合并后尾单）：n10 注释声称"type 缺失也 BAD"但用例
+        # 只测了 type=prompt——补 pop("type") 缺失分支，兑现注释
+        shape = _claude_shape(with_gates=True)
+        shape["hooks"]["PreToolUse"][0]["hooks"][0].pop("type")
+        self._write(shape)
+        rc, out, _ = self._run()
+        self.assertEqual(rc, 1, out[-600:])
+        self.assertIn("接线不正确", out)
+        self.assertIn("type=command", out)
+
     def test_p3_prompt_and_hook_default_marker_paths_match(self):
         # GPT round-6 P2：轮询提示词的打卡缺省路径必须与 quorum_guard 的
         # 缺省一致（env 未生效时两边落同一文件，F6 门不空转）+ 写前建父目录
