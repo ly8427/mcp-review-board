@@ -122,6 +122,35 @@ class TestCheckHooks(unittest.TestCase):
         self.assertIn("预期闸未接线", out)
         self.assertIn("automation_guard_hook.py", out)
 
+    def test_n6_wrong_event_wiring_is_bad(self):
+        # GPT round-4 P1 负向测试：三脚本都在、都能独立运行，但事件接错
+        # （quorum/automation 接到 Stop、plain_speak 接到 PreToolUse）——
+        # 检查器必须报非零；「脚本存在」绝不等于「会在正确时机触发」
+        shape = _claude_shape(with_gates=True)
+        hooks = {"Stop": [], "PreToolUse": []}
+        for entry in shape["hooks"]["Stop"]:
+            hooks["PreToolUse"].append(entry)          # plain_speak → 错接 PreToolUse
+        for entry in shape["hooks"]["PreToolUse"]:
+            hooks["Stop"].append(entry)                # 两道 PreToolUse 闸 → 错接 Stop
+        self._write({"hooks": hooks})
+        rc, out, _ = self._run()
+        self.assertEqual(rc, 1, out[-600:])
+        self.assertEqual(out.count("接线不正确"), 3, out[-600:])
+        self.assertIn("应接在 PreToolUse", out)
+        self.assertIn("应接在 Stop", out)
+
+    def test_n7_matcher_too_narrow_is_bad(self):
+        # GPT round-4 P1 另一半：事件对、但 matcher 覆盖不了管辖工具
+        # （quorum 的 matcher 只写 Edit|Write，治理工具漏接）——必须 BAD
+        shape = _claude_shape(with_gates=True)
+        shape["hooks"]["PreToolUse"][0]["matcher"] = "Edit|Write"
+        self._write(shape)
+        rc, out, _ = self._run()
+        self.assertEqual(rc, 1, out[-600:])
+        self.assertIn("接线不正确", out)
+        self.assertIn("quorum_guard_hook.py", out)
+        self.assertIn("mcp__review-board__create_thread", out)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

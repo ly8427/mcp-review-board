@@ -39,7 +39,7 @@
   →quorum_guard、PreToolUse×`CronCreate|CronUpdate|OffPeakCreate`→automation_guard、
   Stop→plain_speak_gate(同一套 configs/ 脚本,零拷贝)。settings.json 的 `env` 块加
   `RB_WATCHER_GATES_JSON`(指向 `~/.rb-wake/<member>-watcher.fails`——hook 子进程继承会话环境)
-  与 `RB_POLL_MARKER`(claude 宿主无常驻打卡器:缺文件/过期 ⇒ 建帖被拒并给指引,建帖前先 touch 该文件)。
+  与 `RB_POLL_MARKER`(claude 打卡文件:由轮询提示词 v2.4 起**每轮成功轮询后自动刷新**——打卡=轮询存活证据,与 zcode 侧同义;缺文件/过期 ⇒ 建帖被拒并给指引。人工 touch 只能应急救活一轮、不构成轮询在跑的证明——只打卡不轮询,下次仍会被时间戳过期拦住,GPT PR#32 四轮 P2)。
   验收:`python configs/check-hooks.py --config ~/.claude/settings.json`(claude 形状,4.2 起 check-hooks 两形状通吃)。
 - 手测:`echo '{"tool_name":"mcp__review-board__create_thread","input":{"quorum":["trae"]}}' | python configs/quorum_guard_hook.py` → 应 exit 2 并给行动指引。
 

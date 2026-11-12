@@ -336,6 +336,42 @@ class TestGateEndToEnd(Harness):
         self.assertIn("no-assistant-in-file", err,
                       "诊断痕必须带原因代码(不再合流)")
 
+    # ── GPT round-4 P2：容器值的元数据不得冒充正文（V1.1.8） ──
+    def test_h_metadata_container_body_beats_id_field(self):
+        # dict 插入序里 id/status 排在 text 前——旧递归会先取到 "abc123"；
+        # 容器必须取 text 正文：黑话正文 → 打回（取到元数据就会漏放）
+        self.write_transcript([
+            {"type": "assistant", "message": {"role": "assistant", "content": CLEAN}},
+        ])
+        payload = {**self.stop_payload(),
+                   "response": {"id": "abc123", "status": "completed",
+                                "text": JARGON}}
+        rc, b, _ = self.gate(payload)
+        self.assertIsNotNone(b, "容器值必须取 text 正文——元数据冒充正文=漏检")
+        self.assertIn("落盘", b["reason"])
+
+    def test_h2_metadata_only_container_fails_open_with_diag(self):
+        # 未识别形状（纯元数据容器）→ 不扫描元数据、fail-open，但必须留诊断痕
+        self.write_transcript([
+            {"type": "user", "message": {"role": "user", "content": JARGON}},
+        ])
+        payload = {**self.stop_payload(),
+                   "response": {"id": "abc123", "status": "completed"}}
+        rc, b, err = self.gate(payload)
+        self.assertIsNone(b, "纯元数据容器 → 不扫描、fail-open")
+        self.assertIn("未识别出正文", err, "未识别结构必须留 stderr 诊断（GPT round-4 P2）")
+
+    def test_h3_body_in_nonstandard_key_visible_in_diag(self):
+        # 板 ⑤b（dsh #2073 定稿）：正文落在 preview 等非消费面键 → 不得静默
+        # 丢弃，stderr 必须可见；且不盲选（消费面不动，防键序定成败）
+        self.write_transcript([
+            {"type": "user", "message": {"role": "user", "content": JARGON}},
+        ])
+        payload = {**self.stop_payload(), "preview": JARGON}
+        rc, b, err = self.gate(payload)
+        self.assertIsNone(b, "非消费面键不盲选 → 走尾读/fail-open")
+        self.assertIn("不在消费面", err, "正文在非标准键必须留 stderr 诊断（板 ⑤b）")
+
 
 class TestTailReasonsAndWash(unittest.TestCase):
     """GPT round-20/21 §三:七态原因、形状族、洗环境表派生(dsh #2052 §三)。"""

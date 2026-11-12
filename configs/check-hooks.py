@@ -77,8 +77,53 @@ def load_commands(cfg_path: pathlib.Path):
     return out
 
 
-# 票8 三道闸（GPT round-19：配置里至少要能看到这三条接线，缺一即 BAD）
-EXPECTED_GATES = ("quorum_guard_hook.py", "automation_guard_hook.py", "plain_speak_gate.py")
+# 票8 三道闸（GPT round-19：配置里至少要能看到这三条接线，缺一即 BAD；
+# GPT round-4 P1：从「文件名出现」升级为**结构化接线规则**——脚本能运行
+# ≠ 宿主会在正确的事件调用它。每条规则 = (闸脚本名, 必须在的事件,
+# matcher 必须覆盖的工具名)。覆盖语义与宿主一致：re.search(matcher, 工具名)
+# 命中即算覆盖（模板形状 "mcp__review-board__(create_thread|...)"、宽正则、
+# catch-all 无 matcher 都按宿主语义判）；matcher 缺失/空 = 全部工具。
+EXPECTED_WIRING = (
+    ("quorum_guard_hook.py", "PreToolUse",
+     ("mcp__review-board__create_thread", "mcp__review-board__set_quorum",
+      "mcp__review-board__set_verdict")),
+    ("automation_guard_hook.py", "PreToolUse",
+     ("CronCreate", "CronUpdate", "OffPeakCreate")),
+    ("plain_speak_gate.py", "Stop", ()),
+)
+
+
+def _matcher_covers(matcher, tool: str) -> bool:
+    """宿主语义：PreToolUse matcher 是对工具名做正则匹配；空/缺失 = catch-all。"""
+    if not matcher:
+        return True
+    try:
+        return re.search(matcher, tool) is not None
+    except re.error:
+        return tool in matcher   # matcher 不是合法正则 → 退化按子串判
+
+
+def check_wiring(cmds) -> int:
+    """结构化接线验证（GPT round-4 P1）：每道闸必须在正确事件、matcher 覆盖
+    其管辖工具。三脚本都在但事件接错 = 全 BAD——负向测试（test_check_hooks
+    N6）钉死「脚本都能跑、检查器仍必须报非零」。"""
+    bad = 0
+    for script, event, tools in EXPECTED_WIRING:
+        entries = [c for c in cmds if script in c["command"]]
+        if not entries:
+            print(f"[BAD] 预期闸未接线   {script} — 配置里看不到这条闸的 command")
+            bad += 1
+            continue
+        ok = any(c["event"] == event
+                 and all(_matcher_covers(c["matcher"], t) for t in tools)
+                 for c in entries)
+        if not ok:
+            where = ", ".join(f"{c['event']}(matcher={c['matcher']!r})"
+                              for c in entries)
+            need = f"，matcher 须覆盖 {'、'.join(tools)}" if tools else ""
+            print(f"[BAD] 接线不正确     {script} — 应接在 {event}{need}；实际: {where}")
+            bad += 1
+    return bad
 
 
 def smoke_payload(command: str) -> bytes:
@@ -168,6 +213,10 @@ def check_watcher_texts(texts: dict | None = None) -> int:
             if n_chain != 1 or _PRIORITY_OLD in text:
                 miss.append(f"优先级链(期望唯一含 verdict_stale 全序, 实际 {n_chain} 处)"
                             if n_chain != 1 else "旧优先级链残留")
+            # GPT PR#32 四轮 P2：打卡必须是轮询的真自动心跳——提示词必须含
+            # 打卡文件路径（每轮成功轮询后刷新），否则 F6 打卡退化为人工 touch
+            if "rb-claude-poll-heartbeat" not in text:
+                miss.append("打卡步骤(rb-claude-poll-heartbeat:每轮成功轮询后必须刷新)")
         if miss or inv:
             print(f"[BAD] 载体断言     {name} — 缺 {miss or ''} "
                   f"{'机制层出现 claim_token 调用: ' + inv.group(0)[:60] if inv else ''}")
@@ -203,12 +252,8 @@ def main() -> int:
 
     bad = 0
     if not args.hook:
-        # 票8 三道闸接线完整性：缺一即 BAD（对两种配置形状同样生效）
-        joined = " ".join(c["command"] for c in cmds)
-        for gate in EXPECTED_GATES:
-            if gate not in joined:
-                print(f"[BAD] 预期闸未接线   {gate} — 配置里看不到这条闸的 command")
-                bad += 1
+        # 票8 三道闸 + GPT round-4 P1 结构化接线验证（对两种配置形状同样生效）
+        bad += check_wiring(cmds)
 
     print(f"检查 {len(cmds)} 条钩子（配置: {cfg}）\n")
     for c in cmds:

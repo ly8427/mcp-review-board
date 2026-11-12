@@ -71,17 +71,6 @@ def load_dictionary():
     return words, regexes, allowset
 
 
-def _strings(obj):
-    if isinstance(obj, str):
-        yield obj
-    elif isinstance(obj, dict):
-        for v in obj.values():
-            yield from _strings(v)
-    elif isinstance(obj, list):
-        for v in obj:
-            yield from _strings(v)
-
-
 # 渐进窗口（V1.1.4）：起始 64KB，找不到 assistant 记录时 ×4 倍增至 CAP——
 # ≥64KB 单条长回复不再被切掉（dsh #2041 §一 / pi #2042 执行实证的漏检）。
 # GPT round-21 P1：WINDOW_CAP 常量此前漏定义——渐进分支一进扩展即 NameError、
@@ -176,13 +165,37 @@ def last_assistant_text_in_tail(path):
         window = min(window * WINDOW_GROWTH, WINDOW_CAP)
 
 
+def _body_text(v):
+    """回复键值的正文提取（V1.1.8，GPT round-4 P2 + 板 #2078 定稿形状）：
+    裸串 → 原样返回（「首个非空」只留给裸串，板 #2078）；
+    容器(dict/list) → 只收 text/content 字段里的正文（text 串、content 串或
+    块列表、message 包装递归一层），id/status/type/role 等元数据一律不取，
+    多块按文档序 join（与 _assistant_text 同语义）；取不到（纯元数据/
+    未知形状）→ None。"""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, dict):
+        parts = []
+        for bk in ("text", "content", "message"):
+            if bk in v:
+                t = _body_text(v[bk])
+                if t and t.strip():
+                    parts.append(t)
+        return "\n".join(parts) or None
+    if isinstance(v, list):
+        parts = [t for x in v if (t := _body_text(x)) and t.strip()]
+        return "\n".join(parts) or None
+    return None
+
+
 def extract_text(payload):
     """取"刚写完的回复"，按权威级四路（V1.1.4，board #109 五缺口收口）：
     ① payload["last_assistant_message"]——claude Stop 官方权威字段，任意长度都算；
-    ② payload 里名字像回复的字段——**显式"最近一条"键优先于最长串**
+    ② payload 里名字像回复的字段——**显式"最近一条"键优先**
        （last_message > response > text > output；dsh 缺口②：最长串会让旧
-       诊断回文冒充当前回复），同键内按文档序取**首个非空串**
-       （V1.1.6，dsh #2052 §二.2：同键 diagnostics 长文不得冒充 text 正文）；
+       诊断回文冒充当前回复）；值是裸串 → 取该串；值是容器 → 只取
+       text/content 正文字段、元数据（id/status/type 等）不冒充正文
+       （V1.1.8，GPT round-4 P2），未识别形状 fail-open 且留 stderr 诊断；
     ③ payload["transcript_path"]（claude 宿主自带）→ 尾窗读最后一条 assistant 回复；
     ④ 会话 rollout 日志尾窗（zcode）同一语义。
     ③④ 都取不到 → stderr 留**可区分原因**的诊断痕后 fail-open 放行
@@ -195,19 +208,32 @@ def extract_text(payload):
     if isinstance(lam, str) and lam.strip():
         return lam
     keyed = {}
+    meta_only = []   # 有回复键但容器里只有元数据/未识别形状（V1.1.8，GPT round-4 P2）
     for k, v in payload.items():
         if re.search(r"response|preview|last|message|assistant|text|output", str(k), re.I):
-            # V1.1.6(dsh #2052 §二.2):同键内按文档序取**首个非空 str**——
-            # 不再收全部嵌套串按长度选(同键 diagnostics 长文不得冒充 text 正文)
-            first = next((x for x in _strings(v) if x.strip()), None)
-            if first:
-                keyed[k] = first
+            # V1.1.8（GPT round-4 P2 + 板 #2078 定稿）：容器里只取 text/content
+            # 正文字段——id/status/type 等元数据不得冒充正文（dict 插入序在前的
+            # "id":"abc123" 旧实现会被 _strings 先取到）；「首个非空」只留给裸串
+            body = _body_text(v)
+            if body and body.strip():
+                keyed[k] = body
+            elif isinstance(v, (dict, list)) and v:
+                meta_only.append(k)
     # 显式"最近一条"键优先于其余(V1.1.4 ②;flat 兜底已删——同键内长度选择
     # 正是冒充通道,dsh #2052 §二.3)
     for pref in ("last_message", "response", "text", "output"):
         if pref in keyed:
             return keyed[pref]
     diag = []
+    if meta_only:
+        diag.append("回复键存在但未识别出正文（只含元数据/未知形状，不扫描元数据）: "
+                    + ", ".join(sorted(set(meta_only))))
+    # 板 ⑤b（dsh #2073 定稿）：收集面键族比消费面（4 个 pref 键）宽——正文取到了
+    # 却不在消费面 = 旧实现静默丢弃。修法一行：进 diag 可见；**不改消费面**——
+    # 按插入序盲选非 pref 键=「键序定成败」（dsh #2070 反例，claude #2072 已撤回）
+    if keyed and not any(p in keyed for p in ("last_message", "response", "text", "output")):
+        diag.append("回复键有正文但不在消费面（last_message/response/text/output 之外，"
+                    "不盲选防键序定成败）: " + ", ".join(sorted(keyed)))
     tp = payload.get("transcript_path")
     if isinstance(tp, str) and tp:
         best, reason = last_assistant_text_in_tail(tp)
