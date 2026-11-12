@@ -94,13 +94,18 @@ EXPECTED_WIRING = (
 
 
 def _matcher_covers(matcher, tool: str) -> bool:
-    """宿主语义：PreToolUse matcher 是对工具名做正则匹配；空/缺失 = catch-all。"""
-    if not matcher:
+    """宿主语义：PreToolUse matcher 是对工具名做正则匹配；空/缺失 = catch-all。
+    GPT round-5 P1-1：非法正则 = 不覆盖（BAD）——**禁止**退化成子串包含判断
+    （未闭合括号的 matcher 里含全部工具名的子串会假绿，正是本检查器要抓的
+    「看起来接线、实际不触发」）；matcher 类型不是字符串 = 不覆盖。"""
+    if matcher is None or matcher == "":
         return True
+    if not isinstance(matcher, str):
+        return False
     try:
         return re.search(matcher, tool) is not None
     except re.error:
-        return tool in matcher   # matcher 不是合法正则 → 退化按子串判
+        return False   # 非法正则：宿主侧无法匹配 → 判 BAD，不退化
 
 
 def check_wiring(cmds) -> int:
@@ -213,10 +218,16 @@ def check_watcher_texts(texts: dict | None = None) -> int:
             if n_chain != 1 or _PRIORITY_OLD in text:
                 miss.append(f"优先级链(期望唯一含 verdict_stale 全序, 实际 {n_chain} 处)"
                             if n_chain != 1 else "旧优先级链残留")
-            # GPT PR#32 四轮 P2：打卡必须是轮询的真自动心跳——提示词必须含
-            # 打卡文件路径（每轮成功轮询后刷新），否则 F6 打卡退化为人工 touch
+            # GPT PR#32 四轮 P2 + 五轮 P1-2：打卡必须是轮询的真自动心跳，且
+            # 路径与 settings 的 RB_POLL_MARKER 同源——提示词必须含 RB_POLL_MARKER
+            # （环境变量同源）与打卡文件名；写死具体用户名路径 = 与模板 <你> 占位
+            # 脱节（换用户名安装即错位），一律 BAD
             if "rb-claude-poll-heartbeat" not in text:
                 miss.append("打卡步骤(rb-claude-poll-heartbeat:每轮成功轮询后必须刷新)")
+            if "RB_POLL_MARKER" not in text:
+                miss.append("打卡路径同源(须按 RB_POLL_MARKER 取路径,禁写死用户名)")
+            if re.search(r">>\s*[\"']?C:/Users/[^/\"'\s]+/", text):
+                miss.append("打卡命令写死了用户名路径(改 ${RB_POLL_MARKER:-...})")
         if miss or inv:
             print(f"[BAD] 载体断言     {name} — 缺 {miss or ''} "
                   f"{'机制层出现 claim_token 调用: ' + inv.group(0)[:60] if inv else ''}")

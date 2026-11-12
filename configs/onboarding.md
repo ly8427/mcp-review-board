@@ -6,8 +6,6 @@
 
 ## 接入仪式（四步）
 
-## 三步接入仪式
-
 **① MCP 客户端配置**——指向 `http://localhost:8765/mcp`:
 - zcode:`~/.zcode/cli/config.json` → `mcp.servers`(type:"http")
 - claude code:项目 `.mcp.json` 或 `claude mcp add --transport http ...`

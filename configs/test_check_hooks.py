@@ -151,6 +151,30 @@ class TestCheckHooks(unittest.TestCase):
         self.assertIn("quorum_guard_hook.py", out)
         self.assertIn("mcp__review-board__create_thread", out)
 
+    def test_n8_invalid_regex_with_all_tools_is_bad(self):
+        # GPT round-5 P1-1 负向：matcher 是非法正则（未闭合括号）但含全部
+        # 工具名子串——禁止退化成子串判断假绿，必须 BAD
+        shape = _claude_shape(with_gates=True)
+        shape["hooks"]["PreToolUse"][0]["matcher"] = (
+            "mcp__review-board__create_thread|"
+            "mcp__review-board__set_quorum|"
+            "mcp__review-board__set_verdict(")      # 未闭合括号 → 非法正则
+        self._write(shape)
+        rc, out, _ = self._run()
+        self.assertEqual(rc, 1, out[-600:])
+        self.assertIn("接线不正确", out)
+        self.assertIn("quorum_guard_hook.py", out)
+
+    def test_n9_matcher_wrong_type_is_bad_not_crash(self):
+        # GPT round-5 P1-1 负向：matcher 类型错误（对象）→ 明确 BAD，rc=1，
+        # 检查器不得异常退出
+        shape = _claude_shape(with_gates=True)
+        shape["hooks"]["PreToolUse"][0]["matcher"] = {"bad": True}
+        self._write(shape)
+        rc, out, _ = self._run()
+        self.assertEqual(rc, 1, out[-600:])
+        self.assertIn("接线不正确", out)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

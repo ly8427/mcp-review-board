@@ -136,8 +136,20 @@ def last_assistant_text_in_tail(path):
             return None, "empty"
         last = None
         final_unparsed = False
-        # 窗口边界切出的首行（start>0 时可能是不完整记录的前半）：跳过
-        body = lines[1:] if start > 0 else lines
+        # 窗口边界切出的首行：仅当它真的是被截断的半条记录时才跳过。
+        # V1.1.9（GPT round-5 P2）：旧实现 start>0 一律丢 lines[0]——窗口恰好
+        # 落在记录边界（start-1 处是换行）时首行本为完整记录，白白丢掉可能
+        # 让最新 assistant 记录在 cap 处不可见（fail-open）。判据：读 start-1
+        # 一个字节，是 \n = 边界完整（保留首行）；否则首行确为半条（跳过）。
+        first_line_complete = True
+        if start > 0:
+            try:
+                with open(path, "rb") as f:
+                    f.seek(start - 1)
+                    first_line_complete = f.read(1) == b"\n"
+            except OSError:
+                first_line_complete = False
+        body = lines if first_line_complete else lines[1:]
         for i, line in enumerate(body):
             last_line_of_file = i == len(body) - 1   # 窗口永远延伸到文件尾
             if not line.startswith("{"):

@@ -405,6 +405,38 @@ class TestTailReasonsAndWash(unittest.TestCase):
         missing = os.path.join(self.d, "missing.jsonl")
         self.assertEqual(self.m.last_assistant_text_in_tail(missing)[1], "no-file")
 
+    def test_g15_window_boundary_on_record_edge_keeps_first_line(self):
+        # GPT round-5 P2：start>0 且窗口恰好落在记录边界（start-1 是 \n）时，
+        # 首行是完整记录，不得无条件丢弃。构造：rec1(用户记录) + rec2(assistant,
+        # 恰 65535B)，并把 WINDOW_CAP 压到 64KB——扩窗在 cap 停住、start 恰压在
+        # rec2 起点（窗口再大就会 start=0 全读，丢首行无害，故必须钉 cap）。
+        # 旧实现丢首行 → 窗内无 assistant 且到 cap → cap-reached(漏检)；
+        # 新实现前置字节判界 → found。
+        self.m.WINDOW_CAP = 65536   # tearDown 恢复；扩窗到此即停,start 保持 >0
+        rec1 = json.dumps({"type": "user",
+                           "message": {"role": "user", "content": JARGON}},
+                          ensure_ascii=False)
+        base = json.dumps({"type": "assistant",
+                           "message": {"role": "assistant", "content": CLEAN}},
+                          ensure_ascii=False)
+        pad = 65535 - len(base.encode("utf-8"))
+        self.assertGreater(pad, 0)
+        rec2 = json.dumps({"type": "assistant",
+                           "message": {"role": "assistant",
+                                       "content": CLEAN + "x" * pad}},
+                          ensure_ascii=False)
+        self.assertEqual(len(rec2.encode("utf-8")), 65535, "测试前提:rec2 恰 65535B")
+        f1 = os.path.join(self.d, "edge.jsonl")
+        with open(f1, "w", encoding="utf-8", newline="") as f:
+            f.write(rec1 + "\n" + rec2 + "\n")
+        size = os.path.getsize(f1)
+        self.assertEqual(size - 65536, len(rec1.encode("utf-8")) + 1,
+                         "测试前提:窗口起点恰在 rec2 边界")
+        text, reason = self.m.last_assistant_text_in_tail(f1)
+        self.assertEqual(reason, "found",
+                         "边界上的完整首行不得被丢弃(旧实现此处 cap-reached)")
+        self.assertTrue(text.startswith(CLEAN), "找回的必须是 rec2 正文")
+
     def test_g12_unreadable_reason(self):
         dpath = os.path.join(self.d, "adir")   # 传目录:open 必失败
         os.makedirs(dpath, exist_ok=True)
