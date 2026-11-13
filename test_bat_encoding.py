@@ -16,9 +16,10 @@ from pathlib import Path
 failures = []
 for bat in sorted(Path(".").glob("*.bat")):
     data = bat.read_bytes()
-    if b"\r\n" not in data or data.count(b"\n") != data.count(b"\r\n"):
+    n_lf, n_crlf = data.count(b"\n"), data.count(b"\r\n")
+    if b"\r\n" not in data or n_lf != n_crlf:
         failures.append(f"{bat}: not CRLF throughout "
-                        f"({data.count(b'\\n') - data.count(b'\\r\\n')} bare LF)")
+                        f"({n_lf - n_crlf} bare LF)")
     try:
         data.decode("ascii")
     except UnicodeDecodeError as e:

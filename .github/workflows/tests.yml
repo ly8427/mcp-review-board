@@ -1,0 +1,131 @@
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Windows 默认控制台是 cp1252，测试脚本 print('✅'/'β') 会 UnicodeEncodeError。
+# 闸自身已强制 UTF-8 stdio；这里再给整个 job 开 UTF-8 模式，避免用例打印崩。
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hooks:
+    name: hooks / ${{ matrix.os }} / ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    # windows-latest 默认 pwsh：多行 run 里前面的原生命令非零退出不使步骤失败，
+    # 只看最后一条的 $LASTEXITCODE。bash -eo pipefail 与「一套一步」双保险。
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: plain-speak gate
+        run: python configs/test_plain_speak_gate.py
+      - name: check-hooks
+        run: python configs/test_check_hooks.py
+      - name: bat encoding
+        run: python test_bat_encoding.py
+      - name: v2.12 beta gate
+        run: python test_v212_beta_gate.py
+      - name: v2.12 meta writegate
+        run: python test_v212_meta_writegate.py
+      # V25 执行桩在 Windows 上拼 WSL 路径（/mnt/c/…）并调用 bash，
+      # GitHub-hosted windows-latest 无 WSL，故本套只在 POSIX 跑。
+      - name: repair-gate
+        if: runner.os != 'Windows'
+        run: python test_repair_gate.py
+
+  server:
+    name: server / ubuntu / ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # 虽然本 job 只跑 ubuntu（默认已是 bash -eo pipefail），同样一套一步，
+    # 避免以后加 Windows 时再踩 pwsh 多行退出码的坑。
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: python -m pip install -r requirements.txt
+      # 这些套件在本机 Linux 上无需密钥即可跑通（本地看板 / SQLite / 临时端口）。
+      # 只用 ubuntu：stage/cap 用 SIGTERM 和固定 localhost 端口，原本按 WSL/Linux
+      # 写；Windows 信号与路径模型不同，不必在每档 OS 上重复跑集成面。
+      - name: replay stale
+        run: python test_replay_stale.py
+      - name: schema migration
+        run: python test_schema_migration.py
+      - name: search v2.8
+        run: python test_search_v28.py
+      - name: discussion cap
+        run: python test_cap.py
+      - name: v2.10 attention signals
+        run: python test_v210_attention_signals.py
+      - name: v2.11 floor budget
+        run: python test_v211_floor_budget.py
+      - name: v2.12 meta batch2
+        run: python test_v212_meta_batch2.py
+      - name: v2.12 meta hardening
+        run: python test_v212_meta_hardening.py
+      - name: v2.12 meta hardening b2
+        run: python test_v212_meta_hardening_b2.py
+      - name: v2.12 meta obj
+        run: python test_v212_meta_obj.py
+      - name: v2.12 touch sites
+        run: python test_v212_touch_sites.py
+      - name: v2.9.2 flip conditions
+        run: python test_v292_flip_conditions.py
+      - name: v2.9.2 gates
+        run: python test_v292_gates.py
+      - name: v2.9.2 watermark migration
+        run: python test_v292_watermark_migration.py
+      - name: v2.9.3 resolve order
+        run: python test_v293_resolve_order.py
+      - name: v2.9.4 status floor
+        run: python test_v294_status_floor.py
+      - name: v2.9.5 noop override
+        run: python test_v295_noop_override.py
+      - name: v2 stage1
+        run: python test_v2_stage1.py
+      - name: v2 stage2
+        run: python test_v2_stage2.py
+      - name: v2 stage3
+        run: python test_v2_stage3.py
+      - name: v2 stage4
+        run: python test_v2_stage4.py
+      - name: v2 stage5
+        run: python test_v2_stage5.py
+      - name: v2 stage6
+        run: python test_v2_stage6.py
+      - name: v2 stage7
+        run: python test_v2_stage7.py
+      - name: v2 stage8
+        run: python test_v2_stage8.py
+      - name: v2 stage9
+        run: python test_v2_stage9.py
