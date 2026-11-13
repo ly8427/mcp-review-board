@@ -53,15 +53,15 @@ automation-guard、说人话→本闸）。
 
 ## 验证状态（如实，2026-11-13 随 V1.1.12 更新）
 
-自动化回归 **59 项全部通过**（`configs/test_plain_speak_gate.py`）：V1.0.9 的 10 个脚本级用例
-+ V1.1.4-V1.1.12 新增 49 项。V1.1.12（板 #110 终版清单实装）：c8 role 判据（容器角色非
-assistant → 整键跳过、身份哨兵 is 判定、四传播点）+ 三桶一行一桶诊断（meta_only/role_skipped/
+自动化回归 **60 项全部通过**（`configs/test_plain_speak_gate.py`）：V1.0.9 的 10 个脚本级用例
++ V1.1.4-V1.1.12 新增 50 项。V1.1.12（板 #110 终版清单实装）：c8 role 判据（role 键存在且值非 assistant，含 JSON null / 非 str → 整键跳过、身份哨兵 is 判定、四传播点）+ 三桶一行一桶诊断（meta_only/role_skipped/
 b-tier-ignored，固定桶序+键 sorted）+ 五出口统一装配（成功出口只发桶行、fail-open 两出口伞句
-独立成行）+ 双列表（桶/原因分族）+ 契约三句入 docstring + getenv/import 四条绕行灯（g16）。
+独立成行）+ 双列表（桶/原因分族）+ 契约三句入 docstring + getenv/import 绕行灯（g16：含 _gate_env 之外的 os.getenv / getattr(..., "getenv")）。
 关键判别测试做过**变异验证**（role 桶误归旧句 → 红；出口④误发原因 → 红；闸内别名导入 → 红；
 恢复后全绿）。**实弹**：zcode 宿主多次真实打回（含 2026-11-12 两次轮询汇报打回重写）；
-**claude 宿主实弹部分验收**（打卡真自动心跳 3/4 项实证＋落点错位已修正，见 DEBT #33；
-首个真实打回记录等真实事件）。
+**claude 宿主实弹 3/4 实证、余一待验**（env 继承/落点/hook 同读三条经 claude #2121
+实跑实证，时间戳持续更新另有 zcode 查证记录；首个真实打回记录未发生，等真实事件——
+口径随 DEBT #33 v3 枚举＝板 #2141 §四）。
 
 ## 致谢
 

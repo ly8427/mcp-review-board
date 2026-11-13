@@ -618,12 +618,18 @@ class TestTailReasonsAndWash(unittest.TestCase):
         self.assertEqual(bad, [], "环境读取必须收进 _gate_env() 单一入口")
 
     def test_g16_import_shapes_forbidden(self):
-        # 板 #2141 §四 v3「getenv 灯＋import 形状四条」：环境读取的绕行通道
-        # 全部封死（作用域 GATE 非 __file__——测试文件 import importlib 5 处
-        # 属正常）。①from os import … 禁；②import os as o（alias asname）禁；
-        # ③getattr(…, "environ") 常量串即红；④__import__/importlib 名字出现即红。
+        # 板 #2141 §四 v3「getenv 灯＋import 形状四条」（PR#38 评审补封）：
+        # 作用域 GATE 非 __file__（测试文件 import importlib 属正常）。
+        # ①from os import … 禁；②import os as o（alias asname）禁；
+        # ③getattr(…, "environ"|"getenv") 常量串即红；④__import__/importlib 名字出现即红；
+        # ⑤_gate_env 之外 os.getenv(...) / attr=="getenv" 的调用即红。
+        # 不声称「全部」通道已封（如动态属性名仍可能绕过）。
         import ast as _ast
-        tree = _ast.parse(open(GATE, encoding="utf-8").read())
+        with open(GATE, encoding="utf-8") as _gf:
+            tree = _ast.parse(_gf.read())
+        funcs = [n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef)]
+        inside_fn = {id(n) for fn in funcs
+                     if fn.name == "_gate_env" for n in _ast.walk(fn)}
         bad = []
         for node in _ast.walk(tree):
             if isinstance(node, _ast.ImportFrom) and node.module == "os":
@@ -635,13 +641,18 @@ class TestTailReasonsAndWash(unittest.TestCase):
             if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name) \
                     and node.func.id == "getattr" and len(node.args) >= 2 \
                     and isinstance(node.args[1], _ast.Constant) \
-                    and node.args[1].value == "environ":
-                bad.append("getattr(…, \"environ\") 常量串（动态绕灯）")
+                    and node.args[1].value in ("environ", "getenv"):
+                bad.append(f"getattr(…, \"{node.args[1].value}\") 常量串（动态绕灯）")
             for attr in ("__import__", "importlib"):
                 if isinstance(node, _ast.Name) and node.id == attr:
                     bad.append(f"{attr} 名字出现（动态导入绕灯）")
                 if isinstance(node, _ast.Attribute) and node.attr == attr:
                     bad.append(f".{attr} 属性出现（动态导入绕灯）")
+            if id(node) in inside_fn:
+                continue
+            if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute) \
+                    and node.func.attr == "getenv":
+                bad.append("os.getenv(...) 出现在 _gate_env 之外")
         self.assertEqual(bad, [], "闸源码不得存在环境读取的绕行通道")
 
 
@@ -679,6 +690,22 @@ class TestV1112Shapes(Harness):
                    "last_message": {"role": 5, "content": JARGON}}
         rc, b, err = self.gate(payload)
         self.assertIsNone(b)
+        self.assertIn("role_skipped: last_message", err)
+
+    def test_role_null_is_skipped(self):
+        # c8 边界（PR#38 评审 P2）：role 键存在且值为 None（JSON null）须整键跳过，
+        # 不得与「键不存在」合流后把 content 送去扫描。
+        m = self._load()
+        self.assertIs(
+            m._body_text({"role": None, "content": JARGON}),
+            m._ROLE_SKIPPED,
+        )
+        self.write_transcript([{"type": "user",
+                                "message": {"role": "user", "content": JARGON}}])
+        payload = {**self.stop_payload(),
+                   "last_message": {"role": None, "content": JARGON}}
+        rc, b, err = self.gate(payload)
+        self.assertIsNone(b, "role:null 不得把正文送进扫描而打回")
         self.assertIn("role_skipped: last_message", err)
 
     def test_j3_role_assistant_still_blocked(self):

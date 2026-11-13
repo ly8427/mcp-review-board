@@ -245,7 +245,8 @@ def _body_text(v):
     """payload 容器的正文提取（V1.1.12 终版，板 #110 c8/#2078/#2074 定稿）：
     裸串 → 原样返回（「首个非空」只留给裸串/跨键）；
     容器(dict) → ①role 判据（内联单点、不抽共用谓词，板 #2095 §7 终稿）：
-    role 存在且非 "assistant"（非 str 同判，dsh #2090 §二）→ 返回 _ROLE_SKIPPED
+    role 键存在且值非 "assistant"（含 JSON null / 非 str，与「键缺失」区分，
+    dsh #2090 §二）→ 返回 _ROLE_SKIPPED
     身份哨兵；②内容键 text/content/body（含 message 包装递归）全部 join，
     内容链上任一环节为哨兵 → 整键传播哨兵（d2 定稿：不传播=干净部分进扫描
     而黑话无声消失=扫错对象零痕）；③内容键缺席 → 其余**非元数据**串按文档序
@@ -259,9 +260,10 @@ def _body_text(v):
     if isinstance(v, str):
         return v
     if isinstance(v, dict):
-        r = v.get("role")
-        if r is not None and (not isinstance(r, str) or r != "assistant"):
-            return _ROLE_SKIPPED   # c8：容器角色非 assistant → 整键跳过（身份哨兵）
+        if "role" in v and (
+            not isinstance(v["role"], str) or v["role"] != "assistant"
+        ):
+            return _ROLE_SKIPPED   # c8：role 键在且值非 assistant（含 null）→ 整键跳过
         parts = []
         for bk in _CONTENT_KEYS + ("message",):
             if bk in v:
@@ -297,7 +299,8 @@ def extract_text(payload):
        板 #110 终稿）：A 档（last_message > response > text > output 精确消费
        名单）取到正文才消费——值是裸串取该串；值是容器按 _body_text 取
        text/content/body 正文字段（多块 join，元数据 id/status/type 不冒充
-       正文）；role 存在且非 assistant → role_skipped 桶（c8，整键跳过）；
+       正文）；role 键存在且值非 assistant（含 JSON null / 非 str）→
+       role_skipped 桶（c8，整键跳过）；
        未识别形状 → meta_only 桶（h2 灯）。B 档（其余命中键名的字段，如
        conversation_preview）**永不打回**，进 b-tier-ignored 桶（板 #2073
        §二；不盲选防键序定成败）。
@@ -319,7 +322,7 @@ def extract_text(payload):
     if isinstance(lam, str) and lam.strip():
         return lam
     keyed = {}
-    buckets = {}   # 桶：token → [键名]（V1.1.12 双列表之一；构建序即桶序）
+    buckets = {}   # 桶：token → [键名]（V1.1.12 双列表之一；输出序=_BUCKET_ORDER 固定枚举序，非构建序）
     reasons = []   # 原因：尾读失败可分原因（双列表之二；与桶分族，④ 丢弃不误伤 ③）
     for k, v in payload.items():
         if re.search(r"response|preview|last|message|assistant|text|output", str(k), re.I):
