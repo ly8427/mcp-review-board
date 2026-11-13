@@ -404,15 +404,19 @@ class TestGateEndToEnd(Harness):
         self.assertEqual(rc, 0)
 
     def test_i2_b_key_failopen_diag_visible(self):
-        # ③b（判别器）：同形状 stderr 必含 fail-open（修前红/修后绿；
-        # 只钉子串——旧出口文案两处拷贝，禁整句，板 #2073 §二）
+        # ③b（判别器）：同形状 stderr 必含 fail-open（修前红/修后绿；只钉子串
+        # ——出口文案多处，禁整句）。V1.1.12 修正（板 #2138 §四 test_i2 注释
+        # 修正项）：承重灯改钉「不在消费面」键名 token（b-tier-ignored）——
+        # c7 后 b-tier 痕独立成行、伞句只留 ③/⑤，fail-open 词不再是承重灯。
         self.write_transcript([
             {"type": "user", "message": {"role": "user", "content": JARGON}},
         ])
         payload = {**self.stop_payload(), "conversation_preview": JARGON}
         rc, b, err = self.gate(payload)
         self.assertIsNone(b)
-        self.assertIn("fail-open", err, "B 档必须有诊断痕（板 ③b）")
+        self.assertIn("fail-open", err, "③ 出口伞句在位")
+        self.assertIn("b-tier-ignored: conversation_preview", err,
+                      "承重灯=b-tier token 键名痕（V1.1.12 i2 修正）")
         self.assertIn("不在消费面", err, "B 档诊断必须点名键与档位")
 
     def test_i3_structured_label_never_scanned(self):
@@ -624,6 +628,303 @@ class TestTailReasonsAndWash(unittest.TestCase):
                     and node.func.value.attr == "environ":
                 bad.append(f"environ.{node.func.attr}() 出现在 _gate_env 之外")
         self.assertEqual(bad, [], "环境读取必须收进 _gate_env() 单一入口")
+
+    def test_g16_import_shapes_forbidden(self):
+        # 板 #2141 §四 v3「getenv 灯＋import 形状四条」（PR#38 评审补封）：
+        # 作用域 GATE 非 __file__（测试文件 import importlib 属正常）。
+        # ①from os import … 禁；②import os as o（alias asname）禁；
+        # ③getattr(…, "environ"|"getenv") 常量串即红；④__import__/importlib 名字出现即红；
+        # ⑤_gate_env 之外 os.getenv(...) / attr=="getenv" 的调用即红。
+        # 不声称「全部」通道已封（如动态属性名仍可能绕过）。
+        import ast as _ast
+        with open(GATE, encoding="utf-8") as _gf:
+            tree = _ast.parse(_gf.read())
+        funcs = [n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef)]
+        inside_fn = {id(n) for fn in funcs
+                     if fn.name == "_gate_env" for n in _ast.walk(fn)}
+        bad = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom) and node.module == "os":
+                bad.append("from os import …（绕过 _gate_env 判据面）")
+            if isinstance(node, _ast.Import):
+                for a in node.names:
+                    if a.asname:
+                        bad.append(f"import {a.name} as {a.asname}（别名绕灯）")
+            if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name) \
+                    and node.func.id == "getattr" and len(node.args) >= 2 \
+                    and isinstance(node.args[1], _ast.Constant) \
+                    and node.args[1].value in ("environ", "getenv"):
+                bad.append(f"getattr(…, \"{node.args[1].value}\") 常量串（动态绕灯）")
+            for attr in ("__import__", "importlib"):
+                if isinstance(node, _ast.Name) and node.id == attr:
+                    bad.append(f"{attr} 名字出现（动态导入绕灯）")
+                if isinstance(node, _ast.Attribute) and node.attr == attr:
+                    bad.append(f".{attr} 属性出现（动态导入绕灯）")
+            if id(node) in inside_fn:
+                continue
+            if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute) \
+                    and node.func.attr == "getenv":
+                bad.append("os.getenv(...) 出现在 _gate_env 之外")
+        self.assertEqual(bad, [], "闸源码不得存在环境读取的绕行通道")
+
+
+class TestV1112Shapes(Harness):
+    """V1.1.12（板 #110 终版清单实装）：c8 role 桶/哨兵传播/五出口 emit/
+    契约三句/X/Y′/§6 格/e5 格/排序灯。断言一律走 harness 三返回元组分通道
+    （block 钉 decision 载荷、痕钉 stderr——pi #2095 §4 用例纪律）。"""
+
+    def _load(self):
+        import importlib.util
+        s = importlib.util.spec_from_file_location("psg_v1112", GATE)
+        m = importlib.util.module_from_spec(s)
+        s.loader.exec_module(m)
+        return m
+
+    def test_j1_t2_role_user_bounced_with_dedicated_bucket(self):
+        # c8 主案（dsh #2090 §二）：容器 role=user → 整键跳过进专用桶，
+        # 不得落 meta_only 旧句（「只含元数据」与事实相反）。前提：session_id=""
+        # ∧ transcript 仅 user ⇒ 落出口③。
+        self.write_transcript([{"type": "user",
+                                "message": {"role": "user", "content": JARGON}}])
+        payload = {**self.stop_payload(),
+                   "last_message": {"role": "user", "content": JARGON}}
+        rc, b, err = self.gate(payload)
+        self.assertIsNone(b)
+        self.assertIn("role_skipped: last_message", err, "c8 专用桶+键名")
+        self.assertNotRegex(err, r"未识别出正文[^\n]*\blast_message\b",
+                            "按键负向：meta_only 旧句不得吃掉本键（板 #2095 §三）")
+
+    def test_j2_non_str_role_same_bucket(self):
+        # c8 一致性锁（pi #2093 §2）：role=5 非 str 同判同桶同痕。
+        self.write_transcript([{"type": "user",
+                                "message": {"role": "user", "content": JARGON}}])
+        payload = {**self.stop_payload(),
+                   "last_message": {"role": 5, "content": JARGON}}
+        rc, b, err = self.gate(payload)
+        self.assertIsNone(b)
+        self.assertIn("role_skipped: last_message", err)
+
+    def test_role_null_is_skipped(self):
+        # c8 边界（PR#38 评审 P2）：role 键存在且值为 None（JSON null）须整键跳过，
+        # 不得与「键不存在」合流后把 content 送去扫描。
+        m = self._load()
+        self.assertIs(
+            m._body_text({"role": None, "content": JARGON}),
+            m._ROLE_SKIPPED,
+        )
+        self.write_transcript([{"type": "user",
+                                "message": {"role": "user", "content": JARGON}}])
+        payload = {**self.stop_payload(),
+                   "last_message": {"role": None, "content": JARGON}}
+        rc, b, err = self.gate(payload)
+        self.assertIsNone(b, "role:null 不得把正文送进扫描而打回")
+        self.assertIn("role_skipped: last_message", err)
+
+    def test_j3_role_assistant_still_blocked(self):
+        # c8 不变式（dsh #2090 §二-2）：role=assistant 的容器照常取正文打回。
+        self.write_transcript([{"type": "assistant",
+                                "message": {"role": "assistant", "content": CLEAN}}])
+        payload = {**self.stop_payload(),
+                   "last_message": {"role": "assistant", "content": JARGON}}
+        rc, b, _ = self.gate(payload)
+        self.assertIsNotNone(b, "role=assistant 不得被 role 判据误放")
+        self.assertIn("落盘", b["reason"])
+
+    def test_j4_d1_propagation_through_list(self):
+        # d1（pi #2093 §3）：哨兵沿 list 传播——嵌套块角色不符 → 整键跳过
+        # 进专用桶（负向断言锁的是传播完整性，不是白给）。
+        self.write_transcript([{"type": "user",
+                                "message": {"role": "user", "content": JARGON}}])
+        payload = {**self.stop_payload(),
+                   "last_message": {"content": [{"role": "user", "content": JARGON}]}}
+        rc, b, err = self.gate(payload)
+        self.assertIsNone(b)
+        self.assertIn("role_skipped: last_message", err)
+        self.assertNotRegex(err, r"未识别出正文[^\n]*\blast_message\b")
+
+    def test_j5_d2_whole_key_dropped_with_clean_part(self):
+        # d2（pi #2093 §4 定稿：整键跳过）——text:CLEAN 与 role=user 容器并存：
+        # CLEAN 随整键丢（不传播=CLEAN 进扫描而黑话无声消失=扫错对象零痕）。
+        self.write_transcript([{"type": "user",
+                                "message": {"role": "user", "content": JARGON}}])
+        payload = {**self.stop_payload(),
+                   "last_message": {"text": CLEAN,
+                                    "content": {"role": "user", "content": JARGON}}}
+        rc, b, err = self.gate(payload)
+        self.assertIsNone(b)
+        self.assertIn("role_skipped: last_message", err)
+
+    def test_j6_identity_sentinel_direct_call(self):
+        # 身份锁直调（pi #2093 §2/§5.1）：哨兵以 is/is not 判定；extract_text
+        # 出口绝不把哨兵漏给调用方。
+        m = self._load()
+        self.assertIs(m._body_text({"role": "user", "content": JARGON}),
+                      m._ROLE_SKIPPED)
+        self.assertIsNot(m._body_text({"role": "assistant", "content": CLEAN}),
+                         m._ROLE_SKIPPED)
+        self.assertIsNot(m.extract_text({"hook_event_name": "Stop"}),
+                         m._ROLE_SKIPPED)
+
+    def test_j7_guard_no_role_judgement_in_type_dimension(self):
+        # guard 断言（pi #2095 §7）：块只有 type 没有 role → 照常取正文；
+        # 锁「别把记录级谓词搬进递归面」。
+        self.write_transcript([{"type": "assistant",
+                                "message": {"role": "assistant", "content": CLEAN}}])
+        payload = {**self.stop_payload(),
+                   "last_message": {"content": [{"type": "text", "text": JARGON}]}}
+        rc, b, err = self.gate(payload)
+        self.assertIsNotNone(b, "type 判据不得进容器递归面（板 #2094 §二）")
+        self.assertNotIn("role_skipped", err, "无 role 键 ⇒ role_skipped 桶必须为空")
+        self.assertIn("落盘", b["reason"])
+
+    def test_j8_dual_verdict_same_dict_two_paths(self):
+        # 双面断言（pi #2093 §7/#2095 §7 反例两翼）：同一 dict，
+        # transcript 记录语义取正文、payload 容器语义出哨兵——两期望钉死。
+        m = self._load()
+        rec = {"type": "assistant", "role": "user",
+               "content": [{"type": "text", "text": CLEAN}]}
+        self.assertEqual(m._assistant_text(rec), CLEAN)
+        self.assertIs(m._body_text(rec), m._ROLE_SKIPPED)
+
+    def test_j9_multi_key_whole_span_sorted(self):
+        # 多键格（板 #2112 §2 定稿）：整段钉兼排序唯一直接灯。前提：本格
+        # 桶键集恰为 payload 所列（docstring 承诺）。
+        self.write_transcript([{"type": "user",
+                                "message": {"role": "user", "content": JARGON}}])
+        payload = {**self.stop_payload(),
+                   "last_message": {"role": "user", "content": JARGON},
+                   "assistant_message": {"role": "user", "content": JARGON}}
+        rc, b, err = self.gate(payload)
+        self.assertIsNone(b)
+        self.assertIn("role_skipped: assistant_message, last_message", err)
+
+    def test_j10_sorted_swap_byte_identical(self):
+        # sorted 确定性（板 #2104 §2 I3）：键互换 JSON 序 → stderr 逐字节同。
+        self.write_transcript([{"type": "user",
+                                "message": {"role": "user", "content": JARGON}}])
+        inner = {"role": "user", "content": JARGON}
+        p1 = {**self.stop_payload(), "message": inner, "preview": JARGON}
+        p2 = {**self.stop_payload(), "preview": JARGON, "message": inner}
+        _, _, e1 = self.gate(p1)
+        _, _, e2 = self.gate(p2)
+        self.assertEqual(e1, e2, "桶行序与键序均不得随 payload 插入序漂移")
+
+    def test_j11_answer_never_collected(self):
+        # 收集面上界（板 #2104 §3 I4）：不命中收集面正则 ⇒ 不扫、不进桶、零痕。
+        self.write_transcript([{"type": "assistant",
+                                "message": {"role": "assistant", "content": CLEAN}}])
+        payload = {**self.stop_payload(), "answer": JARGON, "response": CLEAN}
+        rc, b, err = self.gate(payload)
+        self.assertIsNone(b)
+        self.assertEqual(err, "", "收集面外键零痕（反向禁令的正面格）")
+
+    def test_j12_I1_lam_exit_outside_contract(self):
+        # I1（板 #2104 §1）：出口①（lam 早退）在收集面之前 = 契约外——
+        # 桶未建，stderr 全空；docstring 明写，防「无痕可丢」误判成缺陷。
+        self.write_transcript([{"type": "user",
+                                "message": {"role": "user", "content": JARGON}}])
+        payload = {**self.stop_payload(),
+                   "last_assistant_message": CLEAN,
+                   "last_message": {"role": "user", "content": JARGON}}
+        rc, b, err = self.gate(payload)
+        self.assertIsNone(b)
+        self.assertEqual(err, "", "出口①契约外（本格桶未建）")
+
+    def test_j13_I2_block_still_carries_bucket_line(self):
+        # I2（板 #2104 §1）：block 载荷同样带跳过行（「allow∧」前缀去掉成立）。
+        self.write_transcript([{"type": "assistant",
+                                "message": {"role": "assistant", "content": CLEAN}}])
+        payload = {**self.stop_payload(),
+                   "last_message": {"role": "user", "content": CLEAN},
+                   "response": JARGON}
+        rc, b, err = self.gate(payload)
+        self.assertIsNotNone(b)
+        self.assertIn("落盘", b["reason"])
+        self.assertIn("role_skipped: last_message", err)
+
+    def test_j14_c3_message_key_never_consumed(self):
+        # c3（dsh #2090 §一 定稿：消费面保持 4 名）：message 键永不进消费面；
+        # 前提钉形状（session_id="" ∧ 尾读无 assistant）——有 sid 且 rollout
+        # 可读时走 return best，痕不出现。
+        self.write_transcript([{"type": "user",
+                                "message": {"role": "user", "content": JARGON}}])
+        payload = {**self.stop_payload(), "message": JARGON}
+        rc, b, err = self.gate(payload)
+        self.assertIsNone(b)
+        self.assertIn("b-tier-ignored: message", err)
+
+    def test_j15_X_exit4_silent_without_buckets(self):
+        # case X（dsh #2114 §三/§2116 §二）：出口④ + 零桶键 ⇒ err==""。
+        # **锁现状、非红→绿**，同时是反向禁令的守卫（谁把 ④ 扩成整份 diag
+        # 谁红）。反向禁令正反两句成对：允许出口④用例级 assertEqual(err,"")；
+        # 禁止推广成 allow ⇒ 无 stderr（c/d/g5/g4/g9 五格假红）。
+        missing = os.path.join(self.d, "missing.jsonl")
+        rollout = os.path.join(self.d, "rollout-x.jsonl")
+        with open(rollout, "w", encoding="utf-8") as f:
+            f.write(CLEAN_ASSISTANT + "\n")
+        payload = {"hook_event_name": "Stop", "stop_hook_active": False,
+                   "session_id": "z", "transcript_path": missing}
+        rc, b, err = self.gate(payload, env_extra={"AG_ROLLOUT": rollout})
+        self.assertIsNone(b)
+        self.assertEqual(err, "", "出口④零桶键 ⇒ 零字节（原因整批不发）")
+
+    def test_j16_Yprime_exit4_bucket_without_reason(self):
+        # case Y′（pi #2115 §2 钉 sid="z"；dsh #2116 §三）：出口④ + b-tier 桶
+        # ⇒ 桶行必发、原因必不发。assertNotIn("fail-open") 是本格唯一的
+        # 出口④判别器——它红了先查 sid/transcript 前提，再谈改断言。
+        missing = os.path.join(self.d, "missing.jsonl")
+        rollout = os.path.join(self.d, "rollout-y.jsonl")
+        with open(rollout, "w", encoding="utf-8") as f:
+            f.write(CLEAN_ASSISTANT + "\n")
+        payload = {"hook_event_name": "Stop", "stop_hook_active": False,
+                   "session_id": "z", "transcript_path": missing,
+                   "preview": JARGON}
+        rc, b, err = self.gate(payload, env_extra={"AG_ROLLOUT": rollout})
+        self.assertIsNone(b)
+        self.assertIn("b-tier-ignored: preview", err)
+        self.assertNotIn("fail-open", err, "出口④不带伞句")
+        self.assertNotIn("尾读未取得回复", err, "出口④原因整批不发")
+
+    def test_j17_sec2_grid_four_lines(self):
+        # §6 格（板 #2108 §2 定稿三件断言）：③ 出口、桶+双原因并存——
+        # 伞句行/b-tier 行/transcript 原因/rollout 原因各一行；三件 =
+        # 桶 token 行恰 1 ∧ 该行不含 fail-open ∧ 桶 token 全文恰 1 次。
+        self.write_transcript([{"type": "user",
+                                "message": {"role": "user", "content": JARGON}}])
+        rollout = os.path.join(self.d, "rollout-user-only.jsonl")
+        with open(rollout, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "user",
+                                "message": {"role": "user", "content": JARGON}},
+                               ensure_ascii=False) + "\n")
+        payload = {"hook_event_name": "Stop", "stop_hook_active": False,
+                   "session_id": "s6", "transcript_path": self.transcript,
+                   "preview": JARGON}
+        rc, b, err = self.gate(payload, env_extra={"AG_ROLLOUT": rollout})
+        self.assertIsNone(b)
+        rows = [l for l in err.splitlines() if "b-tier-ignored" in l]
+        self.assertEqual(len(rows), 1, "独立行灯：桶 token 行恰一")
+        self.assertNotIn("fail-open", rows[0], "该行不含伞句词")
+        self.assertEqual(err.count("b-tier-ignored"), 1, "桶 token 全文恰一次")
+        self.assertIn("rollout 尾读未取得回复", err)
+        self.assertIn("b-tier-ignored: preview", err)
+
+    def test_j18_e5_exit5_umbrella_present(self):
+        # ⑤ 格（板 #2108 §1：出口⑤此前零用例；A6 判别对象=变体D）：
+        # sid 非空 + 两路尾读皆失败 ⇒ 伞句在位（fail-open 词）＋桶行＋原因行。
+        self.write_transcript([{"type": "user",
+                                "message": {"role": "user", "content": JARGON}}])
+        rollout = os.path.join(self.d, "rollout-user-only-e5.jsonl")
+        with open(rollout, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "user",
+                                "message": {"role": "user", "content": JARGON}},
+                               ensure_ascii=False) + "\n")
+        payload = {"hook_event_name": "Stop", "stop_hook_active": False,
+                   "session_id": "e5", "transcript_path": self.transcript,
+                   "preview": JARGON}
+        rc, b, err = self.gate(payload, env_extra={"AG_ROLLOUT": rollout})
+        self.assertIsNone(b)
+        self.assertIn("fail-open", err, "A6：出口⑤伞句定义性在位")
+        self.assertIn("b-tier-ignored: preview", err)
 
 
 class TestHostSkip(unittest.TestCase):
