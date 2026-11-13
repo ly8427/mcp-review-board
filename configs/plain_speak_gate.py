@@ -253,12 +253,19 @@ def _emit(buckets, reasons, *, reasons_out=True):
 
 
 def _body_text(v):
-    """payload 容器的正文提取（V1.1.12 终版，板 #110 c8/#2078/#2074 定稿）：
+    """payload 容器的正文提取（V1.1.12 终版，板 #110 c8/#2078/#2074 定稿；
+    非文本块口径随 PR #35 Bugbot 收口）：
     裸串 → 原样返回（「首个非空」只留给裸串/跨键）；
     容器(dict) → ①role 判据（内联单点、不抽共用谓词，板 #2095 §7 终稿）：
     role 键存在且值非 "assistant"（含 JSON null / 非 str，与「键缺失」区分，
     dsh #2090 §二）→ 返回 _ROLE_SKIPPED
-    身份哨兵；②内容键 text/content/body（含 message 包装递归）全部 join，
+    身份哨兵；①b 带 type 且值既不是 "text" 也不是记录级包装 "assistant"
+    （thinking / tool_use / tool_result 等）→ 整块返回 None，内容键与 ⑦
+    兜底都不取——与 transcript 路 _assistant_text 只收 type=="text" 对齐，
+    同一回复两路判决一致。type 缺席仍走 ②③（i5 无 type 的 ⑦ 兜底，向后
+    兼容）；type=="text" 走内容键（i3/i4）；type=="assistant" 是记录包装
+    （message 递归），不是内容块，继续取；
+    ②内容键 text/content/body（含 message 包装递归）全部 join，
     内容链上任一环节为哨兵 → 整键传播哨兵（d2 定稿：不传播=干净部分进扫描
     而黑话无声消失=扫错对象零痕）；③内容键缺席 → 其余**非元数据**串按文档序
     首个非空兜底；type/role/id 等元数据键一律不取。
@@ -266,7 +273,8 @@ def _body_text(v):
     → 整体哨兵（传播完整性，d1）。
     与 transcript 路 _assistant_text 的口径差异（两处 docstring 各记一句，
     板 #2095 §7）：那条是记录级（type/role 判据先行），本条是容器级（role
-    内联单点）；同一 dict 两处结论可不同（双面断言钉死，j_dual）。
+    内联单点）；同一 dict 两处结论可不同（双面断言钉死，j_dual）——此差异
+    只在 role 维，不在内容块 type 维。
     取不到（纯元数据/未知形状）→ None。"""
     if isinstance(v, str):
         return v
@@ -275,6 +283,16 @@ def _body_text(v):
             not isinstance(v["role"], str) or v["role"] != "assistant"
         ):
             return _ROLE_SKIPPED   # c8：role 键在且值非 assistant（含 null）→ 整键跳过
+        # 带 type 的非文本内容块（thinking / tool_use / tool_result 等）整块不取：
+        # 内容键与 ⑦ 兜底都不走。与 transcript 路 _assistant_text 只收
+        # type=="text" 对齐，同一回复两路判决一致（PR #35 Bugbot）。
+        # type 缺席：仍走原路径（i5 无 type 的 ⑦ 兜底，向后兼容）。
+        # type=="text"：走内容键（i3/i4）。
+        # type=="assistant"：记录级包装（message 递归），不是内容块，继续取。
+        if "type" in v:
+            vt = v["type"]
+            if vt != "text" and vt != "assistant":
+                return None
         parts = []
         for bk in _CONTENT_KEYS + ("message",):
             if bk in v:
