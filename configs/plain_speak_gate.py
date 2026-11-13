@@ -20,6 +20,17 @@ import os
 import re
 import sys
 
+# 钩子经管道收 UTF-8 JSON、写出 UTF-8 决策。Windows 默认 stdio 是
+# cp1252：bounce() 写出中文决策（或诊断）会 UnicodeEncodeError，被下面
+# fail-open 兜底吞成放行——CI 上 15 项「该打回却 unexpectedly None」即此根因。
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    _reconf = getattr(_stream, "reconfigure", None)
+    if _reconf is not None:
+        try:
+            _reconf(encoding="utf-8", errors="replace")
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
+
 DICT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plain-speak-dictionary.md")
 EXPLAIN_MARKERS = ("（", "(", "，即", "（即", "就是", "指的是", "意思是", "——", "＝", "=")
 HASH_CTX = re.compile(r"[\w-]")

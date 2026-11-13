@@ -160,6 +160,18 @@ class TestGateEndToEnd(Harness):
         self.assertIsNone(b2, "第二轮：改写后的干净回复必须放行（#109 验收）")
         self.assertEqual(rc2, 0)
 
+    def test_stdio_cp1252_still_bounces_jargon(self):
+        # 回归（PR #41 Windows CI）：子进程 stdio 若是 cp1252，bounce 写出中文
+        # 决策会 UnicodeEncodeError，被 fail-open 吞成放行。闸必须在启动时把
+        # stdin/stdout/stderr 收到 UTF-8，本用例在任意宿主上用环境变量模拟。
+        self.write_transcript([{"type": "assistant",
+                                "message": {"role": "assistant", "content": JARGON}}])
+        rc, b, err = self.gate(self.stop_payload(), env_extra={
+            "PYTHONUTF8": "0", "PYTHONIOENCODING": "cp1252"})
+        self.assertIsNotNone(b, "stdio 为 cp1252 时仍须打回黑话，不得 fail-open")
+        self.assertIn("落盘", b["reason"])
+        self.assertNotIn("内部错误", err)
+
     def test_c_user_jargon_never_flags(self):
         self.write_transcript([{"type": "user",
                                 "message": {"role": "user", "content": JARGON}}])

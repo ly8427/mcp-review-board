@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# Windows 默认控制台是 cp1252，测试脚本 print('✅'/'β') 会 UnicodeEncodeError。
+# 闸自身已强制 UTF-8 stdio；这里再给整个 job 开 UTF-8 模式，避免用例打印崩。
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
