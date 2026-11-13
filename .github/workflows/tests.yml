@@ -33,6 +33,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.11", "3.12", "3.13"]
+        # macOS 托管 runner 稀缺、并发有限；每次推送 3 个 macOS 作业会在队列里等到被取消。
+        # Python 版本差异由 ubuntu / windows 覆盖；macOS 只验 POSIX 路径，故只跑 3.13。
+        exclude:
+          - os: macos-latest
+            python-version: "3.11"
+          - os: macos-latest
+            python-version: "3.12"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
