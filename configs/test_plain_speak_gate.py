@@ -446,6 +446,43 @@ class TestGateEndToEnd(Harness):
         self.assertIsNotNone(b, "非元数据串兜底可被扫描（元数据不冒充）")
         self.assertIn("落盘", b["reason"])
 
+    def test_i6_thinking_block_matches_transcript(self):
+        # PR #35 Bugbot：thinking 块的 ⑦ 兜底曾把非正文串并进 payload 扫描，
+        # 同一回复走 transcript 路只收 type=="text" → 两路判决不一致
+        # （payload 打回 / transcript 放行）。修后只收 text 块，干净正文两路都放行。
+        content = [
+            {"type": "thinking", "thinking": JARGON},
+            {"type": "text", "text": CLEAN},
+        ]
+        rec = {"type": "assistant",
+               "message": {"role": "assistant", "content": content}}
+        self.write_transcript([rec])
+        rc_p, b_p, _ = self.gate({**self.stop_payload(),
+                                  "response": {"content": content}})
+        rc_t, b_t, _ = self.gate(self.stop_payload())
+        self.assertIsNone(b_p, "payload 路不得把 thinking 块里的黑话扫进去")
+        self.assertIsNone(b_t, "transcript 路只收 text 块，干净正文放行")
+        self.assertEqual(rc_p, rc_t)
+        self.assertEqual(rc_p, 0)
+
+    def test_i7_tool_use_block_matches_transcript(self):
+        # 同因：tool_use 的非元数据字符串字段（如 command）曾被 ⑦ 兜底取走。
+        content = [
+            {"type": "tool_use", "id": "tu1", "name": "Bash",
+             "command": JARGON},
+            {"type": "text", "text": CLEAN},
+        ]
+        rec = {"type": "assistant",
+               "message": {"role": "assistant", "content": content}}
+        self.write_transcript([rec])
+        rc_p, b_p, _ = self.gate({**self.stop_payload(),
+                                  "response": {"content": content}})
+        rc_t, b_t, _ = self.gate(self.stop_payload())
+        self.assertIsNone(b_p, "payload 路不得把 tool_use 字段里的黑话扫进去")
+        self.assertIsNone(b_t, "transcript 路只收 text 块，干净正文放行")
+        self.assertEqual(rc_p, rc_t)
+        self.assertEqual(rc_p, 0)
+
 
 class TestTailReasonsAndWash(unittest.TestCase):
     """GPT round-20/21 §三:七态原因、形状族、洗环境表派生(dsh #2052 §三)。"""
