@@ -8,9 +8,10 @@ r"""check-hooks：把 config.json 里每条 hook command 原样执行一次，�
 用法：python check-hooks.py [--config <path>] [--hook <substr>]
 退出码：0 = 全部在岗；1 = 有闸不在岗；2 = 配置本身读不出来。
 
-runner 约束（pi #745-2，票8 验收②必须注明）：本脚本"原样执行"的命令含 cmd.exe /c +
-Windows 宿主 python.exe ⇒ 只在 Windows 宿主跑得动；WSL 内跑会全部 [BAD] DEAD
-（rc=None 命令无法执行）——那是环境差异，不是闸死。配置一律给绝对路径：
+runner 约束（pi #745-2，票8 验收②必须注明）：Windows 上"原样执行"走 cmd.exe /c
+（配置里常见 python.exe 绝对路径）；POSIX 上按 shlex.split 拆 argv 直执——不再把
+`cmd.exe /c "…"` 整串当可执行文件名（否则 FileNotFoundError → rc=None /
+「命令无法执行」，P1 三闸误报 DEAD）。配置一律给绝对路径：
 默认 ~/.zcode/cli/config.json 是 ZCode cli 形状；--config ~/.claude/settings.json
 读 claude-code 形状（4.2 装闸起本机两份并存，形状差异见 load_commands）。
 """
@@ -18,8 +19,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 
@@ -144,10 +147,21 @@ def smoke_payload(command: str) -> bytes:
 
 
 def run_command(command: str, payload: bytes, timeout_s: float = 20.0):
-    """原样执行（shell=False + 交给 cmd 解析引号），显式指定编码读输出。"""
-    cmdline = f'cmd.exe /c "{command}"'
+    """原样执行，显式指定编码读输出。
+    Windows：shell=False + 把整串交给 cmd.exe /c 解析引号（与宿主一致）。
+    POSIX：shlex.split 后按 argv 直执。POSIX 上 subprocess.run(字符串,
+    shell=False) 会把整串当成可执行文件名，找不到 'cmd.exe /c "…"' →
+    rc=None / 「命令无法执行」。"""
     try:
-        p = subprocess.run(cmdline, input=payload, capture_output=True, timeout=timeout_s)
+        if os.name == "nt":
+            p = subprocess.run(f'cmd.exe /c "{command}"',
+                               input=payload, capture_output=True, timeout=timeout_s)
+        else:
+            argv = shlex.split(command, posix=True)
+            if not argv:
+                return None, b"", b"empty command"
+            p = subprocess.run(argv, input=payload, capture_output=True,
+                               timeout=timeout_s)
     except subprocess.TimeoutExpired:
         return None, b"", b"TIMEOUT"
     except OSError as e:
