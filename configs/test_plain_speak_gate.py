@@ -608,8 +608,8 @@ class TestTailReasonsAndWash(unittest.TestCase):
     def test_g14b_environ_confined_to_gate_env(self):
         # 板 #2073 §四-4（#2070 §四 方向定稿）：闸源码 os.environ 只准出现在
         # _gate_env() 单一入口——函数体内与**模块级**（含嵌套语句块）出现
-        # os.environ / environ.pop / environ.update 即红；洗表派生从此有
-        # 单一锚点（V1.1.11）
+        # os.environ(b) / environ(b).pop / environ(b).update 即红（b 后缀同族
+        # 封堵＝板 #114 dsh #2195 M5）；洗表派生从此有单一锚点（V1.1.11）
         import ast as _ast
         with open(GATE, encoding="utf-8") as f:
             tree = _ast.parse(f.read())
@@ -620,21 +620,22 @@ class TestTailReasonsAndWash(unittest.TestCase):
         for node in _ast.walk(tree):
             if id(node) in inside_fn:
                 continue
-            if isinstance(node, _ast.Attribute) and node.attr == "environ":
-                bad.append("os.environ 出现在 _gate_env 之外（模块级或非入口函数）")
+            if isinstance(node, _ast.Attribute) and node.attr in ("environ", "environb"):
+                bad.append("os.environ(b) 出现在 _gate_env 之外（模块级或非入口函数）")
             if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute) \
                     and node.func.attr in ("pop", "update") \
                     and isinstance(node.func.value, _ast.Attribute) \
-                    and node.func.value.attr == "environ":
-                bad.append(f"environ.{node.func.attr}() 出现在 _gate_env 之外")
+                    and node.func.value.attr in ("environ", "environb"):
+                bad.append(f"environ(b).{node.func.attr}() 出现在 _gate_env 之外")
         self.assertEqual(bad, [], "环境读取必须收进 _gate_env() 单一入口")
 
     def test_g16_import_shapes_forbidden(self):
         # 板 #2141 §四 v3「getenv 灯＋import 形状四条」（PR#38 评审补封）：
         # 作用域 GATE 非 __file__（测试文件 import importlib 属正常）。
-        # ①from os import … 禁；②import os as o（alias asname）禁；
-        # ③getattr(…, "environ"|"getenv") 常量串即红；④__import__/importlib 名字出现即红；
-        # ⑤_gate_env 之外 os.getenv(...) / attr=="getenv" 的调用即红。
+        # ①from os import … 禁；②仅禁 import os as X（别名绕过 _gate_env；其他模块 as 不在本灯范围）；
+        # ③getattr(…, "environ"|"getenv"|"environb"|"getenvb") 常量串即红；④__import__/importlib 名字出现即红；
+        # ⑤_gate_env 之外 os.getenv(b)(...) / attr in {"getenv","getenvb"} 的调用即红；
+        # ⑥from importlib import … 禁（from-import 盲区，板 #114 pi #2191）；b 后缀名同族封堵（板 #114 dsh #2195）。
         # 不声称「全部」通道已封（如动态属性名仍可能绕过）。
         import ast as _ast
         with open(GATE, encoding="utf-8") as _gf:
@@ -646,14 +647,17 @@ class TestTailReasonsAndWash(unittest.TestCase):
         for node in _ast.walk(tree):
             if isinstance(node, _ast.ImportFrom) and node.module == "os":
                 bad.append("from os import …（绕过 _gate_env 判据面）")
+            if isinstance(node, _ast.ImportFrom) and node.module == "importlib":
+                bad.append("from importlib import …（动态导入绕灯，板 #114 pi #2191）")
             if isinstance(node, _ast.Import):
                 for a in node.names:
-                    if a.asname:
-                        bad.append(f"import {a.name} as {a.asname}（别名绕灯）")
+                    if a.name == "os" and a.asname:
+                        bad.append(f"import os as {a.asname}（别名绕灯）")
             if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name) \
                     and node.func.id == "getattr" and len(node.args) >= 2 \
                     and isinstance(node.args[1], _ast.Constant) \
-                    and node.args[1].value in ("environ", "getenv"):
+                    and node.args[1].value in ("environ", "getenv",
+                                               "environb", "getenvb"):
                 bad.append(f"getattr(…, \"{node.args[1].value}\") 常量串（动态绕灯）")
             for attr in ("__import__", "importlib"):
                 if isinstance(node, _ast.Name) and node.id == attr:
@@ -663,8 +667,8 @@ class TestTailReasonsAndWash(unittest.TestCase):
             if id(node) in inside_fn:
                 continue
             if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute) \
-                    and node.func.attr == "getenv":
-                bad.append("os.getenv(...) 出现在 _gate_env 之外")
+                    and node.func.attr in ("getenv", "getenvb"):
+                bad.append("os.getenv(b)(...) 出现在 _gate_env 之外")
         self.assertEqual(bad, [], "闸源码不得存在环境读取的绕行通道")
 
 
