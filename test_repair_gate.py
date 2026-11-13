@@ -443,6 +443,7 @@ class V22Concurrency(unittest.TestCase):
         p.stdin.write(json.dumps({"hook_event_name": "PostToolUse", "session_id": "v22",
                                   "tool_name": "Read", "tool_input": {}}).encode("utf-8"))
         p.stdin.close()
+        p.stdin = None  # Py3.13 communicate() 会对已关闭的 stdin flush → ValueError
         return p
 
     def _log(self):
@@ -503,6 +504,7 @@ class V22Concurrency(unittest.TestCase):
                                            "session_id": "v22", "tool_name": "Read",
                                            "tool_input": {}}).encode("utf-8"))
                 cp.stdin.close()
+                cp.stdin = None  # Py3.13 communicate() 会对已关闭的 stdin flush → ValueError
             for cp in children:                # 确定性握手:收齐两个 WAITING 才放行
                 self.assertEqual(_readline_bounded(cp.stdout).strip(), b"WAITING",
                                  "子进程未实际遭遇锁竞争(非阻塞尝试未失败)")
