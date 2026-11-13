@@ -620,7 +620,7 @@ class TestTailReasonsAndWash(unittest.TestCase):
     def test_g16_import_shapes_forbidden(self):
         # 板 #2141 §四 v3「getenv 灯＋import 形状四条」（PR#38 评审补封）：
         # 作用域 GATE 非 __file__（测试文件 import importlib 属正常）。
-        # ①from os import … 禁；②import os as o（alias asname）禁；
+        # ①from os import … 禁；②仅禁 import os as X（别名绕过 _gate_env；其他模块 as 不在本灯范围）；
         # ③getattr(…, "environ"|"getenv") 常量串即红；④__import__/importlib 名字出现即红；
         # ⑤_gate_env 之外 os.getenv(...) / attr=="getenv" 的调用即红。
         # 不声称「全部」通道已封（如动态属性名仍可能绕过）。
@@ -636,8 +636,8 @@ class TestTailReasonsAndWash(unittest.TestCase):
                 bad.append("from os import …（绕过 _gate_env 判据面）")
             if isinstance(node, _ast.Import):
                 for a in node.names:
-                    if a.asname:
-                        bad.append(f"import {a.name} as {a.asname}（别名绕灯）")
+                    if a.name == "os" and a.asname:
+                        bad.append(f"import os as {a.asname}（别名绕灯）")
             if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name) \
                     and node.func.id == "getattr" and len(node.args) >= 2 \
                     and isinstance(node.args[1], _ast.Constant) \
