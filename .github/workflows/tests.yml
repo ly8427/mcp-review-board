@@ -1,0 +1,88 @@
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hooks:
+    name: hooks / ${{ matrix.os }} / ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: plain-speak / check-hooks / bat / AST gates
+        run: |
+          python configs/test_plain_speak_gate.py
+          python configs/test_check_hooks.py
+          python test_bat_encoding.py
+          python test_v212_beta_gate.py
+          python test_v212_meta_writegate.py
+      # V25 执行桩在 Windows 上拼 WSL 路径（/mnt/c/…）并调用 bash，
+      # GitHub-hosted windows-latest 无 WSL，故本套只在 POSIX 跑。
+      - name: repair-gate
+        if: runner.os != 'Windows'
+        run: python test_repair_gate.py
+
+  server:
+    name: server / ubuntu / ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: python -m pip install -r requirements.txt
+      # 这些套件在本机 Linux 上无需密钥即可跑通（本地看板 / SQLite / 临时端口）。
+      # 只用 ubuntu：stage/cap 用 SIGTERM 和固定 localhost 端口，原本按 WSL/Linux
+      # 写；Windows 信号与路径模型不同，不必在每档 OS 上重复跑集成面。
+      - name: Server and stage regressions
+        run: |
+          python test_replay_stale.py
+          python test_schema_migration.py
+          python test_search_v28.py
+          python test_cap.py
+          python test_v210_attention_signals.py
+          python test_v211_floor_budget.py
+          python test_v212_meta_batch2.py
+          python test_v212_meta_hardening.py
+          python test_v212_meta_hardening_b2.py
+          python test_v212_meta_obj.py
+          python test_v212_touch_sites.py
+          python test_v292_flip_conditions.py
+          python test_v292_gates.py
+          python test_v292_watermark_migration.py
+          python test_v293_resolve_order.py
+          python test_v294_status_floor.py
+          python test_v295_noop_override.py
+          python test_v2_stage1.py
+          python test_v2_stage2.py
+          python test_v2_stage3.py
+          python test_v2_stage4.py
+          python test_v2_stage5.py
+          python test_v2_stage6.py
+          python test_v2_stage7.py
+          python test_v2_stage8.py
+          python test_v2_stage9.py
