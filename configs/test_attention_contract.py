@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import io
 import pathlib
 import subprocess
 import sys
@@ -26,6 +27,23 @@ sys.path.insert(0, str(HERE))
 import attention_contract as ac  # noqa: E402
 
 REPO = HERE.parent
+
+
+def _strip_outer_annotation(text):
+    """平衡括号删除 (v2.10 …) 整段括注——含内层半角括号
+    「my_comment_due(本行按 reason 名写)」（board #2244 预警；
+    GPT PR#47 P2：C/D 两组必须共用同一删除逻辑，find(")") 索引法会切半段）。"""
+    i = text.find("(v2.10")
+    depth, j = 0, i
+    while j < len(text):
+        if text[j] == "(":
+            depth += 1
+        elif text[j] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    return text[:i] + text[j + 1:]
 
 
 class TestDerivation(unittest.TestCase):
@@ -116,30 +134,17 @@ class TestAuthorityCheck(unittest.TestCase):
         # M6（删整段括注）——V1.1.12 D 终稿括注含内层半角括号
         # 「my_comment_due(本行按 reason 名写)」（board #2244 预警）：
         # find(")") 索引法会切半段（极性句幸存=假绿），改平衡括号删除。
-        v = self.healthy
-        i = v.find("(v2.10")
-        depth, j = 0, i
-        while j < len(v):
-            if v[j] == "(":
-                depth += 1
-            elif v[j] == ")":
-                depth -= 1
-                if depth == 0:
-                    break
-            j += 1
-        v = v[:i] + v[j + 1:]
+        v = _strip_outer_annotation(self.healthy)
         # 板 #883 M6 一手：括注里含极性句（唯一权威定义），整段删除后极性判据红
-        self.assertTrue(ac.authority_check(v), "M6：删括注（含极性句）必须红")
+        bad = ac.authority_check(v)
+        self.assertTrue(any("唯一权威" in b for b in bad),
+                        "M6：删括注必须触发极性/权威判据（非泛非零）: " + "; ".join(bad))
 
 
 class TestWatcherIntegration(unittest.TestCase):
     """D：check_watcher_texts 注入口三格（healthy / 删权威行 / 极性篡改）。"""
 
     HEALTHY = (HERE / "claude-polling-prompt.txt").read_text(encoding="utf-8")
-
-    def _run(self, texts):
-        import check_hooks_shim  # noqa: F401  占位防误用（实际走下式）
-        raise AssertionError("unreachable")
 
     def _checker(self, texts):
         import importlib.util
@@ -149,6 +154,31 @@ class TestWatcherIntegration(unittest.TestCase):
         s.loader.exec_module(m)
         return m.check_watcher_texts(texts=texts)
 
+    def test_ac_none_fails_closed_not_pass(self):
+        # GPT PR#47 建议：attention_contract 导入失败（ac=None）时，claude
+        # 载体的结构检查必须 fail-closed（非零 + 明示），不得静默按通过处理。
+        import contextlib
+        import importlib.util
+        healthy_texts = {
+            "task-template-pi.txt": "token_invalid my_comment_due blocking=true",
+            "claude-polling-prompt.txt": self.HEALTHY,
+            "dsh-watcher.sh": "token_invalid my_comment_due blocking=true"}
+        sp = importlib.util.spec_from_file_location(
+            "chk_fc", str(HERE / "check-hooks.py"))
+        m = importlib.util.module_from_spec(sp)
+        sp.loader.exec_module(m)
+        saved = m.ac
+        buf = io.StringIO()
+        try:
+            m.ac = None
+            with contextlib.redirect_stdout(buf):
+                rc = m.check_watcher_texts(texts=healthy_texts)
+        finally:
+            m.ac = saved
+        out = buf.getvalue()
+        self.assertNotEqual(rc, 0, "ac=None 必须非零（fail-closed）")
+        self.assertIn("fail-closed", out, "必须明示单源不可用，不得静默")
+
     def test_healthy_zero_bad(self):
         texts = {n: self.HEALTHY for n in (
             "task-template-pi.txt", "claude-polling-prompt.txt", "dsh-watcher.sh")}
@@ -157,22 +187,28 @@ class TestWatcherIntegration(unittest.TestCase):
         self.assertEqual(self._checker(texts), 0)
 
     def test_m6_removed_paren_note_red(self):
-        # Bugbot 修正：补齐三载体——缺键本身计 bad 会让本格空泛绿
+        # Bugbot 修正 + GPT PR#47 P2：三载体补齐（缺键自计 bad 会空泛绿）＋
+        # 平衡括号 helper（find(")") 在 D 终稿内层括号下切半段）＋ 断言升级：
+        # 集成非零必须来自 authority 极性/权威判据，而非叙事 token 缺失。
         base = {"task-template-pi.txt": "token_invalid my_comment_due blocking=true",
                 "dsh-watcher.sh": "token_invalid my_comment_due blocking=true"}
-        v = self.HEALTHY
-        i = v.find("(v2.10")
-        j = v.find(")", i)
-        texts = {**base, "claude-polling-prompt.txt": v[:i] + v[j + 1:]}
-        self.assertNotEqual(self._checker(texts), 0, "M6：括注/叙事句删除必须红")
+        v = _strip_outer_annotation(self.HEALTHY)
+        bad = ac.authority_check(v)
+        self.assertTrue(any("唯一权威" in b for b in bad),
+                        "M6 集成前提：authority 极性判据必须独立触发: " + "; ".join(bad))
+        texts = {**base, "claude-polling-prompt.txt": v}
+        self.assertNotEqual(self._checker(texts), 0, "M6：括注删除必须红")
         texts_ok = {**base, "claude-polling-prompt.txt": self.HEALTHY}
         self.assertEqual(self._checker(texts_ok), 0, "对照:同前提 healthy 必须绿")
 
     def test_m15_polarity_downgrade_red(self):
         base = {"task-template-pi.txt": "token_invalid my_comment_due blocking=true",
                 "dsh-watcher.sh": "token_invalid my_comment_due blocking=true"}
-        texts = {**base, "claude-polling-prompt.txt": self.HEALTHY.replace(
-            "本行是唯一权威定义", "本行仅为举例,可随时删除")}
+        v = self.HEALTHY.replace(
+            "本行是唯一权威定义", "本行仅为举例,可随时删除")
+        self.assertTrue(any("唯一权威" in b for b in ac.authority_check(v)),
+                        "M15 集成前提：authority 极性判据必须独立触发")
+        texts = {**base, "claude-polling-prompt.txt": v}
         self.assertNotEqual(self._checker(texts), 0, "M15：极性降级必须红")
         texts_ok = {**base, "claude-polling-prompt.txt": self.HEALTHY}
         self.assertEqual(self._checker(texts_ok), 0, "对照:同前提 healthy 必须绿")
