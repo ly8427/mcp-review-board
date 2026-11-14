@@ -17,10 +17,21 @@
   2c. 无 ring + 从未建过 quorum 帖 → 冷启动一次性豁免放行（meta 标志+审计）。
   2d. 直接 create_thread 带 quorum 的既有门保持（陈旧 ring 仍拒）。
 
+③ 档B latch 观测面 A/B + 1.1c 两拍灯（批次1 #112 冻结面 ④⑥⑦）：
+  3a. 错 token 治理调用 → token_blocked_latched 带 int revision + 同修订重发去重
+      （#55③ 口径）；负灯钉【原始】participants.meta.token_blocked（键集 ⊆
+      {'corrupt'}∪{str(现有 thread id)} ∧ 非 corrupt 项 revision 均 int，含非 dict 值）。
+  3b. 正确 token 一次治理调用即清 latch（仅 pop+_set_meta，无新审计行）+
+      token_acked/_at/_via 三键前后不变（法②现状冻结）。
+  1.1c. 暂缓创建者【在 quorum 内】+ 无台账 ⇒ 两拍轮询，delivery_gate_skipped 恰 1 行
+      （拍间前置 status=='open' ∧ revision 未变，rev0 两票后取）；1a 形状第二拍走
+      resolved 分支、skip 二度不可达 ⇒ 假绿，不回退（#2170 §二）。
+
 Run: .venv/bin/python test_v292_flip_conditions.py
 """
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -139,8 +150,10 @@ def main():
     check("1a: suspended out-of-quorum creator no longer deadlocks (resolved)",
           status_of(db, tid_a) == "resolved", status_of(db, tid_a))
     skips = audits(db, "delivery_gate_skipped", tid_a)
+    # 批次1 (#2172 §三): re.search 带 (n or "") None 守卫 + \b 词边界(creator 一词
+    # 不再碰巧命中);verdict_events.note 列可空,零成本处不开新口子(#859 族口径)。
     check("1a: delivery_gate_skipped audited (门不挂死人留痕)",
-          any("cr" in (n or "") for n in skips), f"skips={skips}")
+          any(re.search(r"creator\s+cr\b", n or "") for n in skips), f"skips={skips}")
 
     # 1b. 活跃创建者不在 quorum、未轮询 → 门照常挡
     tid_b = mk_out_of_quorum_thread("1b active creator out of quorum, no poll")
@@ -213,6 +226,105 @@ def main():
                          " ORDER BY id DESC LIMIT 1").fetchone()
     check("2e: cold-start exemption annotated on thread face",
           "f6_coldstart" in ((r[0] if r else "") or ""))
+
+    # ---------- ③ 批次1 (#112 冻结面 ④⑥⑦): 档B latch 观测面 A/B + 1.1c 两拍灯 ----------
+    def raw_token_blocked(db, author):
+        # #2172 §3: 负例观测面钉【原始】participants.meta.token_blocked,不用 face
+        # (face 不透传 revision,键集/类型只有原始 meta 能判)。
+        with _RO(db) as conn:
+            row = conn.execute("SELECT meta FROM participants WHERE author=?",
+                               (author,)).fetchone()
+            meta = json.loads(row[0]) if row and row[0] else {}
+        return meta, meta.get("token_blocked") or {}
+
+    def latch_rows(db, author, tid):
+        with _RO(db) as conn:
+            return conn.execute(
+                "SELECT id, revision FROM verdict_events WHERE action=?"
+                " AND author=? AND thread_id=? ORDER BY id",
+                ("token_blocked_latched", author, tid)).fetchall()
+
+    # A-写侧: 错 token 治理调用 → token_blocked_latched 事件流(带 int revision);
+    # 同修订重发不再加行(去重 (author,thread,revision) #55③ 口径)。
+    tid_bad = mk_out_of_quorum_thread("3a latch on wrong token")
+    srv.post_comment(thread_id=tid_bad, author="v1", body="v1 note")
+    out = srv.set_verdict(thread_id=tid_bad, verdict="pass", author="v1",
+                          token="deadbeef" * 4)
+    check("3a: wrong-token governance call rejected", out.startswith("ERROR"), out[:120])
+    rows = latch_rows(db, "v1", tid_bad)
+    check("A-写侧: token_blocked_latched audited with int revision",
+          len(rows) == 1 and isinstance(rows[0]["revision"], int), f"rows={rows}")
+    srv.set_verdict(thread_id=tid_bad, verdict="pass", author="v1", token="deadbeef" * 4)
+    check("A-写侧: same-revision re-latch deduped (#55③)",
+          len(latch_rows(db, "v1", tid_bad)) == 1)
+    _, tb = raw_token_blocked(db, "v1")
+    with _RO(db) as conn:
+        ids = {str(r[0]) for r in conn.execute("SELECT id FROM threads").fetchall()}
+    check("⑦-负灯(原始 meta): 非空 ∧ 键集 ⊆ {'corrupt'} ∪ {str(现有 thread id)} ∧ revision 均 int",
+          bool(tb) and set(tb) <= (ids | {"corrupt"})  # #2180 §三: tb={} 时后两支真空为真 ⇒ latch 整条漏写灯照绿
+          and all(isinstance(e, dict) and isinstance(e.get("revision"), int)
+                  for k, e in tb.items() if k != "corrupt"), f"tb={tb}")  # #2178 §四1: 非 dict 值不再被 if 静默放过
+
+    # A-清侧: 正确 token 一次治理调用即清 latch(仅 pop+_set_meta,无新审计行)。
+    out = srv.set_verdict(thread_id=tid_bad, verdict="pass", author="v1", token=tok["v1"])
+    check("3a: correct token records the verdict", out.startswith("Verdict recorded"), out[:120])
+    _, tb2 = raw_token_blocked(db, "v1")
+    check("A-清侧: meta.token_blocked 消失(原始面)", not tb2, f"tb2={tb2}")
+    check("A-清侧: 清 latch 不写审计行(仅 pop+_set_meta)",
+          len(latch_rows(db, "v1", tid_bad)) == 1)
+
+    # B(auto-ack,法② 现状冻结): 已板内 acked 成员再发治理调用 ⇒ 无新增
+    # token_blocked_latched ∧ token_acked/_at/_via 三键前后不变
+    # (server.py auto-ack 门: mark_used ∧ 非 acked 才写行 ⇒ acked 成员永不再写)。
+    m1, _ = raw_token_blocked(db, "v1")
+    acked_before = (m1.get("token_acked"), m1.get("token_acked_at"), m1.get("token_acked_via"))
+    n_latch_before = len(latch_rows(db, "v1", tid_bad))
+    out = srv.set_verdict(thread_id=tid_bad, verdict="pass", author="v1", token=tok["v1"])
+    check("B 前提: v1 已是板内 acked(法② 零 fixture 成本)",
+          acked_before[0] is True and acked_before[2] == "auto", f"acked_before={acked_before}")
+    check("B: out.startswith('Verdict recorded')", out.startswith("Verdict recorded"), out[:120])
+    m2, _ = raw_token_blocked(db, "v1")
+    acked_after = (m2.get("token_acked"), m2.get("token_acked_at"), m2.get("token_acked_via"))
+    check("B: token_acked/_at/_via 前后不变(现状冻结)", acked_after == acked_before,
+          f"before={acked_before} after={acked_after}")
+    check("B: 无新增 token_blocked_latched",
+          len(latch_rows(db, "v1", tid_bad)) == n_latch_before)
+
+    # ⑥ 1.1c 真灯(#2170 §二/#2172 §二): creator 在 quorum 内且暂缓 + 无台账
+    # ⇒ 两拍轮询,skip 行恰 1。三态: 裸 _audit 零去重=2 红 / action 只进 INSERT=2 红
+    # (prev 恒 None) / SELECT+INSERT 两处同源=1 绿。1a 形状(quorum 不含创建者)
+    # 第二拍走 resolved 分支、:skip 二度不可达 ⇒ 假绿,不回退。
+    out = srv.create_thread(title="1.1c suspended creator in quorum", author="cr",
+                            quorum=["cr", "v1", "v2"], context=fx.wi("cr", "v1", "v2"))
+    assert out.startswith("Created thread #"), out
+    tid_lamp = int(out.split("#")[1].split(":")[0])
+    srv.post_comment(thread_id=tid_lamp, author="v1", body="v1 note")
+    srv.post_comment(thread_id=tid_lamp, author="v2", body="v2 note")
+    out = srv.set_verdict(thread_id=tid_lamp, verdict="pass", author="v1", token=tok["v1"])
+    assert out.startswith("Verdict recorded"), out
+    out = srv.set_verdict(thread_id=tid_lamp, verdict="pass", author="v2", token=tok["v2"])
+    assert out.startswith("Verdict recorded"), out
+    with _RO(db) as conn:  # 拍 1 前取基线 revision(#2178 §二: 守卫要有牙,得先有 rev0)
+        rev0 = conn.execute("SELECT revision FROM threads WHERE id=?", (tid_lamp,)).fetchone()[0]
+    # skip 行守卫在【创建者行】的活跃态(:skip 分支判 crow),不在 suspended ——
+    # fixture 唯一口径 = 创建者本人在 quorum 内拨旧(#2172 §2 更正:#2170 §二 的
+    # 「三人 quorum + 另找第三人拨旧」写法会 0 行硬红)。
+    conn = sqlite3.connect(db, timeout=10)
+    conn.execute("UPDATE participants SET last_seen=datetime('now','-30 hours') WHERE author='cr'")
+    conn.commit(); conn.close()
+    srv.list_comments_since(since="1h", author="v1")   # 拍 1: skip 行 + no_ledger 行 → return,帖保 open
+    with _RO(db) as conn:
+        r = conn.execute("SELECT status, revision FROM threads WHERE id=?", (tid_lamp,)).fetchone()
+    status_rev_1 = (r[0], r[1])
+    # 两拍之间前置 open 断言: fixture 一旦退化成会 resolve 的形状,灯静默缩成一拍、
+    # 计数仍 1 —— 正是本断言要防的形态(#2170 §二 修法2)。
+    check("1.1c 拍间前置: status=='open' ∧ revision 未变(#2178 §二 修法)",
+          status_rev_1 == ("open", rev0), f"status/rev={status_rev_1} rev0={rev0}")
+    srv.list_comments_since(since="1h", author="v1")   # 拍 2: 同字节 note ⇒ 去重收敛
+    lamp_skips = audits(db, "delivery_gate_skipped", tid_lamp)
+    check("1.1c 两拍灯: delivery_gate_skipped 恰 1 行(两处同源=绿)",
+          len(lamp_skips) == 1 and all(re.search(r"reason=creator_delivery_skip_suspended:", n or "")
+                                       for n in lamp_skips), f"skips={lamp_skips}")
 
     print("=" * 60)
     print(f"flip-condition fixes: {len(PASS)} passed, {len(FAIL)} failed")
