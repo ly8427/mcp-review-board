@@ -459,21 +459,29 @@ def main():
     mut["claude-polling-prompt.txt"] = claude.replace("且该项 blocking=true", "且含该帖")
     check("负向: dropping the blocking=true narrowing trips the assertion",
           ch.check_watcher_texts(mut) > 0)
+    # V1.1.12 后迁移（board #44，4.3③）：手抄常量 ch._PRIORITY_CHAIN 已退役，
+    # 改为 attention_contract 结构判定下的等价负向变异——坏链以字面直接构造
+    # （负向样本本就是字面），replace 落空时 mut==healthy 会让下方断言红，
+    # 前提断言先行防漂移。
+    _chain_literal = ("优先级 token_invalid > awaiting_my_verdict > verdict_stale"
+                      " > awaiting_floor_comment > mentions_me > new_comments")
+    check("前提: authority chain literal present in healthy carrier",
+          _chain_literal in claude)
     mut = dict(healthy)
     mut["claude-polling-prompt.txt"] = claude.replace(
-        ch._PRIORITY_CHAIN,
-        "token_invalid > awaiting_my_verdict > awaiting_floor_comment"
+        _chain_literal,
+        "优先级 token_invalid > awaiting_my_verdict > awaiting_floor_comment"
         " > mentions_me > new_comments(v2.10)")  # GPT 找到的漏 verdict_stale 原状
     check("负向: priority chain missing verdict_stale trips the assertion",
           ch.check_watcher_texts(mut) > 0)
     mut = dict(healthy)
-    mut["claude-polling-prompt.txt"] = claude.replace(ch._PRIORITY_CHAIN,
-                                                      ch._PRIORITY_CHAIN + "\n" + ch._PRIORITY_CHAIN)
+    _row = next(l for l in claude.splitlines() if "优先级 " in l)
+    mut["claude-polling-prompt.txt"] = claude.replace(_row, _row + "\n" + _row)
     check("负向: duplicated priority chain trips the assertion",
           ch.check_watcher_texts(mut) > 0)
     mut = dict(healthy)
     mut["claude-polling-prompt.txt"] = claude.replace(
-        ch._PRIORITY_CHAIN, "优先级 awaiting_my_verdict > mentions_me > new_comments")
+        _chain_literal, "优先级 awaiting_my_verdict > mentions_me > new_comments")
     check("负向: old v2.9 priority line (pre-v2.10 form) trips the assertion",
           ch.check_watcher_texts(mut) > 0)
 
