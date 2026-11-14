@@ -205,7 +205,7 @@ SUSPEND_AFTER_HOURS = 24
 # --- v2 A1: participant registry / heartbeat --------------------------------
 # Single source of truth for the served version (v2.9.3 #55: was duplicated in
 # three literals — FastMCP serverInfo, /ping, PROTOCOL header — and drifted).
-PROTOCOL_VERSION = "2.12.1"
+PROTOCOL_VERSION = "2.13.0"
 mcp = FastMCP("ReviewBoard", version=PROTOCOL_VERSION)  # align serverInfo with pyproject
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")

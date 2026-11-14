@@ -398,11 +398,14 @@ def main():
     check("契约: /attention body carries my_comment_due + token_blocked",
           "my_comment_due" in body and "token_blocked" in body, f"keys={sorted(body)}")
     # P2-2 契约闸(GPT P2-2 原案;host #1730 定稿②;dsh #1731 §一 G1/G2/G3 三格):
-    # 版本号已提前为合并前置(2.12.1)⇒ 写入方向有语义,闸测试必须能翻红。
+    # 版本号已提前为合并前置(=PROTOCOL_VERSION)⇒ 写入方向有语义,闸测试必须能翻红。
     # 旧断言只数行数不断版本串 ⇒ bump 与否不可分(dsh #1731 §一 指认的那格)。
+    # 期望版本自 v2.13.0 起从 server 模块动态取:bump 不再需手改本文件,
+    # once-per-version 语义仍被 G1/G3a/G2/G3b 四格完整钉死(v2.13.0 CI 判例)。
+    _cur_ver = srv.PROTOCOL_VERSION
     rows = audit_rows(db, "attention_contract")
-    check("契约G1(新鲜库): attention_contract 审计恰 1 行 ∧ version=2.12.1 ∧ token_blocked.value=manual|break_glass 段在场 ∧ 合并枚举表键在(once per version)",
-          len(rows) == 1 and "version=2.12.1" in rows[0]
+    check(f"契约G1(新鲜库): attention_contract 审计恰 1 行 ∧ version={_cur_ver} ∧ token_blocked.value=manual|break_glass 段在场 ∧ 合并枚举表键在(once per version)",
+          len(rows) == 1 and f"version={_cur_ver}" in rows[0]
           and "token_blocked.value=manual|break_glass" in rows[0]
           and "my_comment_due" in rows[0] and "token_invalid" in rows[0]
           and "awaiting_floor_comment" in rows[0], f"rows={rows}")
@@ -413,7 +416,7 @@ def main():
     # 不与上方 fixture 的审计行数耦合 —— 预置后库内恰 1 行(= dsh G2 形状)。
     # stub_env 是单例(二次调用不 reload,直接返回已 import 的 server)⇒ 用
     # DB_PATH 换指承载库,finally 还原;旧行用 server 自己的写入器 _audit 造
-    # (字节即逐字节不动基准),新鲜 2.12.1 行清场。红证只能来自这张预置格:
+    # (字节即逐字节不动基准),新鲜当前版本行清场。红证只能来自这张预置格:
     # 新鲜库 fixture 上 G1/G3a 不担红。
     import pathlib as _pl
     _db2 = os.path.join(tempfile.mkdtemp(prefix="rb-contract-g2-"), "g2.db")
@@ -428,14 +431,14 @@ def main():
             srv._audit(conn, "system", "attention_contract",
                        note="version=2.12.0 preset(旧行逐字节不动基准)")
             conn.execute("DELETE FROM verdict_events WHERE action='attention_contract'"
-                         " AND note LIKE 'version=2.12.1%'")
-        srv.init_db()  # gate: acv=2.12.0 != 2.12.1 ⇒ 恰追加一行
+                         f" AND note LIKE 'version={_cur_ver}%'")
+        srv.init_db()  # gate: acv=2.12.0 != _cur_ver ⇒ 恰追加一行
         rows2 = audit_rows(_db2, "attention_contract")
-        check("契约G2(预置 2.12.0 库): 重初始化恰新增 1 行 version=2.12.1 ∧ token_blocked 段在场,旧行逐字节不动",
+        check(f"契约G2(预置 2.12.0 库): 重初始化恰新增 1 行 version={_cur_ver} ∧ token_blocked 段在场,旧行逐字节不动",
               len(rows2) == 2 and rows2[0] == "version=2.12.0 preset(旧行逐字节不动基准)"
-              and "version=2.12.1" in rows2[1]
+              and f"version={_cur_ver}" in rows2[1]
               and "token_blocked.value=manual|break_glass" in rows2[1], f"rows={rows2}")
-        srv.init_db()  # G3b: 同版本(2.12.1)再 init ⇒ 仍 2 行
+        srv.init_db()  # G3b: 同版本(_cur_ver)再 init ⇒ 仍 2 行
         check("契约G3b(预置库同版本 re-init): 仍 2 行(once per version;G2/G3b 成对防『每次启动都写』假绿)",
               len(audit_rows(_db2, "attention_contract")) == 2)
     finally:
