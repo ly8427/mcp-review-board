@@ -41,3 +41,6 @@ configs/repair-gate-state.json
 configs/repair-gate-log.txt
 configs/repair-gate-alarm.txt
 configs/repair-gate-state.json.claim
+
+# tmp-test 归档面（board #112 #2235 §4：一次 git add -A 会把 90 处旧措辞命中拖进跟踪面）
+tmp-test*/

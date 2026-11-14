@@ -27,7 +27,11 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-import attention_contract as ac   # noqa: E402 — 优先级链唯一权威（board #44，4.3③）
+try:
+    import attention_contract as ac   # 优先级链唯一权威（board #44，4.3③）
+except Exception as _ac_err:   # noqa: BLE001 — pi #2236 §2 定稿②：fail-closed
+    ac = None
+    print(f"[FATAL] 单源 attention_contract 不可用（fail-closed）: {_ac_err}")
 
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 sys.stderr.reconfigure(encoding='utf-8', errors='replace')
@@ -239,9 +243,13 @@ def check_watcher_texts(texts: dict | None = None) -> int:
         inv = _INVOKER.search(text)
         if name == "claude-polling-prompt.txt":
             # ④ 优先级链：结构判定三件（board #44，4.3③；手抄字面链已退役）
-            miss_w = ac.authority_check(text)
-            if miss_w:
-                miss.append("唯一权威行:" + "; ".join(miss_w))
+            if ac is None:
+                miss.append("单源 attention_contract 不可用(fail-closed)——"
+                            "优先级链结构判定整体缺席")
+            else:
+                miss_w = ac.authority_check(text)
+                if miss_w:
+                    miss.append("唯一权威行:" + "; ".join(miss_w))
             miss_narr = [t for t in _NARRATIVE_TOKENS if t not in text]
             if miss_narr:
                 miss.append("叙事句要素缺失(" + ", ".join(miss_narr) + ")")

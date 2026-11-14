@@ -73,6 +73,13 @@ def derive_reason_chain(server_path=pathlib.Path(__file__).resolve().parent.pare
             orelse = cur.orelse
             cur = orelse[0] if len(orelse) == 1 and isinstance(orelse[0], ast.If) else None
         break
+    if len(chain) != 6:
+        # 板 #2236 §2 定稿①：arity fail-loud，诊断指向契约（import 面由
+        # check-hooks 的 try/except 接成 fail-closed，总检查器不被带走）
+        raise ValueError(
+            f"attention 契约派生异常：链枚举数={len(chain)}（期望 6）——"
+            "server.py 的 token_fire elif 链形状可能已变；本模块是优先级链唯一权威，"
+            "先核对 server.py 的链再改本模块")
     return tuple(chain)
 
 
@@ -105,12 +112,22 @@ def parse_authority_line(text: str):
     return len(rows), tokens, row
 
 
+def _chain_pattern():
+    """归一链全文正则：REASON_CHAIN 每位的「reason 名 | 字段名」交替、`>` 连接
+    （board #2235/#2236 定稿的牙——无标签副本 S1/括注后副本 S2 的猎物）。"""
+    alts = []
+    for tok in REASON_CHAIN:
+        alts.append("|".join([tok] + [h for h, r in H2R.items() if r == tok]))
+    return re.compile(r"\s*>\s*".join(f"(?:{a})" for a in alts))
+
+
 def authority_check(text: str) -> list[str]:
-    """「唯一权威」结构判定（#1048 ③）。返回违例清单（空=通过）：
+    """「唯一权威」结构判定（#1048 ③ + 板 #2236 腿①）。返回违例清单（空=通过）：
     ①含「优先级 」的行恰 1 行；②该行含「唯一权威」极性标注（挡 M13/M15/M16
     ——权威声明被改成"仅举例/旧版/禁止"即红）；③行内链归一后与
-    REASON_CHAIN 等长元组相等（挡 M9 等价副本/M10·M19 两侧加料/M11 换序，
-    不再依赖逐字）。"""
+    REASON_CHAIN 等长元组相等（挡 M9 等价副本/M11 换序，不再依赖逐字）；
+    ④归一链全文出现次数恰 1（腿①：无标签副本 S1/括注后副本 S2 旧版逃逸，
+    pi #2236 §1 真跑坐实后由本格接管）。"""
     bad = []
     n, tokens, row = parse_authority_line(text)
     if n != 1:
@@ -123,6 +140,9 @@ def authority_check(text: str) -> list[str]:
         bad.append("权威行链不可解析")
     elif normalize(tokens) != REASON_CHAIN:
         bad.append(f"链归一后与 REASON_CHAIN 不等: {normalize(tokens)} != {REASON_CHAIN}")
+    n_hits = len(_chain_pattern().findall(text))
+    if n_hits != 1:
+        bad.append(f"归一链全文出现次数恰 1, 实际 {n_hits}（无标签/括注后副本同属违规）")
     return bad
 
 
