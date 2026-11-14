@@ -8,9 +8,10 @@ r"""check-hooks：把 config.json 里每条 hook command 原样执行一次，�
 用法：python check-hooks.py [--config <path>] [--hook <substr>]
 退出码：0 = 全部在岗；1 = 有闸不在岗；2 = 配置本身读不出来。
 
-runner 约束（pi #745-2，票8 验收②必须注明）：本脚本"原样执行"的命令含 cmd.exe /c +
-Windows 宿主 python.exe ⇒ 只在 Windows 宿主跑得动；WSL 内跑会全部 [BAD] DEAD
-（rc=None 命令无法执行）——那是环境差异，不是闸死。配置一律给绝对路径：
+runner 约束（pi #745-2，票8 验收②必须注明）：Windows 上"原样执行"走 cmd.exe /c
+（配置里常见 python.exe 绝对路径）；POSIX 上按 shlex.split 拆 argv 直执——不再把
+`cmd.exe /c "…"` 整串当可执行文件名（否则 FileNotFoundError → rc=None /
+「命令无法执行」，P1 三闸误报 DEAD）。配置一律给绝对路径：
 默认 ~/.zcode/cli/config.json 是 ZCode cli 形状；--config ~/.claude/settings.json
 读 claude-code 形状（4.2 装闸起本机两份并存，形状差异见 load_commands）。
 """
@@ -18,10 +19,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import attention_contract as ac   # noqa: E402 — 优先级链唯一权威（board #44，4.3③）
 
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 sys.stderr.reconfigure(encoding='utf-8', errors='replace')
@@ -144,10 +150,21 @@ def smoke_payload(command: str) -> bytes:
 
 
 def run_command(command: str, payload: bytes, timeout_s: float = 20.0):
-    """原样执行（shell=False + 交给 cmd 解析引号），显式指定编码读输出。"""
-    cmdline = f'cmd.exe /c "{command}"'
+    """原样执行，显式指定编码读输出。
+    Windows：shell=False + 把整串交给 cmd.exe /c 解析引号（与宿主一致）。
+    POSIX：shlex.split 后按 argv 直执。POSIX 上 subprocess.run(字符串,
+    shell=False) 会把整串当成可执行文件名，找不到 'cmd.exe /c "…"' →
+    rc=None / 「命令无法执行」。"""
     try:
-        p = subprocess.run(cmdline, input=payload, capture_output=True, timeout=timeout_s)
+        if os.name == "nt":
+            p = subprocess.run(f'cmd.exe /c "{command}"',
+                               input=payload, capture_output=True, timeout=timeout_s)
+        else:
+            argv = shlex.split(command, posix=True)
+            if not argv:
+                return None, b"", b"empty command"
+            p = subprocess.run(argv, input=payload, capture_output=True,
+                               timeout=timeout_s)
     except subprocess.TimeoutExpired:
         return None, b"", b"TIMEOUT"
     except OSError as e:
@@ -179,20 +196,23 @@ def classify(rc, stdout: bytes, stderr: bytes) -> tuple[str, str]:
 #   ② 含 my_comment_due 分支（#79 先评论后投票）；
 #   ③ "blocking=true" 必须在位（dsh #820 §3 / pi #823）：漂回「含某帖」不收窄
 #      会复活 A5 要消灭的每轮骚扰；
-#   ④ claude 载体的优先级链必须与服务端 reason 全序**逐字一致且唯一**
-#      （GPT PR#6 review P2：含 verdict_stale 的完整链；旧链/重复链即红）；
+#   ④ claude 载体的优先级链按**结构**判（board #44 三件，4.3③）：唯一权威行
+#      含「优先级 」恰 1 行 ∧ 行含「唯一权威」极性标注 ∧ 链归一后与
+#      attention_contract.REASON_CHAIN 等长元组相等；叙事句（3 对改名+无字段
+#      标注）单独断言。手抄字面链已退役——dsh #882 变异矩阵实证其
+#      「守字面不守对」（错句全绿、改对即红）；
 #   ⑤ 机制层（curl/POST/JSON-RPC）**不得**出现 claim_token 调用——claim 只能由
 #      被唤醒的成员自己发起（明文只显示一次，无人值守领取=把明文写进日志）；
 #      文本里对成员的指令（rb.sh claim_token / claim_token(author=…)）不算机制调用。
 WATCHERS = ("task-template-pi.txt", "claude-polling-prompt.txt", "dsh-watcher.sh")
 _INVOKER = re.compile(r"(curl|wget|Invoke-WebRequest|tools/call|/mcp)[^\n]{0,120}claim_token",
                       re.IGNORECASE)
-# 服务端 /attention 的 reason 全序——载体侧镜像用的是轮询**响应字段名**,
-# 顺序一致但非逐字同名(awaiting_verdict↔awaiting_my_verdict, mentioned↔mentions_me;
-# GPT PR#6 二轮:勿再写"逐字一致")。
-_PRIORITY_CHAIN = ("token_invalid > awaiting_my_verdict > verdict_stale"
-                   " > awaiting_floor_comment > mentions_me > new_comments")
 _PRIORITY_OLD = "优先级 awaiting_my_verdict > mentions_me"  # v2.9 旧链，禁再出现
+# 叙事句断言要素（board #44 #1048 ②）：3 对改名全在位 + 「并非逐字」措辞 +
+# 「verdict_stale 无对应字段」标注（REASON_ONLY 的载体面声明）。
+_NARRATIVE_TOKENS = ("awaiting_my_verdict", "awaiting_verdict", "mentions_me",
+                     "mentioned", "my_comment_due", "awaiting_floor_comment",
+                     "并非逐字", "无对应")
 
 
 def check_watcher_texts(texts: dict | None = None) -> int:
@@ -218,11 +238,15 @@ def check_watcher_texts(texts: dict | None = None) -> int:
                 if k not in text]
         inv = _INVOKER.search(text)
         if name == "claude-polling-prompt.txt":
-            # ④ 优先级链：完整且唯一（GPT PR#6 P2）
-            n_chain = text.count(_PRIORITY_CHAIN)
-            if n_chain != 1 or _PRIORITY_OLD in text:
-                miss.append(f"优先级链(期望唯一含 verdict_stale 全序, 实际 {n_chain} 处)"
-                            if n_chain != 1 else "旧优先级链残留")
+            # ④ 优先级链：结构判定三件（board #44，4.3③；手抄字面链已退役）
+            miss_w = ac.authority_check(text)
+            if miss_w:
+                miss.append("唯一权威行:" + "; ".join(miss_w))
+            miss_narr = [t for t in _NARRATIVE_TOKENS if t not in text]
+            if miss_narr:
+                miss.append("叙事句要素缺失(" + ", ".join(miss_narr) + ")")
+            if _PRIORITY_OLD in text:
+                miss.append("旧优先级链残留")
             # GPT PR#32 四轮 P2 + 五轮 P1-2 + 六轮 P2：打卡必须是轮询的真自动
             # 心跳，路径与 settings 的 RB_POLL_MARKER 同源；缺省必须与
             # quorum_guard 默认同一文件（rb-zcode-poll-heartbeat，env 未生效时

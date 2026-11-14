@@ -160,6 +160,18 @@ class TestGateEndToEnd(Harness):
         self.assertIsNone(b2, "第二轮：改写后的干净回复必须放行（#109 验收）")
         self.assertEqual(rc2, 0)
 
+    def test_stdio_cp1252_still_bounces_jargon(self):
+        # 回归（PR #41 Windows CI）：子进程 stdio 若是 cp1252，bounce 写出中文
+        # 决策会 UnicodeEncodeError，被 fail-open 吞成放行。闸必须在启动时把
+        # stdin/stdout/stderr 收到 UTF-8，本用例在任意宿主上用环境变量模拟。
+        self.write_transcript([{"type": "assistant",
+                                "message": {"role": "assistant", "content": JARGON}}])
+        rc, b, err = self.gate(self.stop_payload(), env_extra={
+            "PYTHONUTF8": "0", "PYTHONIOENCODING": "cp1252"})
+        self.assertIsNotNone(b, "stdio 为 cp1252 时仍须打回黑话，不得 fail-open")
+        self.assertIn("落盘", b["reason"])
+        self.assertNotIn("内部错误", err)
+
     def test_c_user_jargon_never_flags(self):
         self.write_transcript([{"type": "user",
                                 "message": {"role": "user", "content": JARGON}}])
@@ -446,6 +458,43 @@ class TestGateEndToEnd(Harness):
         self.assertIsNotNone(b, "非元数据串兜底可被扫描（元数据不冒充）")
         self.assertIn("落盘", b["reason"])
 
+    def test_i6_thinking_block_matches_transcript(self):
+        # PR #35 Bugbot：thinking 块的 ⑦ 兜底曾把非正文串并进 payload 扫描，
+        # 同一回复走 transcript 路只收 type=="text" → 两路判决不一致
+        # （payload 打回 / transcript 放行）。修后只收 text 块，干净正文两路都放行。
+        content = [
+            {"type": "thinking", "thinking": JARGON},
+            {"type": "text", "text": CLEAN},
+        ]
+        rec = {"type": "assistant",
+               "message": {"role": "assistant", "content": content}}
+        self.write_transcript([rec])
+        rc_p, b_p, _ = self.gate({**self.stop_payload(),
+                                  "response": {"content": content}})
+        rc_t, b_t, _ = self.gate(self.stop_payload())
+        self.assertIsNone(b_p, "payload 路不得把 thinking 块里的黑话扫进去")
+        self.assertIsNone(b_t, "transcript 路只收 text 块，干净正文放行")
+        self.assertEqual(rc_p, rc_t)
+        self.assertEqual(rc_p, 0)
+
+    def test_i7_tool_use_block_matches_transcript(self):
+        # 同因：tool_use 的非元数据字符串字段（如 command）曾被 ⑦ 兜底取走。
+        content = [
+            {"type": "tool_use", "id": "tu1", "name": "Bash",
+             "command": JARGON},
+            {"type": "text", "text": CLEAN},
+        ]
+        rec = {"type": "assistant",
+               "message": {"role": "assistant", "content": content}}
+        self.write_transcript([rec])
+        rc_p, b_p, _ = self.gate({**self.stop_payload(),
+                                  "response": {"content": content}})
+        rc_t, b_t, _ = self.gate(self.stop_payload())
+        self.assertIsNone(b_p, "payload 路不得把 tool_use 字段里的黑话扫进去")
+        self.assertIsNone(b_t, "transcript 路只收 text 块，干净正文放行")
+        self.assertEqual(rc_p, rc_t)
+        self.assertEqual(rc_p, 0)
+
 
 class TestTailReasonsAndWash(unittest.TestCase):
     """GPT round-20/21 §三:七态原因、形状族、洗环境表派生(dsh #2052 §三)。"""
@@ -596,8 +645,8 @@ class TestTailReasonsAndWash(unittest.TestCase):
     def test_g14b_environ_confined_to_gate_env(self):
         # 板 #2073 §四-4（#2070 §四 方向定稿）：闸源码 os.environ 只准出现在
         # _gate_env() 单一入口——函数体内与**模块级**（含嵌套语句块）出现
-        # os.environ / environ.pop / environ.update 即红；洗表派生从此有
-        # 单一锚点（V1.1.11）
+        # os.environ(b) / environ(b).pop / environ(b).update 即红（b 后缀同族
+        # 封堵＝板 #114 dsh #2195 M5）；洗表派生从此有单一锚点（V1.1.11）
         import ast as _ast
         with open(GATE, encoding="utf-8") as f:
             tree = _ast.parse(f.read())
@@ -608,40 +657,55 @@ class TestTailReasonsAndWash(unittest.TestCase):
         for node in _ast.walk(tree):
             if id(node) in inside_fn:
                 continue
-            if isinstance(node, _ast.Attribute) and node.attr == "environ":
-                bad.append("os.environ 出现在 _gate_env 之外（模块级或非入口函数）")
+            if isinstance(node, _ast.Attribute) and node.attr in ("environ", "environb"):
+                bad.append("os.environ(b) 出现在 _gate_env 之外（模块级或非入口函数）")
             if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute) \
                     and node.func.attr in ("pop", "update") \
                     and isinstance(node.func.value, _ast.Attribute) \
-                    and node.func.value.attr == "environ":
-                bad.append(f"environ.{node.func.attr}() 出现在 _gate_env 之外")
+                    and node.func.value.attr in ("environ", "environb"):
+                bad.append(f"environ(b).{node.func.attr}() 出现在 _gate_env 之外")
         self.assertEqual(bad, [], "环境读取必须收进 _gate_env() 单一入口")
 
     def test_g16_import_shapes_forbidden(self):
-        # 板 #2141 §四 v3「getenv 灯＋import 形状四条」：环境读取的绕行通道
-        # 全部封死（作用域 GATE 非 __file__——测试文件 import importlib 5 处
-        # 属正常）。①from os import … 禁；②import os as o（alias asname）禁；
-        # ③getattr(…, "environ") 常量串即红；④__import__/importlib 名字出现即红。
+        # 板 #2141 §四 v3「getenv 灯＋import 形状四条」（PR#38 评审补封）：
+        # 作用域 GATE 非 __file__（测试文件 import importlib 属正常）。
+        # ①from os import … 禁；②仅禁 import os as X（别名绕过 _gate_env；其他模块 as 不在本灯范围）；
+        # ③getattr(…, "environ"|"getenv"|"environb"|"getenvb") 常量串即红；④__import__/importlib 名字出现即红；
+        # ⑤_gate_env 之外 os.getenv(b)(...) / attr in {"getenv","getenvb"} 的调用即红；
+        # ⑥from importlib import … 禁（from-import 盲区，板 #114 pi #2191）；b 后缀名同族封堵（板 #114 dsh #2195）。
+        # 不声称「全部」通道已封（如动态属性名仍可能绕过）。
         import ast as _ast
-        tree = _ast.parse(open(GATE, encoding="utf-8").read())
+        with open(GATE, encoding="utf-8") as _gf:
+            tree = _ast.parse(_gf.read())
+        funcs = [n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef)]
+        inside_fn = {id(n) for fn in funcs
+                     if fn.name == "_gate_env" for n in _ast.walk(fn)}
         bad = []
         for node in _ast.walk(tree):
             if isinstance(node, _ast.ImportFrom) and node.module == "os":
                 bad.append("from os import …（绕过 _gate_env 判据面）")
+            if isinstance(node, _ast.ImportFrom) and node.module == "importlib":
+                bad.append("from importlib import …（动态导入绕灯，板 #114 pi #2191）")
             if isinstance(node, _ast.Import):
                 for a in node.names:
-                    if a.asname:
-                        bad.append(f"import {a.name} as {a.asname}（别名绕灯）")
+                    if a.name == "os" and a.asname:
+                        bad.append(f"import os as {a.asname}（别名绕灯）")
             if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name) \
                     and node.func.id == "getattr" and len(node.args) >= 2 \
                     and isinstance(node.args[1], _ast.Constant) \
-                    and node.args[1].value == "environ":
-                bad.append("getattr(…, \"environ\") 常量串（动态绕灯）")
+                    and node.args[1].value in ("environ", "getenv",
+                                               "environb", "getenvb"):
+                bad.append(f"getattr(…, \"{node.args[1].value}\") 常量串（动态绕灯）")
             for attr in ("__import__", "importlib"):
                 if isinstance(node, _ast.Name) and node.id == attr:
                     bad.append(f"{attr} 名字出现（动态导入绕灯）")
                 if isinstance(node, _ast.Attribute) and node.attr == attr:
                     bad.append(f".{attr} 属性出现（动态导入绕灯）")
+            if id(node) in inside_fn:
+                continue
+            if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute) \
+                    and node.func.attr in ("getenv", "getenvb"):
+                bad.append("os.getenv(b)(...) 出现在 _gate_env 之外")
         self.assertEqual(bad, [], "闸源码不得存在环境读取的绕行通道")
 
 
@@ -679,6 +743,22 @@ class TestV1112Shapes(Harness):
                    "last_message": {"role": 5, "content": JARGON}}
         rc, b, err = self.gate(payload)
         self.assertIsNone(b)
+        self.assertIn("role_skipped: last_message", err)
+
+    def test_role_null_is_skipped(self):
+        # c8 边界（PR#38 评审 P2）：role 键存在且值为 None（JSON null）须整键跳过，
+        # 不得与「键不存在」合流后把 content 送去扫描。
+        m = self._load()
+        self.assertIs(
+            m._body_text({"role": None, "content": JARGON}),
+            m._ROLE_SKIPPED,
+        )
+        self.write_transcript([{"type": "user",
+                                "message": {"role": "user", "content": JARGON}}])
+        payload = {**self.stop_payload(),
+                   "last_message": {"role": None, "content": JARGON}}
+        rc, b, err = self.gate(payload)
+        self.assertIsNone(b, "role:null 不得把正文送进扫描而打回")
         self.assertIn("role_skipped: last_message", err)
 
     def test_j3_role_assistant_still_blocked(self):

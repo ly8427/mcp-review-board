@@ -20,6 +20,17 @@ import os
 import re
 import sys
 
+# 钩子经管道收 UTF-8 JSON、写出 UTF-8 决策。Windows 默认 stdio 是
+# cp1252：bounce() 写出中文决策（或诊断）会 UnicodeEncodeError，被下面
+# fail-open 兜底吞成放行——CI 上 15 项「该打回却 unexpectedly None」即此根因。
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    _reconf = getattr(_stream, "reconfigure", None)
+    if _reconf is not None:
+        try:
+            _reconf(encoding="utf-8", errors="replace")
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
+
 DICT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plain-speak-dictionary.md")
 EXPLAIN_MARKERS = ("（", "(", "，即", "（即", "就是", "指的是", "意思是", "——", "＝", "=")
 HASH_CTX = re.compile(r"[\w-]")
@@ -242,11 +253,19 @@ def _emit(buckets, reasons, *, reasons_out=True):
 
 
 def _body_text(v):
-    """payload 容器的正文提取（V1.1.12 终版，板 #110 c8/#2078/#2074 定稿）：
+    """payload 容器的正文提取（V1.1.12 终版，板 #110 c8/#2078/#2074 定稿；
+    非文本块口径随 PR #35 Bugbot 收口）：
     裸串 → 原样返回（「首个非空」只留给裸串/跨键）；
     容器(dict) → ①role 判据（内联单点、不抽共用谓词，板 #2095 §7 终稿）：
-    role 存在且非 "assistant"（非 str 同判，dsh #2090 §二）→ 返回 _ROLE_SKIPPED
-    身份哨兵；②内容键 text/content/body（含 message 包装递归）全部 join，
+    role 键存在且值非 "assistant"（含 JSON null / 非 str，与「键缺失」区分，
+    dsh #2090 §二）→ 返回 _ROLE_SKIPPED
+    身份哨兵；①b 带 type 且值既不是 "text" 也不是记录级包装 "assistant"
+    （thinking / tool_use / tool_result 等）→ 整块返回 None，内容键与 ⑦
+    兜底都不取——与 transcript 路 _assistant_text 只收 type=="text" 对齐，
+    同一回复两路判决一致。type 缺席仍走 ②③（i5 无 type 的 ⑦ 兜底，向后
+    兼容）；type=="text" 走内容键（i3/i4）；type=="assistant" 是记录包装
+    （message 递归），不是内容块，继续取；
+    ②内容键 text/content/body（含 message 包装递归）全部 join，
     内容链上任一环节为哨兵 → 整键传播哨兵（d2 定稿：不传播=干净部分进扫描
     而黑话无声消失=扫错对象零痕）；③内容键缺席 → 其余**非元数据**串按文档序
     首个非空兜底；type/role/id 等元数据键一律不取。
@@ -254,14 +273,26 @@ def _body_text(v):
     → 整体哨兵（传播完整性，d1）。
     与 transcript 路 _assistant_text 的口径差异（两处 docstring 各记一句，
     板 #2095 §7）：那条是记录级（type/role 判据先行），本条是容器级（role
-    内联单点）；同一 dict 两处结论可不同（双面断言钉死，j_dual）。
+    内联单点）；同一 dict 两处结论可不同（双面断言钉死，j_dual）——此差异
+    只在 role 维，不在内容块 type 维。
     取不到（纯元数据/未知形状）→ None。"""
     if isinstance(v, str):
         return v
     if isinstance(v, dict):
-        r = v.get("role")
-        if r is not None and (not isinstance(r, str) or r != "assistant"):
-            return _ROLE_SKIPPED   # c8：容器角色非 assistant → 整键跳过（身份哨兵）
+        if "role" in v and (
+            not isinstance(v["role"], str) or v["role"] != "assistant"
+        ):
+            return _ROLE_SKIPPED   # c8：role 键在且值非 assistant（含 null）→ 整键跳过
+        # 带 type 的非文本内容块（thinking / tool_use / tool_result 等）整块不取：
+        # 内容键与 ⑦ 兜底都不走。与 transcript 路 _assistant_text 只收
+        # type=="text" 对齐，同一回复两路判决一致（PR #35 Bugbot）。
+        # type 缺席：仍走原路径（i5 无 type 的 ⑦ 兜底，向后兼容）。
+        # type=="text"：走内容键（i3/i4）。
+        # type=="assistant"：记录级包装（message 递归），不是内容块，继续取。
+        if "type" in v:
+            vt = v["type"]
+            if vt != "text" and vt != "assistant":
+                return None
         parts = []
         for bk in _CONTENT_KEYS + ("message",):
             if bk in v:
@@ -297,7 +328,8 @@ def extract_text(payload):
        板 #110 终稿）：A 档（last_message > response > text > output 精确消费
        名单）取到正文才消费——值是裸串取该串；值是容器按 _body_text 取
        text/content/body 正文字段（多块 join，元数据 id/status/type 不冒充
-       正文）；role 存在且非 assistant → role_skipped 桶（c8，整键跳过）；
+       正文）；role 键存在且值非 assistant（含 JSON null / 非 str）→
+       role_skipped 桶（c8，整键跳过）；
        未识别形状 → meta_only 桶（h2 灯）。B 档（其余命中键名的字段，如
        conversation_preview）**永不打回**，进 b-tier-ignored 桶（板 #2073
        §二；不盲选防键序定成败）。
@@ -319,7 +351,7 @@ def extract_text(payload):
     if isinstance(lam, str) and lam.strip():
         return lam
     keyed = {}
-    buckets = {}   # 桶：token → [键名]（V1.1.12 双列表之一；构建序即桶序）
+    buckets = {}   # 桶：token → [键名]（V1.1.12 双列表之一；输出序=_BUCKET_ORDER 固定枚举序，非构建序）
     reasons = []   # 原因：尾读失败可分原因（双列表之二；与桶分族，④ 丢弃不误伤 ③）
     for k, v in payload.items():
         if re.search(r"response|preview|last|message|assistant|text|output", str(k), re.I):
