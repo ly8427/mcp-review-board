@@ -146,13 +146,28 @@ class TestWatcherIntegration(unittest.TestCase):
 
     HEALTHY = (HERE / "claude-polling-prompt.txt").read_text(encoding="utf-8")
 
-    def _checker(self, texts):
+    def _load_chk(self):
         import importlib.util
         s = importlib.util.spec_from_file_location(
             "chk", str(HERE / "check-hooks.py"))
         m = importlib.util.module_from_spec(s)
         s.loader.exec_module(m)
-        return m.check_watcher_texts(texts=texts)
+        return m
+
+    def _checker(self, texts):
+        return self._load_chk().check_watcher_texts(texts=texts)
+
+    def _checker_out(self, texts):
+        """(rc, stdout)：负向断言需锁定错误来源时用
+        （GPT PR#47 复核：check_watcher_texts 同时查权威判据与叙事要素，
+        只断 rc≠0 锁不住来源——未来误删权威检查时测试必须仍红）。
+        装载须在重定向前完成：check-hooks 模块级 reconfigure(sys.stdout)。"""
+        import contextlib
+        m = self._load_chk()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = m.check_watcher_texts(texts=texts)
+        return rc, buf.getvalue()
 
     def test_ac_none_fails_closed_not_pass(self):
         # GPT PR#47 建议：attention_contract 导入失败（ac=None）时，claude
@@ -190,6 +205,8 @@ class TestWatcherIntegration(unittest.TestCase):
         # Bugbot 修正 + GPT PR#47 P2：三载体补齐（缺键自计 bad 会空泛绿）＋
         # 平衡括号 helper（find(")") 在 D 终稿内层括号下切半段）＋ 断言升级：
         # 集成非零必须来自 authority 极性/权威判据，而非叙事 token 缺失。
+        # GPT PR#47 复核补强：rc≠0 只断"红了"不锁来源——删整段括注会同时破坏
+        # 权威判据与叙事要素，必须捕获集成入口输出、钉死「唯一权威行」在案。
         base = {"task-template-pi.txt": "token_invalid my_comment_due blocking=true",
                 "dsh-watcher.sh": "token_invalid my_comment_due blocking=true"}
         v = _strip_outer_annotation(self.HEALTHY)
@@ -197,7 +214,11 @@ class TestWatcherIntegration(unittest.TestCase):
         self.assertTrue(any("唯一权威" in b for b in bad),
                         "M6 集成前提：authority 极性判据必须独立触发: " + "; ".join(bad))
         texts = {**base, "claude-polling-prompt.txt": v}
-        self.assertNotEqual(self._checker(texts), 0, "M6：括注删除必须红")
+        rc, out = self._checker_out(texts)
+        self.assertNotEqual(rc, 0, "M6：括注删除必须红")
+        self.assertIn("唯一权威行", out,
+                      "M6 集成：非零必须来自 authority 判据（唯一权威行），"
+                      "而非仅叙事要素缺失。实际输出: " + out.strip())
         texts_ok = {**base, "claude-polling-prompt.txt": self.HEALTHY}
         self.assertEqual(self._checker(texts_ok), 0, "对照:同前提 healthy 必须绿")
 
