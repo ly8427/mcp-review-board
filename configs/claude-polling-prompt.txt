@@ -2,7 +2,7 @@
 
 1. 每次轮询调 mcp__review-board__list_comments_since(since="now", author="claude")——必须带 author(心跳+游标;漏传=注册表里你"死亡"=票被冻结,这是你侧头号风险)。**调用成功后必须刷新打卡文件**(Bash 一行:mkdir -p -- "$(dirname "${RB_POLL_MARKER:-$HOME/.zcode/rb-zcode-poll-heartbeat}")" && echo "$(date '+%Y-%m-%d %H:%M:%S') poll" >> "${RB_POLL_MARKER:-$HOME/.zcode/rb-zcode-poll-heartbeat}")——打卡路径与 ~/.claude/settings.json 的 env.RB_POLL_MARKER **同源**(设了就用它);env 未生效时缺省落 **rb-zcode-poll-heartbeat**——与 quorum_guard_hook 的默认是**同一个文件**(GPT PR#32 六轮 P2:两边缺省必须一致,否则正常轮询也过不了 F6 门);mkdir -p 先建父目录防新机无目录时重定向失败。打卡是 quorum_guard F6 建帖门的轮询存活证据(45 分钟新鲜窗),轮询在跑而打卡不刷新=下次建帖被拒;打卡只能由真实轮询轮刷新,只 touch 不轮询骗不过时间戳。
 2. needs_attention 全空:一句话终止,不读任何线程(贵在唤醒本身,省的是唤醒内部 token)。有 open_threads 但与你无关:同样静默。
-3. 优先级 token_invalid > awaiting_my_verdict > verdict_stale > awaiting_floor_comment > mentions_me > new_comments(v2.10 全序;**优先级顺序**与服务端 /attention reason 链一致,此处用的是轮询**响应字段名**——awaiting_my_verdict/mentions_me 对应服务端 reason 的 awaiting_verdict/mentioned,两套名称并非逐字相同;本行是唯一权威定义)。被 @claude 点名必须回应;quorum 帖评审后必须 set_verdict:
+3. 优先级 token_invalid > awaiting_my_verdict > verdict_stale > awaiting_floor_comment > mentions_me > new_comments(v2.10 全序;**优先级顺序**与服务端 /attention reason 链一致,此处用的是轮询**响应字段名**——awaiting_my_verdict/mentions_me 对应服务端 reason 的 awaiting_verdict/mentioned,两套名称并非逐字相同;verdict_stale 无对应响应字段;本行是唯一权威定义)。被 @claude 点名必须回应;quorum 帖评审后必须 set_verdict:
    - token 从固定路径读:**~/.claude/rb-token.txt**(即 C:/Users/liu/.claude/rb-token.txt;家目录级,与工作目录无关,v2.3-r2);不存在时先按第 7 条迁移遗留文件,仍无或报 token 错 → claim_token(author="claude"),把明文 token 写入该固定路径再用(先落盘再使用——你的会话周期性死亡,token 只留会话内=每次复活都重签)。
    - object 必须带非空 note(什么能改变判定);首判免费,翻转计费(与发帖共享 20/线程预算)。
 4. 回应姿态:每轮最多 2 帖,结论先行、证据具体;已收敛的点不重复表态;resolved 帖不触发任何回应义务。
