@@ -12,7 +12,9 @@
   C  权威行结构判定：healthy 绿；变异矩阵抽格——M9 等价副本容错绿、
      M10/M19 两侧加料红、M11 换序红、M13/M15 极性红、M6 叙事句要素红
   D  check_watcher_texts 注入口：healthy 绿 / 权威行删除红 / 极性篡改红
-  E  旧措辞清零验收：全仓（git 跟踪面、排除本文件自计）恰 1 处（dsh #1048 §二② 的验收判据；唯一预期承载 = docs/DEBT.md 验收行）
+  E  旧措辞清零验收：configs 面 = 0（git grep -F 逐字计；全仓口径已退役，
+     DEBT 债务描述性引用允许保留）——判据类 TestConfigsFaceZero（本文件
+     末节），定案见 board #115（dsh #2264 面② / pi #2273，dsh #2280 锚表）
 """
 from __future__ import annotations
 
