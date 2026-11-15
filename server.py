@@ -4090,15 +4090,26 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
             if suspended:
                 ok, missing = _wake_ledger_ok(conn, thread_id, t["author"], suspended)
                 if not ok:
-                    _note = (f"{'; '.join(missing)} (timeout/error 过门;"
-                             f"缺条/not-attempted/suspicious 不过;"
-                             f"锚点=^wake_ledger: 行首;#511 枚举不合并)")
-                    # Dedupe key = the reason enum the note already carries
-                    # (no_ledger / ledger_unparsable / floor_wm_missing), or the
-                    # per-member split ledger_entry_missing / _suspicious.
-                    _key = "ledger_entry_suspicious" if "suspicious" in _note \
+                    # DEBT #38 修复（dsh #2178 §三登记 / #2277 §四修法，pi 独立复核）：
+                    # ① _key 从 missing 项本身判定——旧代码查 _note 整串，被固定尾
+                    #   的 "suspicious" 字面量污染（恒真，缺失/存疑两态不可分）；
+                    # ② 逐成员路径 _note 行首补 reason={_key}: ——旧 note 以成员名
+                    #   开头，_audit_blocked_once 的 note LIKE 'reason=<action>%'
+                    #   永不命中 ⇒ 每次唤起重插重复流水；
+                    # ③ 固定尾 "suspicious" 改写为"疑义条目"，防判据再次被常量污染。
+                    _key = "ledger_entry_suspicious" if any("suspicious" in m for m in missing) \
                         else "ledger_entry_missing"
+                    _tail = (" (timeout/error 过门;缺条/not-attempted/疑义条目 不过;"
+                             "锚点=^wake_ledger: 行首;#511 枚举不合并)")
+                    if missing and missing[0].startswith("reason="):
+                        # 整条路径（no_ledger / ledger_unparsable / floor_wm_missing）
+                        # 保留原枚举粒度：key 取自该条自身枚举，note 维持 reason= 行首
+                        _key = missing[0][7:].split(":", 1)[0].split("(", 1)[0].strip()
+                        _note = '; '.join(missing) + _tail
+                    else:
+                        _note = f"reason={_key}: {'; '.join(missing)}" + _tail
                     if _note.startswith("reason="):
+                        # 自动兜底（原 :4101-4102 位保留）：此刻提取值恒等于 _key
                         _key = _note[7:].split(":", 1)[0].split("(", 1)[0].strip()
                     _audit_blocked_once(conn, thread_id, t["revision"], _key, _note)
                     return
