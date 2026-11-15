@@ -2402,6 +2402,19 @@ def _wake_ledger_ok(conn: sqlite3.Connection, thread_id: int,
     return (not missing), missing
 
 
+def _ledger_block_key(missing):
+    """v2.9 台账门阻断 key 判定（DEBT #38 修法；GPT PR#48 审查补边界）。
+    逐成员条目形如「成员名:状态」——只检查冒号后的**状态段**：成员名本身
+    含 "suspicious" 不得污染分类（真实原因=无条目时仍是 missing）。
+    整条路（reason= 前缀：no_ledger / ledger_unparsable / floor_wm_missing）
+    无逐名状态段，返回初值 ledger_entry_missing；调用点随后会用条目自身的
+    枚举覆盖该初值。"""
+    member_status = [m.split(":", 1)[1] for m in missing
+                     if not m.startswith("reason=") and ":" in m]
+    return "ledger_entry_suspicious" if any("suspicious" in s for s in member_status) \
+        else "ledger_entry_missing"
+
+
 # --- v2.9.2 (#47 ①): form-b nonce — user-side confirmation ------------------
 FORM_B_TTL_S = 24 * 3600
 
@@ -4091,14 +4104,14 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
                 ok, missing = _wake_ledger_ok(conn, thread_id, t["author"], suspended)
                 if not ok:
                     # DEBT #38 修复（dsh #2178 §三登记 / #2277 §四修法，pi 独立复核）：
-                    # ① _key 从 missing 项本身判定——旧代码查 _note 整串，被固定尾
-                    #   的 "suspicious" 字面量污染（恒真，缺失/存疑两态不可分）；
+                    # ① _key 从 missing 项的**状态段**判定（_ledger_block_key，
+                    #   只查冒号后部分——GPT PR#48 审查边界：成员名含 "suspicious"
+                    #   不得污染分类；旧代码查 _note 整串，被固定尾字面量污染恒真）；
                     # ② 逐成员路径 _note 行首补 reason={_key}: ——旧 note 以成员名
                     #   开头，_audit_blocked_once 的 note LIKE 'reason=<action>%'
                     #   永不命中 ⇒ 每次唤起重插重复流水；
                     # ③ 固定尾 "suspicious" 改写为"疑义条目"，防判据再次被常量污染。
-                    _key = "ledger_entry_suspicious" if any("suspicious" in m for m in missing) \
-                        else "ledger_entry_missing"
+                    _key = _ledger_block_key(missing)
                     _tail = (" (timeout/error 过门;缺条/not-attempted/疑义条目 不过;"
                              "锚点=^wake_ledger: 行首;#511 枚举不合并)")
                     if missing and missing[0].startswith("reason="):
