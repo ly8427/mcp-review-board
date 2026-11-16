@@ -195,30 +195,43 @@ def main() -> None:
         # still misses FKs — M-A2 (column-level REFERENCES delta on one side)
         # kept a table_info-only f2 green, because foreign keys live in
         # PRAGMA foreign_key_list, not table_info. So compare per-table
-        # (name, type, notnull, dflt_value, pk) tuples AND foreign_key_list
-        # rows across ALL tables, instead of hand-copying either DDL into a
-        # second textual source.
+        # (name, type, notnull, dflt_value, pk) tuples AND projected
+        # foreign_key_list columns across ALL tables, instead of hand-copying
+        # either DDL into a second textual source.
         # Coverage contract (dsh #2425 §1, choice (a)): f2 covers exactly
-        # what the two PRAGMAs expose — NOT NULL, DEFAULT, FK, and (since
-        # the r[5] slot; live carrier: verdicts composite PK) PK. NOT
-        # covered, by PRAGMA-blindness, not by choice: UNIQUE, CHECK,
-        # COLLATE have no pragma face; today both sides carry identical
-        # CHECK text (verdicts.verdict), so parity holds — registered, not
-        # fixed. Choice (b) (normalized sqlite_master.sql text diff) would
-        # cover them but drags SQL-comment normalization (#2421 §7) from
+        # what the PRAGMAs expose — NOT NULL, DEFAULT, FK (projected
+        # columns, see below), plus PK via the r[5] slot (live carrier:
+        # verdicts composite PK). NOT covered: UNIQUE — reachable via
+        # PRAGMA index_list origin='u', just not wired yet (dsh #2427
+        # §3.2: a pragma face exists, unlike CHECK/COLLATE; zero live
+        # carriers in schema.sql today); CHECK / COLLATE — no pragma
+        # face; today both sides carry identical CHECK text
+        # (verdicts.verdict), so parity holds — registered, not fixed.
+        # Choice (b) (normalized sqlite_master.sql text diff) would cover
+        # them but drags SQL-comment normalization (#2421 §7) from
         # low-realism to mandatory; declined for now.
         tables = names(ta) | names(tb)
         shape = lambda cx, t: (  # noqa: E731
             sorted((r[1], r[2], r[3], r[4], r[5])
                    for r in cx.execute(f"PRAGMA table_info({t})")),
-            sorted(map(tuple, cx.execute(f"PRAGMA foreign_key_list({t})")),
+            # FK half compares projected columns (table, from, to,
+            # on_update, on_delete, match) — dsh #2427 §3.1. The full row
+            # carries id/seq = declaration-order bookkeeping, so a
+            # semantically-equal FK set written in a different order on
+            # one side false-reds (live carrier: comments declares two
+            # FKs; M-F1 repro'd red on the full-row shape, green here).
+            # key=repr kept: 'to' may be None.
+            sorted(((r[2], r[3], r[4], r[5], r[6], r[7])
+                    for r in cx.execute(f"PRAGMA foreign_key_list({t})")),
                    key=repr))
         differing = sorted(t for t in tables if shape(ta, t) != shape(tb, t))
         # this suite's check() is (label, ok) only — fold the failing tables
         # into the label so a red names what to fix (batch2 suite carries a
-        # detail slot; here the label is the outlet). Label says "table_info
-        # + FK rows": both halves are load-bearing, name them.
-        f2_label = "f2 schema.sql == embedded fallback (table_info+pk + FK rows per table)"
+        # detail slot; here the label is the outlet). Label names both
+        # halves: table_info+pk and projected FK columns — both
+        # load-bearing.
+        f2_label = ("f2 schema.sql == embedded fallback "
+                    "(table_info+pk + FK projected columns per table)")
         if differing:
             f2_label += f" — differing tables: {differing}"
         check(f2_label, not differing)
