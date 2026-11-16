@@ -234,10 +234,13 @@ def main() -> None:
         # a rowid alias and not already declared NOT NULL, so a one-side
         # mutation there goes f2-red (live: participants.author, meta.key;
         # M-S1 reproduced f2 — differing tables: ['participants']).
-        # Residual blind faces, registered: STRICT/WITHOUT ROWID on
-        # threads/comments/verdict_events (INTEGER PRIMARY KEY = rowid
-        # alias, no bit to flip) and on verdicts (composite PK columns
-        # already NOT NULL — measured all-green on a one-side STRICT, M-S2).
+        # Residual blind faces, registered — evidence tiers kept apart
+        # (dsh #2436 §3): measured = verdicts (composite PK columns already
+        # NOT NULL — all-green on one-side STRICT, M-S2, AND one-side
+        # WITHOUT ROWID, M-S3); static-only (semantic scan, no measured
+        # cell) = STRICT/WITHOUT ROWID on threads/comments/verdict_events
+        # (INTEGER PRIMARY KEY = rowid alias, no bit to flip — inferred,
+        # not run; cite as inference, not measurement).
         # WITHOUT ROWID additionally can't coexist with AUTOINCREMENT
         # (SQLite rejects the combo), so comments/threads/verdict_events
         # carry that incidental guard; verdicts has none. Choice (b)
@@ -307,7 +310,10 @@ def main() -> None:
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
                 (t,)).fetchone()
             if row is None or row[0] is None:
-                return False  # internal tables (sqlite_sequence) carry no sql
+                return False  # missing-row / NULL-sql guard only — internal
+                # tables DO carry sql: sqlite_sequence measures as
+                # CREATE TABLE sqlite_sequence(name,seq) on 3.45.1, so that
+                # path is dead today (false premise fixed, dsh #2436 §4)
             s = re.sub(r"/\*.*?\*/", " ", row[0], flags=re.S)
             s = re.sub(r"--[^\n]*", " ", s)
             return "AUTOINCREMENT" in s.upper()
