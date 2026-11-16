@@ -139,7 +139,11 @@ def static_checks():
     check("SA3b verdict_events.thread_id nullable (clause has no NOT\\s+NULL, re.I)",
           cm is not None and null_m is None,
           (f"constraint={null_m.group(0)!r}" if null_m else
-           f"clause={cm.group(1)!r}" if cm else "thread_id clause not found")[:80])
+           f"clause={cm.group(1)!r}" if cm else
+           # upstream locator failed — name THAT, not the downstream clause
+           # (a wrong red reason is #2416 §3's disease, one level down: #2421 §6)
+           "verdict_events DDL not located" if m is None else
+           "thread_id clause not found")[:80])
     # Either FK spelling (#2416 §2b; opencode #2417 matrix M3): column-level
     # `thread_id INTEGER REFERENCES …` carries no "FOREIGN KEY" text, so the
     # old substring check stayed green on a table that had gained an FK;
@@ -152,7 +156,10 @@ def static_checks():
     fk_m = re.search(r"\b(?:FOREIGN\s+KEY|REFERENCES)\b", ddl, re.I)
     check("SA3c verdict_events has no FOREIGN KEY / REFERENCES (either spelling, re.I)",
           m is not None and fk_m is None,
-          f"constraint={fk_m.group(0)!r}" if fk_m else "no FK text in ddl")
+          f"constraint={fk_m.group(0)!r}" if fk_m else
+          # locator failure (ddl="") and a genuinely clean DDL are different
+          # facts; the detail must not assert over a DDL never located (#2421 §6)
+          ("verdict_events DDL not located" if m is None else "no FK text in ddl"))
     # Whitespace-tolerant (#2414 §3): exact-substring check fake-reds on PEP 604
     # spacing variants (thread_id: int|None=None) — live-repro'd.
     check("SA3d _audit signature thread_id defaults to None",

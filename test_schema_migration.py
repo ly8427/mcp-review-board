@@ -188,6 +188,29 @@ def main() -> None:
         names = lambda cx: {r[0] for r in cx.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         check("f1 schema.sql == embedded fallback (table sets)", names(ta) == names(tb))
+        # f2 (dsh #2421 §5, extended by live mutation M-A2): column-level
+        # parity. f1 only compares table NAME sets; PRAGMA table_info alone
+        # still misses FKs — M-A2 (column-level REFERENCES delta on one side)
+        # kept a table_info-only f2 green, because foreign keys live in
+        # PRAGMA foreign_key_list, not table_info. So compare per-table
+        # (name, type, notnull, dflt_value) tuples AND foreign_key_list rows
+        # across ALL tables, instead of hand-copying either DDL into a
+        # second textual source.
+        tables = names(ta) | names(tb)
+        shape = lambda cx, t: (  # noqa: E731
+            sorted((r[1], r[2], r[3], r[4])
+                   for r in cx.execute(f"PRAGMA table_info({t})")),
+            sorted(map(tuple, cx.execute(f"PRAGMA foreign_key_list({t})")),
+                   key=repr))
+        differing = sorted(t for t in tables if shape(ta, t) != shape(tb, t))
+        # this suite's check() is (label, ok) only — fold the failing tables
+        # into the label so a red names what to fix (batch2 suite carries a
+        # detail slot; here the label is the outlet). Label says "table_info
+        # + FK rows": both halves are load-bearing, name them.
+        f2_label = "f2 schema.sql == embedded fallback (table_info + FK rows per table)"
+        if differing:
+            f2_label += f" — differing tables: {differing}"
+        check(f2_label, not differing)
         ta.close(); tb.close()  # dsh #444: same WinError 32 shape as the v2.8 matrix had
 
         # g) v5 -> v6 (issue #3): id-cursor column added + backfill semantics.
