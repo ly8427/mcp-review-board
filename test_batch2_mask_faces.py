@@ -88,14 +88,18 @@ def static_checks():
     # (#2414 §3 optional hardening) — report duplicates instead.
     check("SA1a _cred_history_record located, exactly 1",
           fn_src is not None and len(fns) == 1, f"n={len(fns)}")
-    if fn_src:
-        # 「INTO」锚钉在 SQL 语句上——docstring 散文里的同族字样不抬计数
-        # （与 SA2 行首锚同病同治：判据本身要能防散文抬高, #2409 §5 ⚠ 同类）。
-        check("SA1b fn-domain INSERT OR IGNORE INTO == 1 (statement-anchored)",
-              fn_src.count("INSERT OR IGNORE INTO") == 1,
-              str(fn_src.count("INSERT OR IGNORE INTO")))
-        check("SA1c fn-domain INSERT OR REPLACE == 0", fn_src.count("INSERT OR REPLACE") == 0,
-              str(fn_src.count("INSERT OR REPLACE")))
+    # Guard-free (#2416 §3 口径, non-defect): a failed locator must turn these
+    # red, not silently skip them — assertion count stays constant. fn="" →
+    # count 0 → SA1b red (SA1a already carries the locator diagnosis).
+    fn = fn_src or ""
+    # 「INTO」锚钉在 SQL 语句上——docstring 散文里的同族字样不抬计数
+    # （与 SA2 行首锚同病同治：判据本身要能防散文抬高, #2409 §5 ⚠ 同类）。
+    check("SA1b fn-domain INSERT OR IGNORE INTO == 1 (statement-anchored)",
+          fn.count("INSERT OR IGNORE INTO") == 1,
+          str(fn.count("INSERT OR IGNORE INTO")))
+    check("SA1c fn-domain INSERT OR REPLACE == 0",
+          fn_src is not None and fn.count("INSERT OR REPLACE") == 0,
+          str(fn.count("INSERT OR REPLACE")))
     # SA1 反向陷阱（#2409 §3.1）：全文件 OR REPLACE 不为 0 是事实，只打印不断言
     n_replace_all = src.count("INSERT OR REPLACE")
     print(f"  ℹ informational: whole-file INSERT OR REPLACE = {n_replace_all}"
@@ -112,21 +116,37 @@ def static_checks():
     # SA3 两段证据链
     m = re.search(r"CREATE TABLE IF NOT EXISTS verdict_events \(.*?\);", src, re.S)
     check("SA3a verdict_events DDL located", m is not None)
-    if m:
-        ddl = m.group(0)
-        # Clause-scoped (#2414 §3): `(?!.*NOT NULL)` never crosses lines, so a
-        # reformatted "thread_id INTEGER\n      NOT NULL," stayed green — a real
-        # one-line bypass (live-repro'd). Scope the verdict to the column clause;
-        # do NOT flatten the DDL first (author TEXT NOT NULL on another clause
-        # would fake-red, #2414 §3 ⚠). The clause may legitimately be empty
-        # ("thread_id  INTEGER," = no NOT NULL = nullable = green): dsh #2414's
-        # literal bool(clause) term fake-reds today's shape (live-repro'd) and
-        # is intentionally dropped; regex failure (column gone) stays red.
-        cm = re.search(r"thread_id\s+INTEGER([^,]*)", ddl)
-        check("SA3b verdict_events.thread_id nullable (clause has no NOT NULL)",
-              cm is not None and "NOT NULL" not in cm.group(1),
-              (repr(cm.group(1)) if cm else "thread_id clause not found")[:80])
-        check("SA3c verdict_events has no FOREIGN KEY", "FOREIGN KEY" not in ddl)
+    # Guard-free (#2416 §3 口径): checks stay outside `if m:` — locator
+    # failure turns them red (ddl "" → both locators miss → red), assertion
+    # count stays constant instead of silently shrinking by 2.
+    ddl = m.group(0) if m else ""
+    # Clause-scoped (#2414 §3): `(?!.*NOT NULL)` never crosses lines, so a
+    # reformatted "thread_id INTEGER\n      NOT NULL," stayed green — a real
+    # one-line bypass (live-repro'd). Scope the verdict to the column clause;
+    # do NOT flatten the DDL first (author TEXT NOT NULL on another clause
+    # would fake-red, #2414 §3 ⚠). The clause may legitimately be empty
+    # ("thread_id  INTEGER," = no NOT NULL = nullable = green): dsh #2414's
+    # literal bool(clause) term fake-reds today's shape (live-repro'd) and
+    # is intentionally dropped; regex failure (column gone) stays red.
+    cm = re.search(r"thread_id\s+INTEGER([^,]*)", ddl)
+    # Whitespace-tolerant constraint match (#2416 §2a; opencode #2417 matrix
+    # M2): literal "NOT NULL" was still bypassable via "NOT\n NULL" — NOT and
+    # NULL are two tokens, any whitespace between them is legal SQL.
+    null_m = re.search(r"\bNOT\s+NULL\b", cm.group(1)) if cm else None
+    check("SA3b verdict_events.thread_id nullable (clause has no NOT\\s+NULL)",
+          cm is not None and null_m is None,
+          (f"constraint={null_m.group(0)!r}" if null_m else
+           f"clause={cm.group(1)!r}" if cm else "thread_id clause not found")[:80])
+    # Either FK spelling (#2416 §2b; opencode #2417 matrix M3): column-level
+    # `thread_id INTEGER REFERENCES …` carries no "FOREIGN KEY" text, so the
+    # old substring check stayed green on a table that had gained an FK;
+    # merged regex also survives a "FOREIGN  KEY" double-space. The locator
+    # precondition keeps a failed SA3a from leaking a vacuous green here
+    # (ddl "" trivially contains no FK text) — locator failure must be red.
+    fk_m = re.search(r"\b(?:FOREIGN\s+KEY|REFERENCES)\b", ddl)
+    check("SA3c verdict_events has no FOREIGN KEY / REFERENCES (either spelling)",
+          m is not None and fk_m is None,
+          f"constraint={fk_m.group(0)!r}" if fk_m else "no FK text in ddl")
     # Whitespace-tolerant (#2414 §3): exact-substring check fake-reds on PEP 604
     # spacing variants (thread_id: int|None=None) — live-repro'd.
     check("SA3d _audit signature thread_id defaults to None",
