@@ -352,6 +352,155 @@ def _oneline(s: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[:limit] + "…"
 
 
+# --- credential masking (batch2 2.1, #113 v9) ---------------------------------
+# Identity layer over the board's own credentials (tokens / form_b nonces).
+# Design pins (thread #113, v5..v9 closed spec):
+#   * candidate enumeration is UNCONDITIONAL and belongs to the identity
+#     layer; the shape layer only controls whether UNREGISTERED candidates
+#     are masked too (REVIEWBOARD_MASK_SHAPE_LAYER=1, default off — host
+#     ruling #2362). Layer definition sentence pinned in #2370 §4.
+#   * candidate = exactly-32 lowercase-hex with BOTH boundaries non-hex
+#     (#2357/#2358 §3): a bare {32} would carve 32 out of 40-hex commit ids.
+#     Leftovers (documented, not bugs): hex-glued tokens, uppercase-hex
+#     legacy credentials, non-32-hex key material ("密钥串"无形态).
+#   * judgment = sha256(candidate RAW bytes, no strip) ∈ registry — same
+#    口径 as _token_ok (#2360 §2-③).
+#   * masking is LENGTH-PRESERVING (first 4 + 28 '*'): faces mask FIRST and
+#     slice AFTER (先掩后截断), positions computed on the ORIGINAL text —
+#     equal length keeps start = max(0, pos - cap//4) alive (#2358 §2).
+#   * registry = CURRENT ∪ HISTORY credential set (#2360 §2-① wording:
+#     "当前凭据集合"; rotation keeps old members via cred_hash_* rows).
+#   * issuance surfaces are wiring-FORBIDDEN (claim_token receipts resp
+#     ×3 ∪ form_b nonce log/file delivery — #2382/#2393 §3①); masking
+#     them would break token issuance / (b) admission.
+CRED_HASH_KEY_PREFIX = "cred_hash_"
+_CRED_CANDIDATE_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])")
+
+
+def _mask_credential_text(text: str, registry: frozenset) -> str:
+    """Mask registered 32-hex credentials inside a free-text surface.
+
+    Pure function (no DB access — the registry is loaded ONCE per face at
+    the face entry, #2365 §2). Identity layer always on; shape layer off
+    unless REVIEWBOARD_MASK_SHAPE_LAYER=1. Length-preserving by contract."""
+    if not registry or not text:
+        return text
+    shape_layer = os.environ.get("REVIEWBOARD_MASK_SHAPE_LAYER", "0") == "1"
+
+    def _repl(m: re.Match) -> str:
+        cand = m.group(0)
+        if hashlib.sha256(cand.encode()).hexdigest() in registry or shape_layer:
+            return cand[:4] + "*" * 28
+        return cand
+
+    return _CRED_CANDIDATE_RE.sub(_repl, text)
+
+
+def _load_credential_registry(conn: sqlite3.Connection) -> tuple[frozenset, list[str]]:
+    """Current ∪ history credential-identity set, loaded once per face entry.
+
+    Sources (v9 registry = 当前∪历史, #2360 §2-② / #2366 §1):
+      participants.meta.token_hash            (current tokens)
+      meta.form_b_pending_*.nonce_sha256      (pending nonces)
+      meta.cred_hash_<sha256> rows            (history: issuance-time appends
+                                               + deploy-time idempotent backfill)
+    Loader contract (#2365 §2 / #2366 §2): a single bad row is SKIPPED with a
+    diag entry — never raises into the read face; loader failure = empty set
+    + diag, callers answer status="ok"."""
+    creds: set[str] = set()
+    diag: list[str] = []
+    try:
+        for r in conn.execute("SELECT author, meta FROM participants").fetchall():
+            state, meta = _meta_obj(r["meta"])
+            if state in META_CORRUPT:
+                diag.append(f"participants:{r['author']}:skip:{state}")
+                continue
+            if state != META_DICT:
+                continue
+            h = meta.get("token_hash")
+            if isinstance(h, str) and h:
+                creds.add(h)
+    except sqlite3.Error as e:
+        diag.append(f"participants:scan_error:{_oneline(str(e), 80)}")
+    try:
+        for r in conn.execute(
+            "SELECT key, value FROM meta WHERE key LIKE 'form_b_pending_%'"
+        ).fetchall():
+            try:
+                obj = json.loads(r["value"])
+            except META_PARSE_ERRORS:
+                diag.append(f"meta:{r['key']}:skip:unparsable")
+                continue
+            h = obj.get("nonce_sha256") if isinstance(obj, dict) else None
+            if isinstance(h, str) and h:
+                creds.add(h)
+    except sqlite3.Error as e:
+        diag.append(f"meta:pending_scan_error:{_oneline(str(e), 80)}")
+    try:
+        for r in conn.execute(
+            "SELECT key FROM meta WHERE key LIKE 'cred\\_hash\\_%' ESCAPE '\\'"
+        ).fetchall():
+            creds.add(r["key"][len(CRED_HASH_KEY_PREFIX):])
+    except sqlite3.Error as e:
+        diag.append(f"meta:history_scan_error:{_oneline(str(e), 80)}")
+    return frozenset(c for c in creds if c), diag
+
+
+def _load_registry_ro() -> tuple[frozenset, list[str]]:
+    """Loader for faces that have no live connection at the wiring point
+    (#2370 §5②: the registry never rides a write transaction)."""
+    conn = _connect_ro()
+    try:
+        return _load_credential_registry(conn)
+    finally:
+        conn.close()
+
+
+def _cred_history_record(conn: sqlite3.Connection, cred_sha256: str) -> None:
+    """One-key-one-row history append (#2365 §1: no single-key JSON array —
+    claim_token has no _begin_write, two concurrent claims would lose updates
+    in a read-modify-write). INSERT OR REPLACE is single-statement atomic
+    (form_b_pending_* precedent). The VALUE stays a scalar timestamp; the key
+    already carries the hash — a second readable copy would be a free leak."""
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+        (f"{CRED_HASH_KEY_PREFIX}{cred_sha256}", _now_iso()),
+    )
+
+
+def _backfill_credential_history(conn: sqlite3.Connection) -> int:
+    """Deploy-time ONE-SHOT idempotent backfill (#2367 §1 修法(a), #2368 §1):
+    credentials alive at deploy time exist only as participants.meta.token_hash
+    / pending nonce_sha256 current values — after the first rotation/reset the
+    plaintext would be unmaskable forever. Idempotent (INSERT OR REPLACE on a
+    deterministic key); runs once per boot inside init_db; corrupt rows are
+    skipped (loader同口径, never raises into startup)."""
+    n = 0
+    try:
+        for r in conn.execute("SELECT author, meta FROM participants").fetchall():
+            state, meta = _meta_obj(r["meta"])
+            if state in META_CORRUPT or state != META_DICT:
+                continue
+            h = meta.get("token_hash")
+            if isinstance(h, str) and h:
+                _cred_history_record(conn, h)
+                n += 1
+        for r in conn.execute(
+            "SELECT key, value FROM meta WHERE key LIKE 'form_b_pending_%'"
+        ).fetchall():
+            try:
+                obj = json.loads(r["value"])
+            except META_PARSE_ERRORS:
+                continue
+            h = obj.get("nonce_sha256") if isinstance(obj, dict) else None
+            if isinstance(h, str) and h:
+                _cred_history_record(conn, h)
+                n += 1
+    except sqlite3.Error:
+        return n
+    return n
+
+
 # --- v2.9.2 F6 / v2.9.3 票3 (thread #53): heartbeat-rhythm gate --------------
 # 票3 把三判据拆开计量（#53 决议对象）：
 #   S1 新鲜度 = 零 LLM 成本探针(/attention)或空闲轮询的最新时间；
@@ -1148,6 +1297,7 @@ def list_participants() -> str:
         ).fetchall()
     if not rows:
         return "No participants registered yet. Any author-carrying call registers."
+    registry, _mask_diag = _load_registry_ro()  # batch2 2.1: wake-error is a free-text echo (#2371 §1)
     lines = ["Participants:"]
     for r in rows:
         state, meta = _meta_obj(r["meta"])  # 空 BLOB 不塌缩 (#1622 P2)
@@ -1164,7 +1314,7 @@ def list_participants() -> str:
                   else "活跃" if idle_secs < DISPLAY_IDLE_MIN * 60 else "⚠️停摆")
         extra = f"  [meta_unparsable: state={state}]" if corrupt else ""
         if meta.get("last_wake_error"):
-            extra += f"  [wake-error: {meta['last_wake_error']}]"
+            extra += f"  [wake-error: {_mask_credential_text(str(meta['last_wake_error']), registry)}]"
         lines.append(
             f"  {r['author']} [{status}] heartbeat {_relative(last)} (first seen {_relative(r['first_seen'])}){extra}"
         )
@@ -1321,6 +1471,7 @@ def init_db() -> None:
         conn.executescript(_load_schema())
         _floor_exempt_shape(conn)  # v2.11.0 (#81 F4): pre-column dbs converge here
         conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+        _backfill_credential_history(conn)  # batch2 2.1: deploy-time idempotent backfill (#2367/#2368)
         row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
         if row is None:
             # legacy pre-meta database: identify & complete its shape, then stamp.
@@ -1656,12 +1807,20 @@ def _like_literal(term: str) -> str:
     return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _search_snippet(body: str, terms: list[str], cap: int) -> str:
+def _search_snippet(body: str, terms: list[str], cap: int,
+                    registry: frozenset = frozenset()) -> str:
     """Snippet built AROUND the first hit (v2 §7; A12/#40 boundary cases):
     earliest occurrence of any term; window centered ahead of it; ellipses
     when cut. Falls back to the head when no literal occurrence exists
     (folding differences like über/ÜBER can make MATCH hit without a plain
-    substring — the head is honest, a wrong window is not)."""
+    substring — the head is honest, a wrong window is not).
+
+    batch2 2.1 (#113 v9): `pos` is still computed on the ORIGINAL text
+    (#2358 §2: self-search keeps its center); the slice is taken from the
+    MASKED full text — masking is length-preserving, so start/window offsets
+    are unaffected and window edges can never leak a ≤31-hex plaintext
+    fragment (slice-then-mask hole closed). Registry loaded ONCE at the
+    search_comments entry and passed in — this stays a pure function."""
     body = str(body)
     pos = -1
     for t in terms:
@@ -1670,10 +1829,11 @@ def _search_snippet(body: str, terms: list[str], cap: int) -> str:
             pos = p
     if pos < 0:
         pos = 0
+    masked = _mask_credential_text(body, registry) if registry else body
     start = max(0, pos - cap // 4)
-    window = body[start:start + cap]
+    window = masked[start:start + cap]
     prefix = "…" if start > 0 else ""
-    suffix = "…" if start + cap < len(body) else ""
+    suffix = "…" if start + cap < len(masked) else ""
     return prefix + window + suffix
 
 
@@ -2109,6 +2269,7 @@ def claim_token(author: str) -> str:
             meta.update(token_hash=hashlib.sha256(token.encode()).hexdigest(),
                         token_acked=False, token_issued_at=_now_iso())
             _set_meta(conn, author, meta)
+            _cred_history_record(conn, meta["token_hash"])  # batch2 2.1: history append (#113 v9)
             _audit(conn, author, "token_issue", note="provisional (unacked)")
             return (f"Token issued for '{author}' (shown ONCE; {hint}):\n  {token}\n"
                     f"Governance calls (set_verdict / bump_revision / set_quorum) require it.")
@@ -2128,6 +2289,7 @@ def claim_token(author: str) -> str:
             meta.update(token_hash=hashlib.sha256(token.encode()).hexdigest(),
                         token_acked=False, token_issued_at=_now_iso())
             _set_meta(conn, author, meta)
+            _cred_history_record(conn, meta["token_hash"])  # batch2 2.1: history append
             _audit(conn, author, "token_reissue",
                    note="unacked free reissue (v2.1: claimant never persisted)")
             return (f"Token REISSUED for '{author}' — previous unacked token "
@@ -2152,6 +2314,7 @@ def claim_token(author: str) -> str:
                         token_acked=False, token_acked_at=None,
                         token_acked_via=None, token_issued_at=_now_iso())
             _set_meta(conn, author, meta)
+            _cred_history_record(conn, meta["token_hash"])  # batch2 2.1: history append
             _audit(conn, author, "token_reissue",
                    note=(f"{'auto' if via == 'auto' else 'acked'} reissue after "
                          f"window ({'auto-ack short lock' if via == 'auto' else 'governance inactivity'})"))
@@ -2470,6 +2633,9 @@ def create_thread(
     """
     if per_author_budget is not None and (per_author_budget < 1 or per_author_budget > 100):
         return "ERROR: per_author_budget must be in [1, 100]"
+    # batch2 2.1: registry loaded on its own query_only connection BEFORE the
+    # write txn (#2371 §2.2 — 装载提前 _begin_write 之前; never rides the write).
+    _registry, _mask_diag = _load_registry_ro()
     with db() as conn:
         _begin_write(conn)
         exempt = None
@@ -2560,7 +2726,7 @@ def create_thread(
             # writes meta.invited_at and leaves last_seen NULL for a new name.
             _invite(conn, q, tid)
     return (
-        f"Created thread #{tid}: {title}\n"
+        f"Created thread #{tid}: {_mask_credential_text(title, _registry)}\n"  # batch2 2.1: receipt title face
         f"Share this id with the other reviewers. New members: read get_protocol first."
     )
 
@@ -2608,6 +2774,9 @@ def post_comment(
     """
     if severity is not None and severity not in VALID_SEVERITIES:
         return f"ERROR: severity must be one of {VALID_SEVERITIES}, got {severity!r}"
+    # batch2 2.1: loaded BEFORE the write txn (#2371 §2.2); `file` is a
+    # caller-supplied free-text echoed in the receipt (负例 C face).
+    _registry, _mask_diag = _load_registry_ro()
     with db() as conn:
         _begin_write(conn)
         _touch(conn, author)
@@ -2693,7 +2862,7 @@ def post_comment(
         recompute_thread(conn, thread_id)
     loc = ""
     if file:
-        loc = f" at {file}" + (f":{line}" if line else "")
+        loc = f" at {_mask_credential_text(file, _registry)}" + (f":{line}" if line else "")
     sev = f" [{severity}]" if severity else ""
     free_tag = " (free floor comment — budget untouched, v2.11.0 #81 F4)" if floor_exempt_post else ""
     return f"Posted comment #{cid} in thread #{thread_id} by {author}{sev}{loc}.{free_tag}{stale_note}"
@@ -2805,6 +2974,7 @@ def list_threads(status: str | None = None) -> str:
     if status != "all" and status not in VALID_STATUSES:
         return f"ERROR: status must be one of {VALID_STATUSES} or 'all', got {status!r}"
     with db() as conn:
+        registry, _mask_diag = _load_credential_registry(conn)  # batch2 2.1: title face
         if status == "all":
             rows = conn.execute(
                 """SELECT t.id, t.title, t.status, t.created_at, t.quorum,
@@ -2833,7 +3003,7 @@ def list_threads(status: str | None = None) -> str:
     lines = ["Threads:"]
     for r in rows:
         flag = f"  ⚠ stale-object:{stale_by_id[r['id']]}" if r["id"] in stale_by_id else ""
-        lines.append(f"  #{r['id']} [{r['status']}] {r['title']}  ({r['n']} comments, {r['created_at']}){flag}")
+        lines.append(f"  #{r['id']} [{r['status']}] {_mask_credential_text(r['title'], registry)}  ({r['n']} comments, {r['created_at']}){flag}")
     return "\n".join(lines)
 
 
@@ -2849,6 +3019,9 @@ def get_thread(thread_id: int) -> str:
         structure, authors, severity, file:line, and status.
     """
     with db() as conn:
+        # batch2 2.1: registry loaded once at the face entry (title / note /
+        # gate note / context / file / body are all free-text echoes here).
+        registry, _mask_diag = _load_credential_registry(conn)
         t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
         if t is None:
             return f"ERROR: thread #{thread_id} does not exist"
@@ -2929,7 +3102,7 @@ def get_thread(thread_id: int) -> str:
                                       "set_quorum", "human_override"):
                     gate_events.append(ev)
     out = [
-        f"Thread #{t['id']}: {t['title']}  [{t['status']}]",
+        f"Thread #{t['id']}: {_mask_credential_text(t['title'], registry)}  [{t['status']}]",
         f"  created: {t['created_at']}   comments: {len(all_comments)}/{THREAD_CAP}",
     ]
     if t["quorum"]:
@@ -2946,7 +3119,7 @@ def get_thread(thread_id: int) -> str:
             if v is not None:
                 seg = f"    {n}: {v['verdict']} @ {v['updated_at']} [{liveness[n]}]"
                 if v["note"]:
-                    seg += (f"  note: {_oneline(str(v['note']), 160)}"
+                    seg += (f"  note: {_oneline(_mask_credential_text(str(v['note']), registry), 160)}"  # batch2 2.1: 先掩后截断 (#2371 §2.1)
                             f" [n={len(' '.join(str(v['note'] or '').split()))};"
                             f" full: configs/rb-notes.py {thread_id}]")
                 if trails.get(n):
@@ -2966,7 +3139,7 @@ def get_thread(thread_id: int) -> str:
                 rev = f" r{ev['revision']}" if ev["revision"] is not None else ""
                 parts.append(
                     f"{ev['created_at']} {ev['action']}{rev} by {ev['author']}"
-                    f" ({_oneline(str(ev['note'] or ''), 120)})")
+                    f" ({_oneline(_mask_credential_text(str(ev['note'] or ''), registry), 120)})")
             out.append("  gate: " + " · ".join(parts))
 
     by_parent: dict[int | None, list[sqlite3.Row]] = {}
@@ -2975,7 +3148,8 @@ def get_thread(thread_id: int) -> str:
 
     if t["context"]:
         out.append("  context:")
-        for line in str(t["context"]).splitlines():
+        masked_ctx = _mask_credential_text(str(t["context"]), registry)  # batch2 2.1: 先掩后切行 (负例 D)
+        for line in masked_ctx.splitlines():
             out.append(f"    {line}")
     out.append("")
 
@@ -2983,11 +3157,11 @@ def get_thread(thread_id: int) -> str:
         indent = "  " * depth
         loc = ""
         if comment["file"]:
-            loc = f" {comment['file']}" + (f":{comment['line']}" if comment["line"] else "")
+            loc = f" {_mask_credential_text(comment['file'], registry)}" + (f":{comment['line']}" if comment["line"] else "")
         sev = f" [{comment['severity']}]" if comment["severity"] else ""
         st = f" ({comment['status']})" if comment["status"] != "open" else ""
         out.append(f"{indent}- #{comment['id']} {comment['author']}{sev}{st}{loc}:")
-        for line in str(comment["body"]).splitlines():
+        for line in _mask_credential_text(str(comment["body"]), registry).splitlines():
             out.append(f"{indent}    {line}")
         for child in by_parent.get(comment["id"], []):
             render(child, depth + 1)
@@ -3468,6 +3642,7 @@ def request_form_b(
         }
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
                      (f"form_b_pending_{thread_id}", json.dumps(pending, ensure_ascii=False)))
+        _cred_history_record(conn, pending["nonce_sha256"])  # batch2 2.1: history append (#2368 §2)
         _audit(conn, author, "form_b_requested", thread_id=thread_id,
                note=f"names={clean}; nonce delivered user-side only (log + data/form_b_nonce.txt); ttl={FORM_B_TTL_S}s")
         # 用户侧交付面：服务器 stdout（→ server.log）+ 用户文件。绝不进返回体。
@@ -3575,8 +3750,12 @@ def register_meta(
                      (json.dumps(meta, ensure_ascii=False), author))
         _audit(conn, author, "register_meta",
                note=f"contract={contract}; entry={entry or ''} (consistency declaration, not gate truth)")
+        # batch2 2.1: `entry` is caller free-text echoed to the caller (#2373
+        # #20; the audit-note twin is masked at the read face — gate note point).
+        _reg2, _diag2 = _load_registry_ro()
+        masked_entry = _mask_credential_text(entry, _reg2) if entry else entry
         return (f"Meta registered for {author}: contract=({contract})"
-                + (f", entry={entry}" if entry else "")
+                + (f", entry={masked_entry}" if entry else "")
                 + ". This is a consistency declaration only — declarations that mismatch "
                   "it are audited (meta_mismatch), not rejected.")
 
@@ -4362,14 +4541,17 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
     header = "needs_attention: " + json.dumps(needs, ensure_ascii=False)
     if not rows:
         return f"{header}\nNo comments since {cutoff}."
+    registry, _mask_diag = _load_registry_ro()  # batch2 2.1: preview/file are free-text echoes
     lines = [header, f"Comments since {cutoff} ({len(rows)}):"]
     for r in rows:
         loc = ""
         if r["file"]:
-            loc = f" {r['file']}" + (f":{r['line']}" if r["line"] else "")
+            loc = f" {_mask_credential_text(r['file'], registry)}" + (f":{r['line']}" if r["line"] else "")
         sev = f" [{r['severity']}]" if r["severity"] else ""
         reply = f" (reply to #{r['parent_id']})" if r["parent_id"] else ""
-        body_preview = str(r["body"]).replace("\n", " ")
+        # batch2 2.1: mask FIRST, then flatten/truncate (#2370 §5①) — the mask
+        # is length-preserving, so the 157+... arithmetic is untouched.
+        body_preview = _mask_credential_text(str(r["body"]), registry).replace("\n", " ")
         if len(body_preview) > 160:
             body_preview = body_preview[:157] + "..."
         lines.append(
@@ -4552,6 +4734,10 @@ def search_comments(
             return payload("timeout", route, complete=False)
         conn.set_progress_handler(
             lambda: 1 if time.monotonic() >= deadline else 0, 500)
+        # batch2 2.1: registry loaded ONCE on the same query_only connection
+        # (#2365 §2 — never inside _search_snippet, called up to 150×/query);
+        # loader failure = empty set + diag, the face still answers ok.
+        registry, _mask_diag = _load_credential_registry(conn)
         base_sql = (
             f"SELECT c.id, c.thread_id, c.author, c.body, c.created_at,"
             f" th.title AS th_title, th.status AS th_status, {rank_sel}"
@@ -4580,16 +4766,16 @@ def search_comments(
             results.append({
                 "comment_id": r["id"],
                 "thread_id": r["thread_id"],
-                "thread_title": r["th_title"],
+                "thread_title": _mask_credential_text(r["th_title"] or "", registry),
                 "thread_status": r["th_status"],
                 "author": r["author"],
                 "timestamp": r["created_at"],
-                "snippet": _search_snippet(r["body"], terms, SEARCH_SNIPPET_CAP),
+                "snippet": _search_snippet(r["body"], terms, SEARCH_SNIPPET_CAP, registry),
                 "rank": r["rank"],
                 "is_self": bool(author and r["author"] == author),
                 "context": [
                     {"comment_id": n["id"], "author": n["author"],
-                     "snippet": _search_snippet(n["body"], terms, SEARCH_CONTEXT_CAP)}
+                     "snippet": _search_snippet(n["body"], terms, SEARCH_CONTEXT_CAP, registry)}
                     for n in ctx
                 ],
             })
@@ -4632,8 +4818,15 @@ def _lag_band(secs: float) -> str:
 _LAG_ORDER = {"当天内": 0, "3 天内": 1, "更久": 2}
 
 
-def _profile_numbers(conn: sqlite3.Connection, author: str) -> dict:
+def _profile_numbers(conn: sqlite3.Connection, author: str,
+                     registry: frozenset = frozenset()) -> dict:
     """v2.2 reliability profile — THE one aggregation (tool and board share it).
+
+    batch2 2.1: `registry` is passed by the reliability_profile face only;
+    the one free-text member (last_wake_error, written into a json.dumps
+    container below) is masked at the write point (#2376 §2 subassign族).
+    The board's _profile_brief path consumes ints only and passes no registry
+    (its wake-error face is the static tooltip, not an echo — #2371 §1).
 
     Derived-only: pure reads; callers pass a query_only connection (附录 F2)
     so even a buggy or hostile aggregation cannot write. Zero governance
@@ -4733,7 +4926,7 @@ def _profile_numbers(conn: sqlite3.Connection, author: str) -> dict:
                  "A1 ⚠️ 徽章即同一信号,画像不吞掉它"),
     }
     if wake_err:
-        participation["watcher_gate"]["last_wake_error"] = wake_err
+        participation["watcher_gate"]["last_wake_error"] = _mask_credential_text(wake_err, registry)
 
     # ---- judgment (endogenous ground truth — display only) ----
     # verdict_free and verdict carry the SAME judgment semantics (only the
@@ -4907,7 +5100,8 @@ def reliability_profile(author: str) -> str:
     """
     conn = _connect_ro()
     try:
-        data = _profile_numbers(conn, author)
+        registry, _mask_diag = _load_credential_registry(conn)  # batch2 2.1
+        data = _profile_numbers(conn, author, registry)
     finally:
         conn.close()
     return json.dumps(data, ensure_ascii=False, indent=1)
@@ -4916,6 +5110,7 @@ def reliability_profile(author: str) -> str:
 # --- read-only HTML board --------------------------------------------------
 def _board_html() -> str:
     with _connect() as conn:
+        registry, _mask_diag = _load_credential_registry(conn)  # batch2 2.1: titles/context/body/file face
         threads = conn.execute(
             """SELECT t.*, (SELECT COUNT(*) FROM comments c WHERE c.thread_id = t.id) AS n
                FROM threads t ORDER BY t.id DESC"""
@@ -4998,9 +5193,10 @@ def _board_html() -> str:
     ]
     for t in threads:
         aw = " ⏳" if t["id"] in awaiting_map else ""
+        m_title = _mask_credential_text(t["title"], registry)
         side.append(
-            f"<a href='#t{t['id']}' title='{escape(t['title'])}'>"
-            f"#{t['id']} {escape(t['title'])}"
+            f"<a href='#t{t['id']}' title='{escape(m_title)}'>"
+            f"#{t['id']} {escape(m_title)}"
             f"<span class='cnt st-{t['status']}'>{t['n']}·{t['status']}{aw}</span></a>"
         )
 
@@ -5050,7 +5246,7 @@ def _board_html() -> str:
             if aw else ""
         )
         parts.append(
-            f"<h2 id='t{t['id']}'>#{t['id']} {escape(t['title'])} "
+            f"<h2 id='t{t['id']}'>#{t['id']} {escape(_mask_credential_text(t['title'], registry))} "
             f"<span class='badge {t['status']}'>{t['status']}</span>{aw_html}</h2>"
         )
         parts.append(f"<div class='meta'>{t['n']} comment(s) · created {t['created_at']}</div>")
@@ -5059,7 +5255,7 @@ def _board_html() -> str:
             # synthetic cid 'ctx{id}' keeps sessionStorage keys collision-free
             parts.append(
                 f"<pre class='cbody' data-cid='ctx{t['id']}' "
-                f"data-len='{len(t['context'])}'>{escape(t['context'])}</pre>"
+                f"data-len='{len(t['context'])}'>{escape(_mask_credential_text(t['context'], registry))}</pre>"
             )
 
         comments = by_thread.get(t["id"], [])
@@ -5070,7 +5266,7 @@ def _board_html() -> str:
         def render(c: sqlite3.Row, depth: int) -> None:
             loc = ""
             if c["file"]:
-                loc = f" · <code>{escape(str(c['file']))}" + (
+                loc = f" · <code>{escape(_mask_credential_text(str(c['file']), registry))}" + (
                     f":{c['line']}" if c["line"] else ""
                 ) + "</code>"
             sev = (
@@ -5092,7 +5288,7 @@ def _board_html() -> str:
                 f"<div><b>#{c['id']} {escape(c['author'])}</b>{sev}{st}{loc} "
                 f"<span class='meta'>{c['created_at']}</span>"
                 f"<a class='plink meta' href='#c{c['id']}'>¶</a></div>"
-                f"<pre class='cbody' data-len='{blen}' data-cid='{c['id']}'>{escape(c['body'])}</pre></div>"
+                f"<pre class='cbody' data-len='{blen}' data-cid='{c['id']}'>{escape(_mask_credential_text(c['body'], registry))}</pre></div>"
             )
             for child in by_parent.get(c["id"], []):
                 render(child, depth + 1)
