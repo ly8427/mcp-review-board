@@ -406,7 +406,11 @@ def _load_credential_registry(conn: sqlite3.Connection) -> tuple[frozenset, list
                                                + deploy-time idempotent backfill)
     Loader contract (#2365 §2 / #2366 §2): a single bad row is SKIPPED with a
     diag entry — never raises into the read face; loader failure = empty set
-    + diag, callers answer status="ok"."""
+    + diag, callers answer status="ok".
+    Diag outlet (#2403 §3.1 判(b)): face-level call sites intentionally discard
+    diag (masking stays fail-open, zero per-face chatter); init_db audits a
+    non-empty diag once per boot (action=cred_mask_diag) so a corrupt-row
+    dropout of token_hash is observable until the human reset resolves it."""
     creds: set[str] = set()
     diag: list[str] = []
     try:
@@ -459,11 +463,15 @@ def _load_registry_ro() -> tuple[frozenset, list[str]]:
 def _cred_history_record(conn: sqlite3.Connection, cred_sha256: str) -> None:
     """One-key-one-row history append (#2365 §1: no single-key JSON array —
     claim_token has no _begin_write, two concurrent claims would lose updates
-    in a read-modify-write). INSERT OR REPLACE is single-statement atomic
-    (form_b_pending_* precedent). The VALUE stays a scalar timestamp; the key
-    already carries the hash — a second readable copy would be a free leak."""
+    in a read-modify-write). INSERT OR IGNORE is single-statement atomic
+    (form_b_pending_* precedent). VALUE is pinned to FIRST-SEEN/issuance time
+    (#2403 §3.2: REPLACE let the per-boot backfill rewrite alive credentials'
+    values to boot time — row-idempotent but not byte-idempotent; any future
+    credential-age/rotation reading would be wrong from the first restart).
+    The key already carries the hash — a second readable copy would be a free
+    leak."""
     conn.execute(
-        "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+        "INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)",
         (f"{CRED_HASH_KEY_PREFIX}{cred_sha256}", _now_iso()),
     )
 
@@ -472,8 +480,9 @@ def _backfill_credential_history(conn: sqlite3.Connection) -> int:
     """Deploy-time ONE-SHOT idempotent backfill (#2367 §1 修法(a), #2368 §1):
     credentials alive at deploy time exist only as participants.meta.token_hash
     / pending nonce_sha256 current values — after the first rotation/reset the
-    plaintext would be unmaskable forever. Idempotent (INSERT OR REPLACE on a
-    deterministic key); runs once per boot inside init_db; corrupt rows are
+    plaintext would be unmaskable forever. Idempotent (INSERT OR IGNORE on a
+    deterministic key — byte-idempotent: existing rows keep their first-seen
+    value, #2403 §3.2); runs once per boot inside init_db; corrupt rows are
     skipped (loader同口径, never raises into startup)."""
     n = 0
     try:
@@ -1472,6 +1481,10 @@ def init_db() -> None:
         _floor_exempt_shape(conn)  # v2.11.0 (#81 F4): pre-column dbs converge here
         conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
         _backfill_credential_history(conn)  # batch2 2.1: deploy-time idempotent backfill (#2367/#2368)
+        _boot_reg, _boot_diag = _load_credential_registry(conn)  # #2403 §3.1 判(b): diag gets one observable outlet
+        if _boot_diag:
+            _audit(conn, "system", "cred_mask_diag",
+                   note=f"entries={len(_boot_diag)} first={_oneline(';'.join(_boot_diag), 160)}")
         row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
         if row is None:
             # legacy pre-meta database: identify & complete its shape, then stamp.
