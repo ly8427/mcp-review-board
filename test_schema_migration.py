@@ -193,12 +193,21 @@ def main() -> None:
         # still misses FKs — M-A2 (column-level REFERENCES delta on one side)
         # kept a table_info-only f2 green, because foreign keys live in
         # PRAGMA foreign_key_list, not table_info. So compare per-table
-        # (name, type, notnull, dflt_value) tuples AND foreign_key_list rows
-        # across ALL tables, instead of hand-copying either DDL into a
+        # (name, type, notnull, dflt_value, pk) tuples AND foreign_key_list
+        # rows across ALL tables, instead of hand-copying either DDL into a
         # second textual source.
+        # Coverage contract (dsh #2425 §1, choice (a)): f2 covers exactly
+        # what the two PRAGMAs expose — NOT NULL, DEFAULT, FK, and (since
+        # the r[5] slot; live carrier: verdicts composite PK) PK. NOT
+        # covered, by PRAGMA-blindness, not by choice: UNIQUE, CHECK,
+        # COLLATE have no pragma face; today both sides carry identical
+        # CHECK text (verdicts.verdict), so parity holds — registered, not
+        # fixed. Choice (b) (normalized sqlite_master.sql text diff) would
+        # cover them but drags SQL-comment normalization (#2421 §7) from
+        # low-realism to mandatory; declined for now.
         tables = names(ta) | names(tb)
         shape = lambda cx, t: (  # noqa: E731
-            sorted((r[1], r[2], r[3], r[4])
+            sorted((r[1], r[2], r[3], r[4], r[5])
                    for r in cx.execute(f"PRAGMA table_info({t})")),
             sorted(map(tuple, cx.execute(f"PRAGMA foreign_key_list({t})")),
                    key=repr))
@@ -207,7 +216,7 @@ def main() -> None:
         # into the label so a red names what to fix (batch2 suite carries a
         # detail slot; here the label is the outlet). Label says "table_info
         # + FK rows": both halves are load-bearing, name them.
-        f2_label = "f2 schema.sql == embedded fallback (table_info + FK rows per table)"
+        f2_label = "f2 schema.sql == embedded fallback (table_info+pk + FK rows per table)"
         if differing:
             f2_label += f" — differing tables: {differing}"
         check(f2_label, not differing)
