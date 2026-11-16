@@ -188,7 +188,9 @@ def main() -> None:
         names = lambda cx: {r[0] for r in cx.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         check("f1 schema.sql == embedded fallback (table sets)", names(ta) == names(tb))
-        # f2 (dsh #2421 §5, extended by live mutation M-A2): column-level
+        # f2 (dsh #2421 §5, extended by live mutation M-A2; FK half already
+        # anticipated by dsh #2423 §4 — foreign_key_list, not a mutation
+        # find): column-level
         # parity. f1 only compares table NAME sets; PRAGMA table_info alone
         # still misses FKs — M-A2 (column-level REFERENCES delta on one side)
         # kept a table_info-only f2 green, because foreign keys live in
