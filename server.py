@@ -410,7 +410,16 @@ def _load_credential_registry(conn: sqlite3.Connection) -> tuple[frozenset, list
     Diag outlet (#2403 §3.1 判(b)): face-level call sites intentionally discard
     diag (masking stays fail-open, zero per-face chatter); init_db audits a
     non-empty diag once per boot (action=cred_mask_diag) so a corrupt-row
-    dropout of token_hash is observable until the human reset resolves it."""
+    dropout of token_hash is observable until the human reset resolves it.
+    "Observable" = DB-read only (#2407 §3.3): the audit row has NULL
+    thread_id and is therefore invisible in every MCP face (get_thread
+    filters WHERE thread_id=?); read it via SELECT ... FROM verdict_events
+    WHERE action='cred_mask_diag'. Precedents: f6_read_epoch_init,
+    search_disabled — same NULL-thread_id shape, no new face (version gate).
+    Known lazy coupling (#2407 §3.2): this row raises MAX(id) seen by a
+    _floor_wm_epoch computed on THIS boot of a legacy db (eff +1) — harmless,
+    the row's action never matches the bump_revision query; do not "fix".
+    """
     creds: set[str] = set()
     diag: list[str] = []
     try:
@@ -483,7 +492,9 @@ def _backfill_credential_history(conn: sqlite3.Connection) -> int:
     plaintext would be unmaskable forever. Idempotent (INSERT OR IGNORE on a
     deterministic key — byte-idempotent: existing rows keep their first-seen
     value, #2403 §3.2); runs once per boot inside init_db; corrupt rows are
-    skipped (loader同口径, never raises into startup)."""
+    skipped (loader同口径, never raises into startup).
+    Return n = credentials SEEN, not rows inserted (#2407 §3.4①: OR IGNORE
+    keeps counting duplicates); the sole caller (init_db) discards it."""
     n = 0
     try:
         for r in conn.execute("SELECT author, meta FROM participants").fetchall():
@@ -1481,7 +1492,7 @@ def init_db() -> None:
         _floor_exempt_shape(conn)  # v2.11.0 (#81 F4): pre-column dbs converge here
         conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
         _backfill_credential_history(conn)  # batch2 2.1: deploy-time idempotent backfill (#2367/#2368)
-        _boot_reg, _boot_diag = _load_credential_registry(conn)  # #2403 §3.1 判(b): diag gets one observable outlet
+        _, _boot_diag = _load_credential_registry(conn)  # #2403 §3.1 判(b): diag gets one DB-read outlet; reg unused (#2407 §3.4②)
         if _boot_diag:
             _audit(conn, "system", "cred_mask_diag",
                    note=f"entries={len(_boot_diag)} first={_oneline(';'.join(_boot_diag), 160)}")
