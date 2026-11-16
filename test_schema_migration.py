@@ -13,6 +13,7 @@ Covers:
 """
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -198,18 +199,27 @@ def main() -> None:
         # (name, type, notnull, dflt_value, pk) tuples AND projected
         # foreign_key_list columns across ALL tables, instead of hand-copying
         # either DDL into a second textual source.
-        # Coverage contract (dsh #2425 §1, choice (a)): f2 covers exactly
-        # what the PRAGMAs expose — NOT NULL, DEFAULT, FK (projected
-        # columns, see below), plus PK via the r[5] slot (live carrier:
-        # verdicts composite PK). NOT covered: UNIQUE — reachable via
-        # PRAGMA index_list origin='u', just not wired yet (dsh #2427
-        # §3.2: a pragma face exists, unlike CHECK/COLLATE; zero live
-        # carriers in schema.sql today); CHECK / COLLATE — no pragma
-        # face; today both sides carry identical CHECK text
-        # (verdicts.verdict), so parity holds — registered, not fixed.
-        # Choice (b) (normalized sqlite_master.sql text diff) would cover
-        # them but drags SQL-comment normalization (#2421 §7) from
-        # low-realism to mandatory; declined for now.
+        # Coverage contract (dsh #2425 §1 choice (a), extended per dsh
+        # #2430 §2): f2 covers what the column/FK PRAGMAs expose — NOT
+        # NULL, DEFAULT, FK (projected columns, see below), PK via the
+        # r[5] slot (live carrier: verdicts composite PK). f3 (below)
+        # wires PRAGMA index_list, covering indexes — origin='c' (live
+        # carrier: idx_comments_thread/parent/created, schema.sql:34-36)
+        # and origin='u' (UNIQUE; the #2427 §3.2 "not wired yet" tier is
+        # now wired) — projection (name, unique, origin, partial) drops
+        # seq (bookkeeping) and carries index_info column order. f4
+        # (below) covers AUTOINCREMENT as a comment-stripped per-table
+        # boolean (dsh #2430 §2.2 choice (a) — attribute presence only,
+        # NOT a normalized full-DDL text diff, so #2421 §7 SQL-comment
+        # normalization stays out; load-bearing: comments.id non-reuse
+        # underpins the delivery-watermark injectivity argument
+        # (server.py ~:4451) and the #944 to_v premise).
+        # NOT covered: CHECK / COLLATE — no pragma face; today both
+        # sides carry identical CHECK text (verdicts.verdict), so
+        # parity holds — registered, not fixed. Choice (b) (normalized
+        # sqlite_master.sql text diff) would cover them but drags
+        # SQL-comment normalization (#2421 §7) from low-realism to
+        # mandatory; declined for now.
         tables = names(ta) | names(tb)
         shape = lambda cx, t: (  # noqa: E731
             sorted((r[1], r[2], r[3], r[4], r[5])
@@ -235,6 +245,47 @@ def main() -> None:
         if differing:
             f2_label += f" — differing tables: {differing}"
         check(f2_label, not differing)
+        # f3 (dsh #2430 §2.1, exit (i)): index parity — one PRAGMA closes
+        # both open families: origin='c' (normal indexes; live carrier
+        # idx_comments_*, schema.sql:34-36) and origin='u' (UNIQUE — the
+        # #2427 §3.2 "not wired yet" tier, wired here). Projection
+        # (name, unique, origin, partial) drops seq (bookkeeping) and
+        # carries index_info column order; key=repr kept: expression-
+        # index names may be None.
+        idx_shape = lambda cx, t: sorted(  # noqa: E731
+            ((r[1], r[2], r[3], r[4],
+              tuple(i[2] for i in cx.execute(f"PRAGMA index_info({r[1]})")))
+             for r in cx.execute(f"PRAGMA index_list({t})")),
+            key=repr)
+        idx_diff = sorted(t for t in tables if idx_shape(ta, t) != idx_shape(tb, t))
+        f3_label = ("f3 schema.sql == embedded fallback "
+                    "(index_list+index_info per table)")
+        if idx_diff:
+            f3_label += f" — differing tables: {idx_diff}"
+        check(f3_label, not idx_diff)
+        # f4 (dsh #2430 §2.2, choice (a)): AUTOINCREMENT presence per
+        # table, read from sqlite_master.sql with SQL comments stripped —
+        # an attribute boolean, NOT a normalized full-DDL diff, so the
+        # #2421 §7 comment-normalization quagmire stays out. Load-bearing:
+        # comments.id non-reuse is the stated premise of the delivery
+        # watermark injectivity argument (server.py ~:4451) and of #944
+        # to_v. Known edge (theoretical, registered): the keyword inside
+        # a DDL string literal would false-positive — zero carriers today.
+        def ai_bool(cx, t):
+            row = cx.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (t,)).fetchone()
+            if row is None or row[0] is None:
+                return False  # internal tables (sqlite_sequence) carry no sql
+            s = re.sub(r"/\*.*?\*/", " ", row[0], flags=re.S)
+            s = re.sub(r"--[^\n]*", " ", s)
+            return "AUTOINCREMENT" in s.upper()
+        ai_diff = sorted(t for t in tables if ai_bool(ta, t) != ai_bool(tb, t))
+        f4_label = ("f4 schema.sql == embedded fallback "
+                    "(AUTOINCREMENT per table, comment-stripped boolean)")
+        if ai_diff:
+            f4_label += f" — differing tables: {ai_diff}"
+        check(f4_label, not ai_diff)
         ta.close(); tb.close()  # dsh #444: same WinError 32 shape as the v2.8 matrix had
 
         # g) v5 -> v6 (issue #3): id-cursor column added + backfill semantics.
