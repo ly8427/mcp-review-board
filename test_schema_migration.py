@@ -8,8 +8,11 @@ Covers:
   c) idempotent re-init -> same version, same board id
   d) db NEWER than the server -> loud refusal to start
   e) /attention exposes a STABLE board_id across server restarts (HTTP level)
-  f) schema.sql and the embedded _SCHEMA_FALLBACK create an IDENTICAL table
-     set — the manual-sync debt is guarded by a test, not by hope
+  f) schema.sql and the embedded _SCHEMA_FALLBACK create identical schemas —
+     f1 table sets, f2 columns/FK/PK, f3 indexes (index_list + index_xinfo),
+     f4 AUTOINCREMENT boolean; the full coverage contract (covered faces and
+     registered blind faces) lives in-suite in the f2 comment block — the
+     manual-sync debt is guarded by a test, not by hope
 """
 import json
 import os
@@ -207,19 +210,40 @@ def main() -> None:
         # carrier: idx_comments_thread/parent/created, schema.sql:34-36)
         # and origin='u' (UNIQUE; the #2427 §3.2 "not wired yet" tier is
         # now wired) — projection (name, unique, origin, partial) drops
-        # seq (bookkeeping) and carries index_info column order. f4
+        # seq (bookkeeping); index columns read via index_xinfo as ordered
+        # (name, desc, coll) tuples over key=1 rows (dsh #2433 §2 choice
+        # (a): desc/coll close the index-column COLLATE face). f4
         # (below) covers AUTOINCREMENT as a comment-stripped per-table
         # boolean (dsh #2430 §2.2 choice (a) — attribute presence only,
         # NOT a normalized full-DDL text diff, so #2421 §7 SQL-comment
         # normalization stays out; load-bearing: comments.id non-reuse
         # underpins the delivery-watermark injectivity argument
         # (server.py ~:4451) and the #944 to_v premise).
-        # NOT covered: CHECK / COLLATE — no pragma face; today both
-        # sides carry identical CHECK text (verdicts.verdict), so
-        # parity holds — registered, not fixed. Choice (b) (normalized
-        # sqlite_master.sql text diff) would cover them but drags
-        # SQL-comment normalization (#2421 §7) from low-realism to
-        # mandatory; declined for now.
+        # NOT covered / registered: CHECK — no pragma face (live carrier
+        # verdicts.verdict CHECK, identical on both sides today). COLLATE:
+        # the index-column face is wired via xinfo.coll (above); column-level
+        # COLLATE surfaces only through an index on that column, otherwise no
+        # pragma face — registered. partial is a 0/1 presence bit only — the
+        # WHERE predicate text is NOT compared (dsh #2433 §3 choice (b):
+        # wiring it needs a normalized sqlite_master diff, i.e. the #2421 §7
+        # cost; zero carriers today — schema.sql has no WHERE). Expression
+        # indexes project name=None, expression text not compared —
+        # registered. WITHOUT ROWID / STRICT: NOT fully blind, correcting
+        # dsh #2433 §4 (a static claim — measured M-S1): under either, the
+        # table_info notnull bit reads 1 (vs 0) on PK columns that are not
+        # a rowid alias and not already declared NOT NULL, so a one-side
+        # mutation there goes f2-red (live: participants.author, meta.key;
+        # M-S1 reproduced f2 — differing tables: ['participants']).
+        # Residual blind faces, registered: STRICT/WITHOUT ROWID on
+        # threads/comments/verdict_events (INTEGER PRIMARY KEY = rowid
+        # alias, no bit to flip) and on verdicts (composite PK columns
+        # already NOT NULL — measured all-green on a one-side STRICT, M-S2).
+        # WITHOUT ROWID additionally can't coexist with AUTOINCREMENT
+        # (SQLite rejects the combo), so comments/threads/verdict_events
+        # carry that incidental guard; verdicts has none. Choice (b)
+        # (normalized sqlite_master.sql text diff) would cover these and all
+        # remaining faces but drags SQL-comment normalization (#2421 §7)
+        # from low-realism to mandatory; declined for now.
         tables = names(ta) | names(tb)
         shape = lambda cx, t: (  # noqa: E731
             sorted((r[1], r[2], r[3], r[4], r[5])
@@ -245,21 +269,28 @@ def main() -> None:
         if differing:
             f2_label += f" — differing tables: {differing}"
         check(f2_label, not differing)
-        # f3 (dsh #2430 §2.1, exit (i)): index parity — one PRAGMA closes
-        # both open families: origin='c' (normal indexes; live carrier
-        # idx_comments_*, schema.sql:34-36) and origin='u' (UNIQUE — the
-        # #2427 §3.2 "not wired yet" tier, wired here). Projection
-        # (name, unique, origin, partial) drops seq (bookkeeping) and
-        # carries index_info column order; key=repr kept: expression-
-        # index names may be None.
+        # f3 (dsh #2430 §2.1, exit (i); xinfo upgrade per dsh #2433 §2
+        # choice (a)): index parity — one PRAGMA closes both open families:
+        # origin='c' (normal indexes; live carrier idx_comments_*,
+        # schema.sql:34-36) and origin='u' (UNIQUE — the #2427 §3.2
+        # "not wired yet" tier, wired here). Projection (name, unique,
+        # origin, partial) drops seq (bookkeeping); columns read via
+        # index_xinfo as ordered (name, desc, coll) tuples over key=1 rows
+        # — desc/coll close the index-column COLLATE/DESC faces (coll
+        # 'NOCASE' vs 'BINARY' projects differently), the auxiliary rowid
+        # entry (key=0) stays out, and the xinfo `key` column itself is
+        # not compared (auxiliary columns are not key face). partial is
+        # presence-only (contract above). key=repr kept: expression-index
+        # names may be None.
         idx_shape = lambda cx, t: sorted(  # noqa: E731
             ((r[1], r[2], r[3], r[4],
-              tuple(i[2] for i in cx.execute(f"PRAGMA index_info({r[1]})")))
+              tuple((i[2], i[3], i[4])
+                    for i in cx.execute(f"PRAGMA index_xinfo({r[1]})") if i[5]))
              for r in cx.execute(f"PRAGMA index_list({t})")),
             key=repr)
         idx_diff = sorted(t for t in tables if idx_shape(ta, t) != idx_shape(tb, t))
         f3_label = ("f3 schema.sql == embedded fallback "
-                    "(index_list+index_info per table)")
+                    "(index_list+index_xinfo per table)")
         if idx_diff:
             f3_label += f" — differing tables: {idx_diff}"
         check(f3_label, not idx_diff)
