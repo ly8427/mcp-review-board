@@ -132,8 +132,11 @@ def static_checks():
     # Whitespace-tolerant constraint match (#2416 §2a; opencode #2417 matrix
     # M2): literal "NOT NULL" was still bypassable via "NOT\n NULL" — NOT and
     # NULL are two tokens, any whitespace between them is legal SQL.
-    null_m = re.search(r"\bNOT\s+NULL\b", cm.group(1)) if cm else None
-    check("SA3b verdict_events.thread_id nullable (clause has no NOT\\s+NULL)",
+    # Case-insensitive (#2419 §4): lowercase "not null" with INTEGER still
+    # uppercase (locator-compatible) bypassed the case-sensitive match —
+    # live-repro'd; baseline stays green (live-repro'd).
+    null_m = re.search(r"\bNOT\s+NULL\b", cm.group(1), re.I) if cm else None
+    check("SA3b verdict_events.thread_id nullable (clause has no NOT\\s+NULL, re.I)",
           cm is not None and null_m is None,
           (f"constraint={null_m.group(0)!r}" if null_m else
            f"clause={cm.group(1)!r}" if cm else "thread_id clause not found")[:80])
@@ -143,8 +146,11 @@ def static_checks():
     # merged regex also survives a "FOREIGN  KEY" double-space. The locator
     # precondition keeps a failed SA3a from leaking a vacuous green here
     # (ddl "" trivially contains no FK text) — locator failure must be red.
-    fk_m = re.search(r"\b(?:FOREIGN\s+KEY|REFERENCES)\b", ddl)
-    check("SA3c verdict_events has no FOREIGN KEY / REFERENCES (either spelling)",
+    # Case-insensitive (#2419 §4): lowercase "references" bypassed the
+    # case-sensitive match (same family as SA3b) — live-repro'd; baseline
+    # stays green (live-repro'd).
+    fk_m = re.search(r"\b(?:FOREIGN\s+KEY|REFERENCES)\b", ddl, re.I)
+    check("SA3c verdict_events has no FOREIGN KEY / REFERENCES (either spelling, re.I)",
           m is not None and fk_m is None,
           f"constraint={fk_m.group(0)!r}" if fk_m else "no FK text in ddl")
     # Whitespace-tolerant (#2414 §3): exact-substring check fake-reds on PEP 604
@@ -160,9 +166,13 @@ def static_checks():
                 boot_calls.append(node)
     check("SA3e exactly one cred_mask_diag boot _audit call", len(boot_calls) == 1,
           str(len(boot_calls)))
-    for node in boot_calls:
-        check("SA3f boot audit passes no thread_id (row stays NULL)",
-              all(kw.arg != "thread_id" for kw in node.keywords))
+    # Out of the loop (dsh #2419 tail, #2416 §3 口径): constant count; the
+    # len==1 precondition keeps empty boot_calls from leaking a vacuous
+    # green (all() over nothing is True — #2418 §3 ML-hole family).
+    check("SA3f boot audit passes no thread_id (row stays NULL)",
+          len(boot_calls) == 1
+          and all(kw.arg != "thread_id" for kw in boot_calls[0].keywords),
+          f"n={len(boot_calls)}")
 
     # 计数锁口径：只打印不进断言（#2381 §3「23/24 不进断言」同族）
     n_defs = len(re.findall(r"(?m)^\s*(?:async )?def ", src))
