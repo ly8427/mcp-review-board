@@ -81,11 +81,13 @@ def static_checks():
 
     print("SA 静态三小项（dsh #2409 §3，函数域/行首锚/两段证据链）")
     # SA1 函数域：_cred_history_record 内 OR IGNORE=1、OR REPLACE=0
-    fn_src = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "_cred_history_record":
-            fn_src = ast.get_source_segment(src, node)
-    check("SA1a _cred_history_record located", fn_src is not None)
+    fns = [ast.get_source_segment(src, node) for node in ast.walk(tree)
+           if isinstance(node, ast.FunctionDef) and node.name == "_cred_history_record"]
+    fn_src = fns[-1] if fns else None
+    # last-wins alone would silently audit a shadowing duplicate def
+    # (#2414 §3 optional hardening) — report duplicates instead.
+    check("SA1a _cred_history_record located, exactly 1",
+          fn_src is not None and len(fns) == 1, f"n={len(fns)}")
     if fn_src:
         # 「INTO」锚钉在 SQL 语句上——docstring 散文里的同族字样不抬计数
         # （与 SA2 行首锚同病同治：判据本身要能防散文抬高, #2409 §5 ⚠ 同类）。
@@ -112,11 +114,23 @@ def static_checks():
     check("SA3a verdict_events DDL located", m is not None)
     if m:
         ddl = m.group(0)
-        check("SA3b verdict_events.thread_id nullable (no NOT NULL)",
-              re.search(r"thread_id\s+INTEGER(?!.*NOT NULL)", ddl) is not None, ddl[:80])
+        # Clause-scoped (#2414 §3): `(?!.*NOT NULL)` never crosses lines, so a
+        # reformatted "thread_id INTEGER\n      NOT NULL," stayed green — a real
+        # one-line bypass (live-repro'd). Scope the verdict to the column clause;
+        # do NOT flatten the DDL first (author TEXT NOT NULL on another clause
+        # would fake-red, #2414 §3 ⚠). The clause may legitimately be empty
+        # ("thread_id  INTEGER," = no NOT NULL = nullable = green): dsh #2414's
+        # literal bool(clause) term fake-reds today's shape (live-repro'd) and
+        # is intentionally dropped; regex failure (column gone) stays red.
+        cm = re.search(r"thread_id\s+INTEGER([^,]*)", ddl)
+        check("SA3b verdict_events.thread_id nullable (clause has no NOT NULL)",
+              cm is not None and "NOT NULL" not in cm.group(1),
+              (repr(cm.group(1)) if cm else "thread_id clause not found")[:80])
         check("SA3c verdict_events has no FOREIGN KEY", "FOREIGN KEY" not in ddl)
+    # Whitespace-tolerant (#2414 §3): exact-substring check fake-reds on PEP 604
+    # spacing variants (thread_id: int|None=None) — live-repro'd.
     check("SA3d _audit signature thread_id defaults to None",
-          "thread_id: int | None = None" in src)
+          re.search(r"thread_id:\s*int\s*\|\s*None\s*=\s*None", src) is not None)
     boot_calls = []
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
