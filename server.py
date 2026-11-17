@@ -2252,6 +2252,47 @@ def _audit_blocked_once(conn, thread_id: int, revision: int, reason: str,
     return False
 
 
+def _reissue_window_end(conn: sqlite3.Connection, author: str, meta: dict) -> dict:
+    """batch2 1.4 (dsh #2351 §1 single-source contract): THE reissue-window
+    arithmetic — the enforcement face (claim_token) and the read face
+    (_token_blocked_face) both call this and only this, so the window a user
+    is TOLD about can never diverge from the window actually enforced.
+
+    Bindings (carried verbatim into the PR doc):
+    1. hours judged ONLY by meta["token_acked_via"] == "auto" — never inferred
+       from a latch tier (read faces don't infer write-point knowledge).
+    2. no governance activity at all ⇒ window_end=None: that is "no window",
+       NOT "a window ending in the future"; never fall back to the ack time.
+    3. an unparsable last-activity stamp is EXPLICIT ("unparsable" +
+       reason=unparsable_last_activity), never a silently vanished segment.
+       Enforcement stays fail-closed on it (via _hours_since()==0.0 ⇒ locked).
+    4. acceptance is the equality read_end == enforce_end within one sampling
+       (fixtures: no activity / re-governance after ack / auto tier) —
+       symbol anchors only, line numbers forbidden on this chain (#2351 §1.4).
+
+    Returns {"hours": float, "window_end": None | "unparsable" | timestamp str,
+    "reason": str, "last": raw last-activity stamp or None}.
+    """
+    hours = (AUTO_ACK_REISSUE_HOURS if meta.get("token_acked_via") == "auto"
+             else REISSUE_AFTER_HOURS)
+    last = conn.execute(
+        "SELECT created_at FROM verdict_events WHERE author=?"
+        " AND action IN ('verdict','verdict_free','bump_revision','set_quorum')"
+        " ORDER BY id DESC LIMIT 1", (author,),
+    ).fetchone()
+    if last is None:
+        return {"hours": hours, "window_end": None,
+                "reason": "unlocked_no_governance_activity", "last": None}
+    raw = last["created_at"]
+    try:
+        end_dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S") + timedelta(hours=hours)
+        return {"hours": hours, "window_end": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "reason": "governance_inactivity", "last": raw}
+    except ValueError:
+        return {"hours": hours, "window_end": "unparsable",
+                "reason": "unparsable_last_activity", "last": raw}
+
+
 @mcp.tool
 def claim_token(author: str) -> str:
     """Issue (or reissue) your governance token — two-phase (v2.1; v2.3 two-tier acks).
@@ -2322,13 +2363,13 @@ def claim_token(author: str) -> str:
         # (governance use without proven persistence) gets the short lock;
         # only an EXPLICIT ack (persisted + read back) enjoys the full 24h.
         via = meta.get("token_acked_via", "explicit")
-        window_h = AUTO_ACK_REISSUE_HOURS if via == "auto" else REISSUE_AFTER_HOURS
-        last = conn.execute(
-            "SELECT created_at FROM verdict_events WHERE author=?"
-            " AND action IN ('verdict','verdict_free','bump_revision','set_quorum')"
-            " ORDER BY id DESC LIMIT 1", (author,),
-        ).fetchone()
-        if last is None or _hours_since(last["created_at"]) >= window_h:
+        # batch2 1.4 (dsh #2351 §1): window arithmetic is single-sourced in
+        # _reissue_window_end — this face and _token_blocked_face answer the
+        # same window from the same sampling. hours judgment = ONLY
+        # meta["token_acked_via"] == "auto". Unparsable last-activity stays
+        # fail-closed here (_hours_since()==0.0 ⇒ no reissue), same as before.
+        win = _reissue_window_end(conn, author, meta)
+        if win["window_end"] is None or _hours_since(win["last"]) >= win["hours"]:
             # v2.12.0 (1.1a): inside the THEN block — the lock-window reject at
             # the end of this function is the ELSE side, so anchoring on the last
             # textual ERROR would have produced dead code (#1183 §二.2).
@@ -2346,8 +2387,8 @@ def claim_token(author: str) -> str:
         return (
             f"ERROR: token for '{author}' is issued AND acknowledged via '{via}' "
             f"({'transient possession only — short lock' if via == 'auto' else 'durable possession'}). "
-            f"Reissue unlocks after {window_h:g}h without governance activity "
-            f"(last: {last['created_at']}); for an urgent human-authorized reset "
+            f"Reissue unlocks after {win['hours']:g}h without governance activity "
+            f"(last: {win['last']}); for an urgent human-authorized reset "
             f"use reset_token(human_override=True)."
         )
 
@@ -4100,7 +4141,8 @@ def _token_blocked_face(conn: sqlite3.Connection, author: str) -> dict:
     #1553 §三): "manual" — read back as stored (the tier is written at the
     latch write point where the cause is known; this face never infers one
     from since/revision), exit = human reset or the reissue window end
-    (auto-ack 1h / explicit 24h from ack); and "break_glass" — a corrupt
+    (auto-ack 1h / explicit 24h; anchor = last governance activity, single
+    source _reissue_window_end — batch2 1.4 #2351 §1); and "break_glass" — a corrupt
     row's home: its bytes are unreadable and must not be written (reset is
     the only authorized overwrite), so the state itself is the cause and the
     entry is derived from _meta_state exactly like the meta_unparsable face
@@ -4120,15 +4162,19 @@ def _token_blocked_face(conn: sqlite3.Connection, author: str) -> dict:
         return {}
     latch = meta.get("token_blocked") or {}
     window = ""
-    if meta and meta.get("token_acked") and meta.get("token_acked_at"):
-        hours = (AUTO_ACK_REISSUE_HOURS if meta.get("token_acked_via") == "auto"
-                 else REISSUE_AFTER_HOURS)
-        try:
-            ends = datetime.strptime(meta["token_acked_at"], "%Y-%m-%d %H:%M:%S") \
-                + timedelta(hours=hours)
-            window = f" | window_ends_at={ends.strftime('%Y-%m-%d %H:%M:%S')}"
-        except ValueError:
-            pass
+    if meta and meta.get("token_acked"):
+        # batch2 1.4 (dsh #2351 §1): same single-source window as claim_token —
+        # anchor = last governance activity, NEVER "from ack" (the old second
+        # clock answered a future window when governance had since occurred,
+        # and a fake one when there was no activity at all). Parse failure is
+        # an explicit sentinel, never a silently vanished segment.
+        win = _reissue_window_end(conn, author, meta)
+        if win["window_end"] is None:
+            window = " | window_ends_at=unlocked (no governance activity yet)"
+        elif win["window_end"] == "unparsable":
+            window = f" | window_ends_at=unparsable | window_diag={win['reason']}"
+        else:
+            window = f" | window_ends_at={win['window_end']}"
     return {
         # Pre-batch3 entries carry no tier field; the mismatch branch was their
         # only writer, so "manual" is the migration default (not an inference —
