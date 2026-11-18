@@ -312,6 +312,19 @@ def _relative(utc: str | None) -> str:
     return f"{int(secs // 86400)} 天前"
 
 
+def _epoch(utc: str | None) -> int:
+    """UTC timestamp string → epoch seconds (0 on unparsable). UI v2 sidebar:
+    client recency buckets compare against Date.now()/1000 — same UTC basis,
+    no timezone conversion (design rule)."""
+    if not utc:
+        return 0
+    try:
+        return int(datetime.strptime(utc, "%Y-%m-%d %H:%M:%S")
+                   .replace(tzinfo=timezone.utc).timestamp())
+    except ValueError:
+        return 0
+
+
 def _is_active(last_seen: str | None, now: datetime | None = None) -> bool:
     """The one shared activity predicate (claude #52: 单点口径). Stage 1 uses it
     for display; stage 3b wires it into every governance write path."""
@@ -5188,6 +5201,20 @@ def _board_html() -> str:
         by_thread: dict[int, list[sqlite3.Row]] = {}
         for c in conn.execute("SELECT * FROM comments ORDER BY created_at ASC").fetchall():
             by_thread.setdefault(c["thread_id"], []).append(c)
+        # UI v2 (用户指令 2026-11-18): sidebar index data — per-thread last
+        # activity/speaker + a global recent-comments feed. Same read-only
+        # display path, no writes (C3 by construction).
+        thread_last: dict[int, tuple[str, str]] = {}
+        for tid, cs in by_thread.items():
+            lc = cs[-1]  # comments collected ASC → last element is latest
+            thread_last[tid] = (lc["created_at"], lc["author"])
+        for t in threads:
+            thread_last.setdefault(t["id"], (t["created_at"], t["author"]))
+        recent = conn.execute(
+            """SELECT c.*, t.title AS t_title FROM comments c
+               JOIN threads t ON t.id = c.thread_id
+               ORDER BY c.created_at DESC, c.id DESC LIMIT 12"""
+        ).fetchall()
         participants = conn.execute(
             "SELECT author, last_seen, meta FROM participants ORDER BY last_seen DESC"
         ).fetchall()
@@ -5254,21 +5281,56 @@ def _board_html() -> str:
             f"<span class='p'>{mark} {escape(p['author'])} {_relative(last)}{err}{brief_html}</span>"
         )
 
-    # v2.12.2 (DEBT #17): sidebar thread index — same threads the main column
-    # renders, each entry a link to its per-thread anchor (#t{id}); titles
-    # escape()d, full text in title= since CSS truncates visually.
+    # UI v2 (用户指令 2026-11-18): sidebar rebuilt as a filterable index —
+    # search box (票号/标题/发言者), status chips, sort modes, a global
+    # recent-comments feed (answers "最新发言在哪个帖"), and recency-grouped
+    # thread rows carrying last-speaker + relative time. Filtering/sorting is
+    # client-side over data- attributes; filter state persists across the 20s
+    # auto-refresh via sessionStorage (same store the folder uses).
+    feed = []
+    for c in recent:
+        snip = " ".join(_mask_credential_text(c["body"] or "", registry).split())[:48]
+        ft = _mask_credential_text(c["t_title"] or "", registry)
+        feed.append(
+            f"<a class='frow' href='#c{c['id']}' title='#{c['thread_id']} {escape(ft)}'>"
+            f"<span class='ftime'>{_relative(c['created_at'])}</span>"
+            f"<span class='fwho'>{escape(c['author'])}</span>"
+            f"<span class='ftid'>#{c['thread_id']}</span>"
+            f"<span class='fsnip'>{escape(snip) or '(空)'}</span></a>"
+        )
     side = [
-        f"<div class='side-h'>Threads ({len(threads)})</div>",
+        "<div class='side-h'>Board Index</div>",
+        "<input id='q' type='search' placeholder='过滤：票号 / 标题 / 发言者' autocomplete='off'>",
+        "<div class='chips' id='stchips'>"
+        "<button class='chip on' data-st='all'>全部</button>"
+        "<button class='chip' data-st='open'>open</button>"
+        "<button class='chip' data-st='resolved'>resolved</button>"
+        "<button class='chip' data-st='wontfix'>wontfix</button></div>",
+        "<div class='chips' id='sortchips'>"
+        "<button class='chip on' data-sort='recent'>最近更新</button>"
+        "<button class='chip' data-sort='id'>票号</button>"
+        "<button class='chip' data-sort='n'>评论数</button></div>",
+        "<div class='side-h'>最新发言</div>",
+        "<div id='feed'>" + "".join(feed) + "</div>",
+        f"<div class='side-h' id='list-h'>Threads ({len(threads)})</div>",
         "<a href='#' onclick='scrollTo(0,0);return false'>▲ top</a>",
+        "<div id='tlist'>",
     ]
     for t in threads:
-        aw = " ⏳" if t["id"] in awaiting_map else ""
+        ts, spk = thread_last[t["id"]]
         m_title = _mask_credential_text(t["title"], registry)
+        spks = " ".join(sorted({c["author"] for c in by_thread.get(t["id"], [])}))
+        aw = " ⏳" if t["id"] in awaiting_map else ""
         side.append(
-            f"<a href='#t{t['id']}' title='{escape(m_title)}'>"
-            f"#{t['id']} {escape(m_title)}"
-            f"<span class='cnt st-{t['status']}'>{t['n']}·{t['status']}{aw}</span></a>"
+            f"<a class='trow' href='#t{t['id']}' data-id='{t['id']}' data-st='{t['status']}'"
+            f" data-last='{_epoch(ts)}' data-n='{t['n']}' data-spk='{escape(spks)}'"
+            f" title='{escape(m_title)}'>"
+            f"<span class='row1'><span class='dot st-{t['status']}'></span>"
+            f"<span class='tid'>#{t['id']}</span>"
+            f"<span class='ttl'>{escape(m_title)}</span></span>"
+            f"<span class='tmeta'>{escape(spk)} · {_relative(ts)} · {t['n']} 条{aw}</span></a>"
         )
+    side.append("</div>")
 
     parts = [
         "<!doctype html><html><head><meta charset='utf-8'>",
@@ -5277,7 +5339,7 @@ def _board_html() -> str:
         "html{color-scheme:light}",
         "body{font-family:system-ui,sans-serif;margin:0;color:#222;background:#fff}",
         "#layout{display:flex;max-width:1400px;margin:0 auto;padding:0 16px;gap:22px}",
-        "#sidebar{width:280px;flex-shrink:0;position:sticky;top:0;max-height:100vh;overflow-y:auto;padding:14px 0;font-size:.85rem}",
+        "#sidebar{width:320px;flex-shrink:0;position:sticky;top:0;max-height:100vh;overflow-y:auto;padding:12px 10px;font-size:.85rem;background:#f6f8fa;border-right:1px solid #e3e6ea;box-sizing:border-box}",
         "#main{flex:1;min-width:0;padding:24px 0}",
         "h1{font-size:1.4rem;margin:.5em 0} h2{font-size:1.1rem;margin-top:1.5em;border-bottom:1px solid #ddd;padding-bottom:4px;scroll-margin-top:12px}",
         ".meta{color:#888;font-size:.85rem} .badge{font-size:.75rem;padding:1px 6px;border-radius:3px;background:#eee;margin-left:6px}",
@@ -5286,11 +5348,25 @@ def _board_html() -> str:
         ".c{margin:8px 0;scroll-margin-top:12px}.reply{margin-left:24px;border-left:2px solid #eee;padding-left:12px}",
         ".p{margin-right:14px;font-size:.85rem} .await{background:#fff3cd;padding:1px 8px;border-radius:10px;font-size:.75rem}",
         "details{margin-top:2em} summary{cursor:pointer;color:#888;font-size:.85rem}",
-        "#sidebar .side-h{font-weight:600;margin:4px 0}",
+        "#sidebar .side-h{font-weight:600;margin:10px 0 4px}",
         "#sidebar a{display:block;padding:3px 6px;border-radius:4px;color:inherit;text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-        "#sidebar a:hover{background:#eef1f4}",
-        "#sidebar .cnt{color:#999;font-size:.75rem;margin-left:4px}",
-        "#sidebar .st-open{color:#b35900}#sidebar .st-resolved{color:#1a7f37}#sidebar .st-wontfix{color:#888}",
+        "#sidebar a:hover{background:#e9eef4}",
+        "#q{width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #cdd3da;border-radius:6px;font-size:.85rem;margin:2px 0 6px;background:#fff}",
+        ".chip{border:1px solid #cdd3da;background:#fff;border-radius:12px;padding:2px 10px;font-size:.75rem;cursor:pointer;margin:0 4px 4px 0;color:#555}",
+        ".chip.on{background:#2563eb;border-color:#2563eb;color:#fff}",
+        "#feed{border:1px solid #e3e6ea;border-radius:6px;background:#fff;padding:4px;margin:2px 0 4px;max-height:190px;overflow-y:auto}",
+        "#feed .frow{padding:3px 6px;font-size:.75rem;line-height:1.5}",
+        ".ftime{color:#8a919a;margin-right:6px}.fwho{font-weight:600;margin-right:6px;color:#1f2933}",
+        ".ftid{color:#2563eb;margin-right:6px;white-space:nowrap}.fsnip{color:#5f6b76}",
+        "#tlist .trow{padding:5px 7px}",
+        "#tlist .row1{display:flex;align-items:center;gap:4px;min-width:0}",
+        "#tlist .dot{flex-shrink:0;width:8px;height:8px;border-radius:50%;background:#999}",
+        "#tlist .dot.st-open{background:#e08600}#tlist .dot.st-resolved{background:#1a7f37}#tlist .dot.st-wontfix{background:#aaa}",
+        "#tlist .tid{flex-shrink:0;font-weight:600;color:#4b5563;font-variant-numeric:tabular-nums}",
+        "#tlist .ttl{flex:1;min-width:0}",
+        "#tlist .tmeta{display:block;color:#8a919a;font-size:.72rem;margin:1px 0 0 13px}",
+        "#tlist .grp{font-size:.7rem;color:#8a919a;font-weight:600;letter-spacing:.4px;margin:9px 0 2px;padding-left:7px}",
+        "#tlist .hide{display:none!important}",
         ".foldbtn{display:block;margin:-4px 0 8px;background:none;border:none;color:#1a7f37;cursor:pointer;font-size:.8rem;padding:2px 4px}",
         "pre.folded{max-height:9em;overflow:hidden}",
         # line-clamp cuts at whole-line boxes even with taller CJK fallback
@@ -5377,6 +5453,55 @@ def _board_html() -> str:
     # folded with an expand/collapse toggle; per-comment state persists across
     # the 20s auto-refresh via sessionStorage, and a #cN hash target always
     # expands so an anchor jump never lands on a hidden body.
+    parts.append(
+        "<script>(function(){"
+        "var rows=[].slice.call(document.querySelectorAll('#tlist .trow'));"
+        "var sess=null;try{sess=window.sessionStorage}catch(e){}"
+        "var q=document.getElementById('q'),list=document.getElementById('tlist'),"
+        "lh=document.getElementById('list-h');"
+        "var chips=[].slice.call(document.querySelectorAll('#stchips .chip')),"
+        "sorts=[].slice.call(document.querySelectorAll('#sortchips .chip'));"
+        "var st=(sess&&sess.getItem('rb-idx-st'))||'all',"
+        "sort=(sess&&sess.getItem('rb-idx-sort'))||'recent',"
+        "qv=(sess&&sess.getItem('rb-idx-q'))||'';"
+        "q.value=qv;"
+        "function setOn(arr,v,k){arr.forEach(function(b){b.classList.toggle('on',b.dataset[k]===v)})}"
+        "setOn(chips,st,'st');setOn(sorts,sort,'sort');"
+        "var GRP=[[3600,'1 小时内'],[86400,'24 小时内'],[259200,'3 天内'],[604800,'一周内'],[2592000,'一个月内'],[1e15,'更早']];"
+        "function render(){"
+        "var term=q.value.trim().toLowerCase(),now=Date.now()/1000;"
+        "var vis=rows.filter(function(r){"
+        "if(st!=='all'&&r.dataset.st!==st)return false;"
+        "if(term){var hay=(r.dataset.id+' '+r.dataset.spk+' '+r.textContent).toLowerCase();"
+        "if(hay.indexOf(term)<0)return false;}"
+        "return true;});"
+        "if(sort==='id')vis.sort(function(a,b){return +b.dataset.id-+a.dataset.id});"
+        "else if(sort==='n')vis.sort(function(a,b){return +b.dataset.n-+a.dataset.n});"
+        "else vis.sort(function(a,b){return +b.dataset.last-+a.dataset.last});"
+        "list.innerHTML='';"
+        "var lastG=null;"
+        "vis.forEach(function(r){"
+        "if(sort==='recent'){var d=now-(+r.dataset.last||0),g=GRP[GRP.length-1][1];"
+        "for(var i=0;i<GRP.length;i++){if(d<GRP[i][0]){g=GRP[i][1];break}}"
+        "if(g!==lastG){var h=document.createElement('div');h.className='grp';h.textContent=g;"
+        "list.appendChild(h);lastG=g;}}"
+        "list.appendChild(r);});"
+        "if(!vis.length){var e=document.createElement('div');e.className='grp';"
+        "e.textContent='（无匹配帖子）';list.appendChild(e);}"
+        "lh.textContent='Threads '+vis.length+'/'+rows.length;"
+        "}"
+        "q.oninput=function(){if(sess)sess.setItem('rb-idx-q',q.value);render();};"
+        "chips.forEach(function(b){b.onclick=function(){st=b.dataset.st;"
+        "if(sess)sess.setItem('rb-idx-st',st);setOn(chips,st,'st');render();};});"
+        "sorts.forEach(function(b){b.onclick=function(){sort=b.dataset.sort;"
+        "if(sess)sess.setItem('rb-idx-sort',sort);setOn(sorts,sort,'sort');render();};});"
+        "render();"
+        "if(qv&&sess&&sess.getItem('rb-idx-focus')==='1'){q.focus();"
+        "try{q.setSelectionRange(qv.length,qv.length)}catch(e){}}"
+        "q.onfocus=function(){if(sess)sess.setItem('rb-idx-focus','1')};"
+        "q.onblur=function(){if(sess)sess.setItem('rb-idx-focus','0')};"
+        "})();</script>"
+    )
     parts.append(
         "<script>(function(){"
         "var FOLD_AT=700,K='rb-fold-';"
