@@ -7,8 +7,8 @@
   B  派生集 − 表行集 == ∅（每个派生点一行）
   C  ∀行: (行 ∈ WIRED) ⟺ NEEDS_MASK(行)   NEEDS_MASK = sink≠none ∧ class∉EXEMPT
   D  class ∈ CLASS ∧ (sink ∈ SINK ∨ RESP_RE.fullmatch(sink))
-     D1 机械行（override_reason 为空）sink 逐字 == sink_for(...)；前置
-        qname ∈ 派生 qname 集（unknown_qname 红，#2461）；裸 "resp" 红（#2461）
+     D1 机械行（override_reason 为 None(is None)）sink 逐字 == sink_for(...)；
+        裸 "resp" 红（#2461）；unknown-qname 是全表灯（见 UQ，单源不双写）
      D2 override 行 sink 为 resp:* 形 → fullmatch 先于 split 解包（#2461）
         ∧ 解析式配对 kind == rootkinds[name]（#2504 §1）
   E  {行: sink=="none"} ⟺ SINK_NONE_LANDINGS（八穷尽落点的行粒度展开，15 行）
@@ -21,12 +21,15 @@
   F-H  {title} 标 identity ⇒ F 谓词红（#2392 夹具 H）
   receipt  claim_token 回执行 ∈ WIRED ⇒ 红（#2382 红夹具 F）
   none-wired  sink=none 行 ∈ WIRED ⇒ 红（负例 E）
-  living-example  _load_credential_registry 行保持机械行（override_reason 空
-      ∧ sink==sink_for）——显式断言，不指望 D1/D2（pi #2542 运行时坐实）
-  empty-reason  override 标记（sink≠机械）而 override_reason=="" ⇒ 红
-      （『override 行缺理由』单盏灯，pi #2552）
-  unknown-qname  表行 qname ∉ 派生集 ⇒ 红（#2461）
-  resp-names-24  len(resp_names)==24 反真空锁（#2461，写死区分塌空与改对）
+  living-example  _load_credential_registry 行保持机械行（override_reason
+      为 None(is None) ∧ sink==sink_for）——显式断言，不指望 D1/D2（pi #2542
+      运行时坐实）
+  empty-reason  override 行（override_reason 非 None）而 override_reason==""
+      ⇒ 红（纯列谓词，无 sink 条件——pi #2563 §3 (i)；判别格=合成
+      「"" ∧ sink==机械」dsh #2571 §3）
+  unknown-qname  全表灯：表行 qname ∉ 派生集 ⇒ 红（#2461；pi #2568 (a)，
+      单源=本灯，D1 分支内不双写——dsh #2571 §1 附）
+  resp-names-25  len(resp_names)==25 反真空锁（#2461 写死区分塌空与改对；24→25=1.2a preflight 合法新增）
 WIRED 接线清单（#2382 伪码）：机械 _mask_credential_text 直包（deriver wired
   字段）∪ occurrence 级补扫（子树含任一掩码器——_search_snippet 搜索面
   #2355 §3；IfExp 后置掩码如 register_meta masked_entry）。派生器本体零改动。
@@ -124,6 +127,10 @@ def f_violation(k, row):
 
 
 def main():
+    if "%d.%d.%d" % sys.version_info[:3] != mf.DECLARED_PYTHON:
+        print("  ❌ wrong interpreter: DECLARED 快照生成于", mf.DECLARED_PYTHON,
+              "，当前", "%d.%d.%d" % sys.version_info[:3], "— 指纹引号形态不保证稳定")
+        sys.exit(1)
     declared = mf.DECLARED
 
     print("B 表行集 == 派生全集（#2384 §3 / v9）")
@@ -148,12 +155,12 @@ def main():
         if not d_domain_ok(row):
             d_bad.append((q, fp[:40], row["class"], row["sink"]))
         if row["sink"] == "resp":
-            d1_bad.append((q, "bare resp", row["sink"]))          # #2461 裸 resp 红
+            d1_bad.append((q, "bare resp", row["sink"]))          # #2461 裸 resp 红（全表）
         mech = mf.sink_for(q, ROOTMAP, ROOTKINDS) if q in DERIVED_QNAMES else None
         if row["override_reason"] is None:
-            if q not in DERIVED_QNAMES:
-                d1_bad.append((q, "unknown_qname", fp[:40]))      # #2461 前置
-            elif mech is not None and row["sink"] != mech:
+            # unknown_qname 已上移为全表 UQ 灯（pi #2568 (a)——单源不双写，
+            # dsh #2571 §1 附：与裸 resp 兄弟子句对齐）
+            if mech is not None and row["sink"] != mech:
                 d1_bad.append((q, fp[:40], f"{row['sink']} != mech {mech}"))
         else:
             if mf.RESP_RE.fullmatch(row["sink"]):
@@ -162,7 +169,8 @@ def main():
                 if kind != ROOTKINDS.get(name):
                     d2_bad.append((q, fp[:40], row["sink"]))
     check("D1a 值域谓词全表成立", not d_bad, str(d_bad[:5]))
-    check("D1b 机械行逐字 == sink_for ∧ 无裸 resp ∧ 无 unknown_qname", not d1_bad, str(d1_bad[:5]))
+    check("D1b 机械行逐字 == sink_for ∧ 无裸 resp（unknown_qname 单源=UQ 全表灯）",
+          not d1_bad, str(d1_bad[:5]))
     check("D2 override resp:* 行文法 ∧ 解析式配对", not d2_bad, str(d2_bad[:5]))
 
     print("E sink=none 行集 ⟺ SINK_NONE_LANDINGS（#2382 §3）")
@@ -212,18 +220,28 @@ def main():
         check("LE2 活例行保持机械行（override_reason 空 ∧ sink==sink_for）",
               living["override_reason"] is None and living["sink"] == mech_living,
               f"{living['override_reason']!r} vs {mech_living!r}")
-    # empty-reason 灯（pi #2552）：sink≠机械 而 override_reason=="" ⇒ 红
-    er_bad = [k[0] for k, row in declared.items()
-              if row["override_reason"] == ""
-              and k in DERIVED_QNAMES
-              and row["sink"] != mf.sink_for(k[0], ROOTMAP, ROOTKINDS)]
-    check("ER override 标记行不得缺理由（"" 灯）", not er_bad, str(er_bad[:4]))
-    # unknown-qname 灯（#2461）
-    uq_bad = [k[0] for k in declared if k[0] not in DERIVED_QNAMES
-              and declared[k]["override_reason"] is None]
-    check("UQ unknown_qname 红（#2461）", not uq_bad, str(uq_bad[:4]))
+    # empty-reason 灯（pi #2552 原裁字面，#2563 §3 (i)：纯列谓词，无 sink 条件）
+    def er_lamp(k, row):
+        return row["override_reason"] == "" and k[0] in DERIVED_QNAMES
+    er_bad = [k[0] for k, row in declared.items() if er_lamp(k, row)]
+    check("ER override 行缺理由（\"\" 灯，纯列谓词）", not er_bad, str(er_bad[:4]))
+    # ERH 合成（dsh #2571 §3 判别格）："" ∧ sink==机械 ⇒ 灯亮——(i) 的唯一判别证据
+    # （机械值现算，表演进不破夹具；M1 只修 k[0] 时此灯 False，M2 (i) 时 True）
+    mech_le = mf.sink_for("_load_credential_registry", ROOTMAP, ROOTKINDS)
+    check("ERH 合成：override_reason=='' ∧ sink==机械 ⇒ 灯亮（(i) 判别格）",
+          er_lamp(("_load_credential_registry", "synthetic-er"),
+                  {"sink": mech_le, "class": "closed_domain", "override_reason": ""}))
+    # unknown-qname 全表灯（#2461；pi #2568 (a)：去 is None 子句——qname 合法性
+    # 与机械/override 分类正交；单源=本灯，D1 分支内不双写）
+    uq_bad = [k[0] for k in declared if k[0] not in DERIVED_QNAMES]
+    check("UQ unknown_qname 红（#2461，全表灯）", not uq_bad, str(uq_bad[:4]))
+    # UQ 合成（pi #2568）：ghost qname ∧ 非机械分类 ⇒ 灯亮（真表 0 ghost，B2 兜底）
+    def uq_lamp(k):
+        return k[0] not in DERIVED_QNAMES
+    check("UQH 合成：no_such_qname ⇒ 灯亮（pi #2568）",
+          uq_lamp(("no_such_qname", "synthetic-uq")))
     # resp-names 反真空锁（#2461，写死 24）
-    check("RN len(resp_names)==24 反真空", len(RESP_NAMES) == 24, str(len(RESP_NAMES)))
+    check("RN len(resp_names)==25 反真空（24+preflight 1.2a）", len(RESP_NAMES) == 25, str(len(RESP_NAMES)))
 
     print("SA 模块源静态（#2461 §4 验收 + dsh #2544 §3 三数）")
     mask_src = open(os.path.join(HERE, "mask_faces.py"), encoding="utf-8").read()
@@ -231,7 +249,7 @@ def main():
     check("SA2 模块源 sink=none == 5 处", mask_src.count("sink=none") == 5,
           str(mask_src.count("sink=none")))
     check("SA3 不可执行并句 SINK ∪ RESP_RE == 0（dsh #2544 §3）",
-          SRC.count("SINK ∪ RESP_RE") == 0)
+          mask_src.count("SINK ∪ RESP_RE") == 0)
 
     print(f"\n=== {len(PASS)} passed, {len(FAIL)} failed ===")
     if FAIL:

@@ -25,7 +25,8 @@
   D: p.class ∈ CLASS ∧ (p.sink ∈ SINK ∨ RESP_RE.fullmatch(p.sink))
      （v8 值域 fail-fast；resp:* 形 sink 按 RESP_RE 值域计——#2458 口径，
      dsh #2528 §4 (b)、#2533 §2 (ii)）——拆两句（#2451 §2）：
-     D1 机械行（override_reason 为空的行——None；与 override 行互斥且穷尽，
+     D1 机械行（override_reason 为 None 的行（`is None`，`""` 不是机械行，见下）；
+        与 override 行互斥且穷尽，
         由字段判定非自述——dsh #2541 §2①，pi #2542 收进本批；载荷 v4 #2461
         既有 override_reason: str|None）sink 逐字 ==
         sink_for(qname, rootmap, rootkinds)；override 行（override_reason 非 None，
@@ -326,7 +327,8 @@ def sink_for(qname: str, rootmap: dict, rootkinds: dict,
              override: str | None = None) -> str:
     """机械 sink：根=tool → resp:tool:<名>；根=route → resp:route:<名>；
     无根（stdout/模块路径）→ log（stdout 事实落点）。override 供语义行钉值。
-    机械分支（无 override）的返回值过 RESP_RE 文法或属闭集；override 分支
+    机械分支（`override` 为 None 或 `""`——`if override:` 参数真值，≠ D1 的列谓词
+    `is None`）的返回值过 RESP_RE 文法或属闭集；override 分支
     原样返回、不保证文法——语义权重在人工行与断言 D2。"""
     if override:
         return override
@@ -370,12 +372,14 @@ SINK_NONE_LANDINGS = frozenset({
     ('_read_epoch', 'const:F6_READ_EPOCH_CODE'),
     ('_search_fingerprint', 'name:body'),
     ('_search_fingerprint', 'name:cid'),
+    ('create_thread', 'call:hashlib.sha256(title.strip().encode()).hexdigest()'),
     ('main', "SEARCH_STATE['reason']"),
     ('main', "SEARCH_STATE['sqlite']"),
     ('main', 'const:DB_PATH'),
     ('main', 'const:HOST'),
     ('main', 'const:PORT'),
     ('request_form_b', 'call:hashlib.sha256(nonce.encode()).hexdigest()'),
+    ('request_form_b', 'call:hashlib.sha256(title.strip().encode()).hexdigest()'),
 })
 
 ISSUANCE_FACES = frozenset({
@@ -862,15 +866,29 @@ DECLARED = {
         "sink": 'resp:tool:confirm_form_b', "class": 'closed_domain', "override_reason": None},
     ('confirm_form_b', 'param:thread_id'): {
         "sink": 'resp:tool:confirm_form_b', "class": 'closed_domain', "override_reason": None},
+    ('create_thread', "call:','.join(('#%d' % r[0] for r in ids))"): {
+        "sink": 'resp:tool:create_thread', "class": 'closed_domain', "override_reason": None},
+    ('create_thread', 'call:conn.execute("SELECT COUNT(*) FROM threads WHERE status=\'open\' A'): {
+        "sink": 'resp:tool:create_thread', "class": 'closed_domain', "override_reason": None},
     ('create_thread', "call:conn.execute('INSERT INTO threads(title, context, author, quorum"): {
         "sink": 'resp:tool:create_thread', "class": 'closed_domain', "override_reason": None},
+    ('create_thread', 'call:hashlib.sha256(title.strip().encode()).hexdigest()'): {
+        "sink": 'none', "class": 'mask', "override_reason": '票7 2.2 新增：标题哈希存储面（meta 键+thread-less 审计注）不外显，掩码禁入（改哈希语义）——#2380 §2③ 同形判例随树登记'},  # 票7 2.2 新增：标题哈希存储面（meta 键+thread-less 审计注）不外显，掩码禁入（改哈希语义）——#2380 §2③ 同形判例随树登记
     ('create_thread', 'call:list(dict.fromkeys([author] + names))'): {
         "sink": 'resp:tool:create_thread', "class": 'closed_domain', "override_reason": None},
     ('create_thread', 'call:m.group(1)'): {
         "sink": 'resp:tool:create_thread', "class": 'closed_domain', "override_reason": None},
     ('create_thread', "call:obj_n.get('contract')"): {
         "sink": 'resp:tool:create_thread', "class": 'closed_domain', "override_reason": None},
+    ('create_thread', "call:pend.get('names')"): {
+        "sink": 'resp:tool:create_thread', "class": 'closed_domain', "override_reason": None},
+    ('create_thread', 'const:QUORUM_OPEN_CAP'): {
+        "sink": 'resp:tool:create_thread', "class": 'closed_domain', "override_reason": None},
     ('create_thread', 'const:THREADS_PER_DAY'): {
+        "sink": 'resp:tool:create_thread', "class": 'closed_domain', "override_reason": None},
+    ('create_thread', "lit:'initiate nonce already consumed'"): {
+        "sink": 'resp:tool:create_thread', "class": 'closed_domain', "override_reason": None},
+    ('create_thread', 'lit:True'): {
         "sink": 'resp:tool:create_thread', "class": 'closed_domain', "override_reason": None},
     ('create_thread', 'name:state_n'): {
         "sink": 'resp:tool:create_thread', "class": 'closed_domain', "override_reason": None},
@@ -884,13 +902,21 @@ DECLARED = {
         "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
     ('get_thread', 'call:_author_usage(conn, thread_id, a)'): {
         "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
+    ('get_thread', 'call:_ro_conn.execute("SELECT COUNT(*) FROM threads WHERE status=\'ope'): {
+        "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
     ('get_thread', "call:json.loads(t['quorum'])"): {
         "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
     ('get_thread', "call:len(' '.join(str(v['note'] or '').split()))"): {
         "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
     ('get_thread', 'call:len(all_comments)'): {
         "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
+    ('get_thread', 'call:len(tops)'): {
+        "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
     ('get_thread', 'call:masked_ctx.splitlines()'): {
+        "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
+    ('get_thread', 'call:max(1, -(-len(tops) // per_page))'): {
+        "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
+    ('get_thread', 'const:QUORUM_OPEN_CAP'): {
         "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
     ('get_thread', 'const:THREAD_CAP'): {
         "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
@@ -921,6 +947,10 @@ DECLARED = {
     ('get_thread', 'name:last_voted_rev'): {
         "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
     ('get_thread', 'name:liveness'): {
+        "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
+    ('get_thread', 'param:page'): {
+        "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
+    ('get_thread', 'param:per_page'): {
         "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
     ('get_thread', 'param:thread_id'): {
         "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
@@ -1007,6 +1037,8 @@ DECLARED = {
     ('list_comments_since', 'call:_token_blocked_face(conn, author)'): {
         "sink": 'resp:tool:list_comments_since', "class": 'closed_domain', "override_reason": None},
     ('list_comments_since', 'call:_token_invalid_tids(conn, author)'): {
+        "sink": 'resp:tool:list_comments_since', "class": 'closed_domain', "override_reason": None},
+    ('list_comments_since', 'call:_verdict_overdue(conn)'): {
         "sink": 'resp:tool:list_comments_since', "class": 'closed_domain', "override_reason": None},
     ('list_comments_since', 'call:conn.execute("SELECT COUNT(*) FROM threads WHERE status=\'open\'")'): {
         "sink": 'resp:tool:list_comments_since', "class": 'closed_domain', "override_reason": None},
@@ -1116,6 +1148,16 @@ DECLARED = {
         "sink": 'resp:tool:post_comment', "class": 'echo', "override_reason": None},  # ECHO_FACES 校验拒绝回显(#2393 §3②)
     ('post_comment', 'param:thread_id'): {
         "sink": 'resp:tool:post_comment', "class": 'closed_domain', "override_reason": None},
+    ('preflight', 'param:author'): {
+        "sink": 'resp:tool:preflight', "class": 'closed_domain', "override_reason": None},
+    ('preflight', "row['author']"): {
+        "sink": 'resp:tool:preflight', "class": 'closed_domain', "override_reason": None},
+    ('preflight', "row['last_delivered_id']"): {
+        "sink": 'resp:tool:preflight', "class": 'closed_domain', "override_reason": None},
+    ('preflight', "row['last_read']"): {
+        "sink": 'resp:tool:preflight', "class": 'closed_domain', "override_reason": None},
+    ('preflight', "row['last_seen']"): {
+        "sink": 'resp:tool:preflight', "class": 'closed_domain', "override_reason": None},
     ('recompute_thread', "call:' · '.join((f'{n} pass' for n in active))"): {
         "sink": 'resp:route:attention_probe', "class": 'closed_domain', "override_reason": None},
     ('recompute_thread', "call:'; '.join(missing)"): {
@@ -1172,11 +1214,15 @@ DECLARED = {
         "sink": 'resp:tool:request_form_b', "class": 'closed_domain', "override_reason": None},
     ('request_form_b', 'call:hashlib.sha256(nonce.encode()).hexdigest()'): {
         "sink": 'none', "class": 'issuance', "override_reason": 'E 穷尽落点(#2382 §3/#2380 §2③)'},  # form_b 唯一交付面 log∪file(#2379 §2.3)；绝不进返回体
+    ('request_form_b', 'call:hashlib.sha256(title.strip().encode()).hexdigest()'): {
+        "sink": 'none', "class": 'mask', "override_reason": '票7 2.2 新增：标题哈希存储面（meta 键+thread-less 审计注）不外显，掩码禁入（改哈希语义）——#2380 §2③ 同形判例随树登记'},  # 票7 2.2 新增：标题哈希存储面（meta 键+thread-less 审计注）不外显，掩码禁入（改哈希语义）——#2380 §2③ 同形判例随树登记
     ('request_form_b', 'comp:[n.strip() for n in names]'): {
         "sink": 'resp:tool:request_form_b', "class": 'echo', "override_reason": None},  # ECHO_FACES 校验拒绝回显(#2393 §3②)
     ('request_form_b', 'const:FORM_B_TTL_S'): {
         "sink": 'resp:tool:request_form_b', "class": 'closed_domain', "override_reason": None},
     ('request_form_b', 'param:author'): {
+        "sink": 'resp:tool:request_form_b', "class": 'closed_domain', "override_reason": None},
+    ('request_form_b', 'param:purpose'): {
         "sink": 'resp:tool:request_form_b', "class": 'closed_domain', "override_reason": None},
     ('request_form_b', 'param:thread_id'): {
         "sink": 'resp:tool:request_form_b', "class": 'closed_domain', "override_reason": None},
@@ -1303,3 +1349,7 @@ DECLARED = {
     ('set_verdict', "t['revision']"): {
         "sink": 'resp:tool:set_verdict', "class": 'closed_domain', "override_reason": None},
 }
+
+# 解释器卫兵：指纹=ast.unparse 截断，跨解释器版本的引号形态不保证稳定
+# （grok #2565 §2 / claude #2566 定性）——DECLARED 是一树×一解释器的快照收据。
+DECLARED_PYTHON = "3.12.3"
