@@ -2703,6 +2703,7 @@ def create_thread(
     author: str | None = None,
     quorum: list[str] | None = None,
     per_author_budget: int | None = None,
+    form_b_nonce: str | None = None,
 ) -> str:
     """Start a new review topic.
 
@@ -2762,6 +2763,34 @@ def create_thread(
                 idlist = ",".join("#%d" % r[0] for r in ids)
                 return (f"ERROR: open quorum threads = {open_q} (cap {QUORUM_OPEN_CAP}): "
                         f"{idlist}; resolve or conclude them first.")
+            # 票7 2.2: initiate nonce 消费——绑定 (创建者, 标题哈希, 名单) 三者全对
+            # 且未过期未消费才放行；不符即拒（fail-closed：建帖后无法补，#2349 §2）。
+            # 校验位置在任何邀请注册之前——被拒的建帖不得注册任何人（L1 门同款纪律）。
+            if form_b_nonce is not None:
+                th = hashlib.sha256(title.strip().encode()).hexdigest()[:16]
+                mrow = conn.execute("SELECT value FROM meta WHERE key=?",
+                                    (f"form_b_initiate_{th}",)).fetchone()
+                ok, why = False, "no initiate nonce for this title hash"
+                if mrow is not None:
+                    pend = json.loads(mrow[0])
+                    if pend.get("consumed"):
+                        why = "initiate nonce already consumed"
+                    elif pend.get("creator") != author:
+                        why = "initiate nonce creator mismatch"
+                    elif float(pend.get("expires_at", 0)) < datetime.now(timezone.utc).timestamp():
+                        why = "initiate nonce expired (TTL 24h)"
+                    elif not set(names) <= set(pend.get("names", [])):
+                        why = "quorum names not covered by the initiate nonce binding"
+                    else:
+                        ok = True
+                if not ok:
+                    return f"ERROR: form_b_nonce rejected: {why}"
+                pend["consumed"] = True
+                conn.execute("UPDATE meta SET value=? WHERE key=?",
+                             (json.dumps(pend, ensure_ascii=False),
+                              f"form_b_initiate_{th}"))
+                _audit(conn, author, "form_b_initiate_consumed",
+                       note=f"names={pend.get('names')}; title_hash={th}")
             # v2.9 L1 (thread #45): wake_infra declaration gate — BEFORE the
             # invitee auto-registration touches (a rejected thread must not
             # register anyone). v2.9.2 (#48 ②): the CREATOR is in the checked
@@ -3723,12 +3752,20 @@ def set_quorum(
 # --- v2.9.2 (#47 ①): form-b admission — user-side nonce ---------------------
 @mcp.tool
 def request_form_b(
-    thread_id: int,
+    thread_id: int | None,
     author: str,
     names: list[str],
     token: str | None = None,
+    purpose: str = "add",
+    title: str | None = None,
 ) -> str:
     """Creator-only: request (b)-form member admission for an OPEN thread.
+
+    票7 2.2 (pi #2349 §2): purpose="initiate" = 建帖前发起——thread_id 必须为
+    None、title 必填；nonce 绑 (标题哈希, quorum 名单, 发起者名)，由
+    create_thread(form_b_nonce=…) 在建帖时消费（绑定不符/TTL 过期即拒）。
+    「先建空帖再补 nonce」视同未过验收：initiate 模式带 thread_id 一律拒。
+    消费面 confirm_form_b/TTL 24h（add 模式）复用不动。
 
     The nonce is delivered USER-SIDE ONLY (server log + data/form_b_nonce.txt);
     it NEVER appears in any tool return or agent-visible context (dsh #492 1.1:
@@ -3743,8 +3780,59 @@ def request_form_b(
     not credentials.
     """
     import secrets as _secrets
+    if purpose not in ("add", "initiate"):
+        return f"ERROR: purpose must be 'add' or 'initiate', got {purpose!r}"
+    if purpose == "initiate" and thread_id is not None:
+        # 票7 2.2：「先建空帖再补 nonce」视同未过验收——initiate 只许建帖前发起。
+        return ("ERROR: initiate mode is pre-thread only (thread_id must be None; "
+                "creating a thread first and back-filling a nonce is a validation failure)")
+    if purpose == "add" and thread_id is None:
+        return "ERROR: add mode requires an existing thread (thread_id)"
+    if purpose == "initiate" and (not isinstance(title, str) or not title.strip()):
+        return "ERROR: initiate mode requires title (the nonce binds to the title hash)"
     with db() as conn:
         _begin_write(conn)
+        if purpose == "initiate":
+            # 票7 2.2：建帖前发起——nonce 绑 (标题哈希, quorum 名单, 发起者名)。
+            # 消费=create_thread(form_b_nonce=…) 建帖时校验；TTL 与 add 模式同。
+            _tok_err = _token_gate(conn, author, token, where="request_form_b")
+            if _tok_err:
+                return _tok_err
+            if not names or not all(isinstance(n, str) and n.strip() for n in names):
+                return "ERROR: names must be a non-empty list of strings"
+            _touch(conn, author)
+            clean = [n.strip() for n in names]
+            th = hashlib.sha256(title.strip().encode()).hexdigest()[:16]
+            nonce = _secrets.token_hex(16)
+            now = datetime.now(timezone.utc)
+            pending = {
+                "names": clean,
+                "creator": author,
+                "issued_at": _now_iso(),
+                "expires_at": (now.timestamp() + FORM_B_TTL_S),
+                "nonce_sha256": hashlib.sha256(nonce.encode()).hexdigest(),
+                "consumed": False,
+                "title_hash": th,
+                "purpose": "initiate",
+            }
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                         (f"form_b_initiate_{th}", json.dumps(pending, ensure_ascii=False)))
+            _cred_history_record(conn, pending["nonce_sha256"])
+            _audit(conn, author, "form_b_initiated",
+                   note=f"names={clean}; title_hash={th}; ttl={FORM_B_TTL_S}s; consumed-by=create_thread")
+            line = (f"[form_b] initiate (pre-thread) creator={author} names={clean} "
+                    f"title_hash={th} nonce={nonce} (expires {FORM_B_TTL_S // 3600}h; "
+                    f"user hands it to create_thread(form_b_nonce='…'))")
+            print(line, flush=True)
+            try:
+                p = DATA_DIR / "form_b_nonce.txt"
+                p.write_text(line + "\n", encoding="utf-8")
+            except OSError:
+                pass
+            return (f"form_b initiate nonce requested (pre-thread; names={clean}) — "
+                    f"delivered to the USER side only. Hand it to "
+                    f"create_thread(form_b_nonce='…') with the SAME title and names; "
+                    f"a thread created without consuming it cannot be back-filled.")
         t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
         if t is None:
             return f"ERROR: thread #{thread_id} does not exist"

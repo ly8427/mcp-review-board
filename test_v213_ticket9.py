@@ -173,11 +173,72 @@ def main():
     check("⑤h used 仍 21 ∧ 免费打标仍 1", used3 == 21 and flagged2 == 1,
           f"used={used3} flagged={flagged2}")
 
+    ticket9_initiate(srv, tmp, tid, db)
+
     print(f"\n=== {len(PASS)} passed, {len(FAIL)} failed ===")
     if FAIL:
         for name in FAIL:
             print("  FAIL:", name)
         sys.exit(1)
+
+
+
+
+def ticket9_initiate(srv, tmp, tid, db):
+    """票7 2.2 (pi #2349 §2)：nonce initiate——建帖前发起+建帖时消费。"""
+    print("\n=== ⑥ 2.2 nonce initiate ===")
+    import pathlib
+    srv.DATA_DIR = pathlib.Path(tmp)      # 用户侧交付文件重定向到测试目录（不污染活板 data/）
+    # 反例：initiate 带 thread_id（先建帖再补 nonce）→ 逐字拒
+    r = srv.request_form_b(thread_id=tid, author="anna", names=["anna", "brin"],
+                           token=TOK["anna"], purpose="initiate", title="x")
+    check("⑥a 先建后补逐字拒", r.startswith("ERROR: initiate mode is pre-thread only"), r[:130])
+    # 正路：建帖前发起（绑定 标题哈希+名单+发起者）
+    r = srv.request_form_b(thread_id=None, author="anna", names=["anna", "brin", "cyr"],
+                           token=TOK["anna"], purpose="initiate", title="ticket9-initiate")
+    check("⑥b initiate 发起放行", r.startswith("form_b initiate nonce requested"), r[:130])
+    nonce_file = pathlib.Path(tmp) / "form_b_nonce.txt"
+    m = re.search(r"nonce=([0-9a-f]{32})", nonce_file.read_text(encoding="utf-8"))
+    check("⑥c nonce 用户侧文件可取", m is not None)
+    nonce = m.group(1) if m else "0" * 32
+    # 绑定不符：标题不对 → 拒（且不消费）
+    r = srv.create_thread(title="ticket9-WRONG", author="anna",
+                          quorum=["anna", "brin", "cyr"], context=fx.wi("anna", "brin", "cyr"),
+                          form_b_nonce=nonce)
+    check("⑥d 标题哈希不符拒收", r.startswith("ERROR: form_b_nonce rejected"), r[:130])
+    # 名单不符：quorum 超出绑定名单 → 拒
+    r = srv.create_thread(title="ticket9-initiate", author="anna",
+                          quorum=["anna", "brin", "cyr", "dsh"], context=fx.wi("anna", "brin", "cyr"),
+                          form_b_nonce=nonce)
+    check("⑥e 名单超出绑定拒收", r.startswith("ERROR: form_b_nonce rejected: quorum names"), r[:130])
+    # 正路消费：同标题同名单建帖 → 放行且消费
+    r = srv.create_thread(title="ticket9-initiate", author="anna",
+                          quorum=["anna", "brin", "cyr"], context=fx.wi("anna", "brin", "cyr"),
+                          form_b_nonce=nonce)
+    check("⑥f 绑定全对 → 建帖放行", r.startswith("Created thread"), r[:130])
+    tid2 = int(re.search(r"#(\d+)", r).group(1))
+    # 复用：已消费的 nonce 二次建帖 → 拒
+    r = srv.create_thread(title="ticket9-initiate", author="anna",
+                          quorum=["anna", "brin", "cyr"], context=fx.wi("anna", "brin", "cyr"),
+                          form_b_nonce=nonce)
+    check("⑥g 已消费复用拒收", r.startswith("ERROR: form_b_nonce rejected: initiate nonce already consumed"), r[:130])
+    # TTL：直接把 expires_at 改到过去 → 拒
+    r = srv.request_form_b(thread_id=None, author="anna", names=["anna", "brin", "cyr"],
+                           token=TOK["anna"], purpose="initiate", title="ticket9-expired")
+    m2 = re.search(r"nonce=([0-9a-f]{32})", nonce_file.read_text(encoding="utf-8"))
+    c = sqlite3.connect(db, timeout=10)
+    import json as _json
+    th = __import__("hashlib").sha256("ticket9-expired".encode()).hexdigest()[:16]
+    row = c.execute("SELECT value FROM meta WHERE key=?", (f"form_b_initiate_{th}",)).fetchone()[0]
+    pend = _json.loads(row)
+    pend["expires_at"] = 0
+    c.execute("UPDATE meta SET value=? WHERE key=?", (_json.dumps(pend), f"form_b_initiate_{th}"))
+    c.commit()
+    c.close()
+    r = srv.create_thread(title="ticket9-expired", author="anna",
+                          quorum=["anna", "brin", "cyr"], context=fx.wi("anna", "brin", "cyr"),
+                          form_b_nonce=m2.group(1))
+    check("⑥h TTL 过期拒收", r.startswith("ERROR: form_b_nonce rejected: initiate nonce expired"), r[:130])
 
 
 if __name__ == "__main__":
