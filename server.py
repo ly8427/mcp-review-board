@@ -2943,7 +2943,7 @@ def post_comment(
         loc = f" at {_mask_credential_text(file, _registry)}" + (f":{line}" if line else "")
     sev = f" [{severity}]" if severity else ""
     free_tag = " (free floor comment — budget untouched, v2.11.0 #81 F4)" if floor_exempt_post else ""
-    return f"Posted comment #{cid} in thread #{thread_id} by {author}{sev}{loc}.{free_tag}{stale_note}"
+    return f"Posted comment #{cid} in thread #{thread_id} by {author}{sev}{loc}.{free_tag}{_mask_credential_text(stale_note, _registry)}"  # batch2 2.1: stale receipt note face (F-ratchet, declaration table)
 
 
 @mcp.tool
@@ -3034,7 +3034,7 @@ def reply_comment(comment_id: int, author: str, body: str) -> str:
         # can be the last thing the discussion floor was waiting for.
         recompute_thread(conn, row["thread_id"])
     free_tag = " (free floor comment — budget untouched, v2.11.0 #81 F4)" if floor_exempt_post else ""
-    return f"Posted reply #{cid} to comment #{comment_id} by {author}.{free_tag}{stale_note}"
+    return f"Posted reply #{cid} to comment #{comment_id} by {author}.{free_tag}{_mask_credential_text(stale_note, _registry)}"  # batch2 2.1: stale receipt note face (F-ratchet, declaration table)
 
 
 @mcp.tool
