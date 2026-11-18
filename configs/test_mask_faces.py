@@ -217,7 +217,7 @@ def main():
     check("LE 活例行存在", living is not None, str(living_key[:60]))
     if living:
         mech_living = mf.sink_for(living_key[0], ROOTMAP, ROOTKINDS)
-        check("LE2 活例行保持机械行（override_reason 空 ∧ sink==sink_for）",
+        check("LE2 活例行保持机械行（override_reason 为 None(is None) ∧ sink==sink_for）",
               living["override_reason"] is None and living["sink"] == mech_living,
               f"{living['override_reason']!r} vs {mech_living!r}")
     # empty-reason 灯（pi #2552 原裁字面，#2563 §3 (i)：纯列谓词，无 sink 条件）
