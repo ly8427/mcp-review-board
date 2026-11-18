@@ -232,17 +232,25 @@ def main():
     check("ERH 合成：override_reason=='' ∧ sink==机械 ⇒ 灯亮（(i) 判别格）",
           er_lamp(("_load_credential_registry", "synthetic-er"),
                   {"sink": mech_le, "class": "closed_domain", "override_reason": ""}))
-    # unknown-qname 全表灯（#2461；pi #2568 (a)）——pi #2581 §3：uq_lamp 上移
-    # 真灯之前、真灯改调 uq_lamp（合成灯驱动生产谓词，与 ER/ERH 同形——否则
-    # (ii) 形态回归不可观测，dsh #2578 §3 覆盖缺口）
-    def uq_lamp(k):
+    # unknown-qname 全表灯（#2461；pi #2568 (a)）——pi #2592 修法升级：
+    # uq_lamp 行参数化 + uq_lamp_all 驱动真灯 + 探针喂单行合成表（判别格
+    # override_reason 非 None——None 格 M1 不判别）；探针驱动推导装配本体，
+    # M1 (ii)入灯 ⇒ 空 ⇒ 红、M2 (ii)入推导 ⇒ 空 ⇒ 红，双落法可观测。
+    def uq_lamp(k, row):
         return k[0] not in DERIVED_QNAMES
-    uq_bad = [k[0] for k in declared if uq_lamp(k)]
+
+    def uq_lamp_all(rows):
+        return [k[0] for k, row in rows.items() if uq_lamp(k, row)]
+
+    uq_bad = uq_lamp_all(declared)
     check("UQ unknown_qname 红（#2461，全表灯）", not uq_bad, str(uq_bad[:4]))
-    # UQ 合成（pi #2568）：ghost qname ⇒ 灯亮（真表 0 ghost，B2 兜底）
-    check("UQH 合成：no_such_qname ⇒ 灯亮（pi #2568）",
-          uq_lamp(("no_such_qname", "synthetic-uq")))
-    # resp-names 反真空锁（#2461，写死 24）
+    # UQH 合成（pi #2592 升级）：单行合成表走同一装配本体
+    synth_table = {("no_such_qname", "synthetic-uq"):
+                   {"sink": "log", "class": "closed_domain",
+                    "override_reason": "semantic"}}
+    check("UQH 合成：no_such_qname 单行合成表 ⇒ 灯亮（pi #2592）",
+          uq_lamp_all(synth_table) == ["no_such_qname"])
+    # resp-names 反真空锁（#2461，写死 25）
     check("RN len(resp_names)==25 反真空（24+preflight 1.2a）", len(RESP_NAMES) == 25, str(len(RESP_NAMES)))
 
     print("SA 模块源静态（#2461 §4 验收 + dsh #2544 §3 三数）")
