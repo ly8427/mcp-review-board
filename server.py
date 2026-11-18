@@ -3042,6 +3042,9 @@ def reply_comment(comment_id: int, author: str, body: str) -> str:
 
     Returns: the new reply comment id.
     """
+    # batch2 2.1: registry loaded BEFORE the write txn (#2371 §2.2 装载提前) —
+    # the stale receipt note face is masked at assembly (declaration table row).
+    _registry, _mask_diag = _load_registry_ro()
     with db() as conn:
         _begin_write(conn)
         _touch(conn, author)
@@ -3121,6 +3124,31 @@ def reply_comment(comment_id: int, author: str, body: str) -> str:
 
 
 @mcp.tool
+def preflight(author: str) -> str:
+    """1.2a (#86 残件, 票5 绑定): READ-ONLY eligibility preflight — the three
+    columns a watcher needs (last_seen / last_read / last_delivered_id) with
+    ZERO write side effects: query-only connection, no _touch, no cursor
+    advance (C3 by construction). Acceptance = participants.meta byte-identical
+    before/after the call.
+
+    Args:
+        author: the member to query (self-check before a governance action).
+
+    Returns: the three columns verbatim, or an explicit not-registered error.
+    """
+    with _connect_ro() as conn:
+        row = conn.execute(
+            "SELECT author, last_seen, last_read, last_delivered_id"
+            " FROM participants WHERE author=?", (author,),
+        ).fetchone()
+    if row is None:
+        return f"ERROR: participant {author!r} not registered"
+    return (f"preflight {row['author']}: last_seen={row['last_seen']!r}"
+            f" last_read={row['last_read']!r}"
+            f" last_delivered_id={row['last_delivered_id']!r}")
+
+
+@mcp.tool
 def list_threads(status: str | None = None) -> str:
     """List review threads.
 
@@ -3169,14 +3197,21 @@ def list_threads(status: str | None = None) -> str:
 
 
 @mcp.tool
-def get_thread(thread_id: int) -> str:
+def get_thread(thread_id: int, page: int | None = None, per_page: int = 20) -> str:
     """Get a whole thread: its metadata plus the full comment tree (replies
     shown nested under their parent).
 
+    1.2c (#86 残件, #1049 §四②): optional pagination over TOP-LEVEL comments —
+    page=None (default) renders everything exactly as before (watcher/SDK
+    read face unchanged); page=N renders the Nth window of top-level comments
+    (replies stay attached to their parent), with a `page: p/P` marker line.
+
     Args:
         thread_id: the thread to read.
+        page: optional 1-based page over top-level comments (None = all).
+        per_page: top-level comments per page (1..100, default 20).
 
-    Returns: a formatted view of the thread and all comments with their reply
+    Returns: a formatted view of the thread and comments with their reply
         structure, authors, severity, file:line, and status.
     """
     with db() as conn:
@@ -3333,7 +3368,22 @@ def get_thread(thread_id: int) -> str:
         for child in by_parent.get(comment["id"], []):
             render(child, depth + 1)
 
-    for top in by_parent.get(None, []):
+    # 1.2c (#86 残件): optional top-level pagination — page=None renders all
+    # (default unchanged); page=N slices the TOP-LEVEL parent list (replies
+    # stay attached to their parent, never orphaned by a page boundary).
+    tops = by_parent.get(None, [])
+    if page is not None:
+        if page < 1:
+            return "ERROR: page must be >= 1 (page=None renders everything)"
+        per_page = max(1, min(int(per_page), 100))
+        total_pages = max(1, -(-len(tops) // per_page))
+        if page > total_pages:
+            return (f"ERROR: page {page} out of range "
+                    f"(total_pages={total_pages}, top-level={len(tops)}, per_page={per_page})")
+        tops = tops[(page - 1) * per_page: page * per_page]
+        out.append(f"  page: {page}/{total_pages} (top-level; per_page={per_page};"
+                   f" page=None for all)")
+    for top in tops:
         render(top, 0)
 
     if not all_comments:
