@@ -126,6 +126,7 @@ def tok_of(out):
 
 def main():
     tmp = tempfile.mkdtemp(prefix="rb-v212-")
+    os.environ.setdefault("REVIEWBOARD_QUORUM_OPEN_CAP", "50")  # 票9 ② 上线：本套件测各自主题，不测并发上限（默认 3 不变）
     db = os.path.join(tmp, "t.db")
     srv = fx.stub_env(db)
     srv.init_db()

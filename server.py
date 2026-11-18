@@ -2768,11 +2768,11 @@ def create_thread(
             # 校验位置在任何邀请注册之前——被拒的建帖不得注册任何人（L1 门同款纪律）。
             if form_b_nonce is not None:
                 th = hashlib.sha256(title.strip().encode()).hexdigest()[:16]
-                mrow = conn.execute("SELECT value FROM meta WHERE key=?",
-                                    (f"form_b_initiate_{th}",)).fetchone()
+                marker_row = conn.execute("SELECT value FROM meta WHERE key=?",
+                                          (f"form_b_initiate_{th}",)).fetchone()
                 ok, why = False, "no initiate nonce for this title hash"
-                if mrow is not None:
-                    pend = json.loads(mrow[0])
+                if marker_row is not None:
+                    pend = json.loads(marker_row[0])
                     if pend.get("consumed"):
                         why = "initiate nonce already consumed"
                     elif pend.get("creator") != author:
@@ -4785,6 +4785,7 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
             awaiting = "not_implemented"
             blocked_verdict = []
             ti_tids, due_face, tb_face = [], [], {}
+            verdict_overdue = []          # 票9 ③：author-less 轮询同字段在场（空数组）
     needs = {
         "new_comments": len(rows),
         "mentions_me": mentions,
