@@ -135,7 +135,8 @@ CREATE TABLE IF NOT EXISTS comments (
     severity   TEXT,
     status     TEXT    NOT NULL DEFAULT 'open',
     created_at TEXT    NOT NULL DEFAULT (datetime('now')),
-    floor_exempt INTEGER NOT NULL DEFAULT 0
+    floor_exempt INTEGER NOT NULL DEFAULT 0,
+    summary_free INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments(thread_id);
 CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments(parent_id);
@@ -190,6 +191,10 @@ PORT = int(os.environ.get("REVIEWBOARD_PORT", "8765"))
 # post_comment / reply_comment — a full thread rejects new posts and tells the
 # agent to conclude with set_status. Set REVIEWBOARD_THREAD_CAP to override (tests).
 THREAD_CAP = int(os.environ.get("REVIEWBOARD_THREAD_CAP", "100"))
+# 票9 ② (rev 2, dsh #763): 硬闸——同时 open 的 quorum 帖上限，只对带 quorum 的
+# create_thread 生效，先建先排；free threads 不受限。触顶仍可投票（THREAD_CAP
+# 只锁讨论——两处触顶文案明写 set_verdict 不受影响）。
+QUORUM_OPEN_CAP = int(os.environ.get("REVIEWBOARD_QUORUM_OPEN_CAP", "3"))
 
 VALID_STATUSES = ("open", "resolved", "wontfix")
 VALID_SEVERITIES = ("info", "minor", "major", "blocker")
@@ -205,7 +210,7 @@ SUSPEND_AFTER_HOURS = 24
 # --- v2 A1: participant registry / heartbeat --------------------------------
 # Single source of truth for the served version (v2.9.3 #55: was duplicated in
 # three literals — FastMCP serverInfo, /ping, PROTOCOL header — and drifted).
-PROTOCOL_VERSION = "2.13.0"
+PROTOCOL_VERSION = "2.13.1"
 mcp = FastMCP("ReviewBoard", version=PROTOCOL_VERSION)  # align serverInfo with pyproject
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -1071,6 +1076,7 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 - 心跳语义 =「可参与性信号」(备注 D):LLM 调用与带失败闸门的 watcher 探针都续 last_seen;
   连续 3 次唤醒失败后 watcher 停止心跳,成员自然衰减为暂缓(≥24h 无心跳)。
 - 暂缓 = 冻结计票参与(非清除),心跳恢复即自动复权。
+- **暂缓 ≠ veto**(票9 rev2,dsh #763 §4):暂缓者不计入自动路计票(活跃名册),复权后其票自动重入。(b) 形态成员在本修订内无票时,自动关帖前须有一次用户侧可读告知——创建者 `wake_ledger:` 条目覆盖该成员(复用既有 ledger 闸),静默排除不存在。
 
 ## 讨论帖
 - review 帖建议传 quorum 并在 context 写明对象/目的;发言表态后须落判定。
@@ -1426,6 +1432,19 @@ def _floor_exempt_shape(conn: sqlite3.Connection) -> None:
         )
 
 
+def _summary_free_shape(conn: sqlite3.Connection) -> None:
+    """票9 ⑤ (rev 2, dsh #763): comments.summary_free — additive column,
+    idempotent every-start fixup (same PRAGMA guard pattern as
+    _floor_exempt_shape; O(1) metadata ALTER, no version-ladder step).
+    Marks the creator's ONE free per-thread summary post (#2465 同族：行级
+    打标由服务端单点置位，客户端无从伪造). Fresh DBs get it from schema.sql."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(comments)")}
+    if "summary_free" not in cols:
+        conn.execute(
+            "ALTER TABLE comments ADD COLUMN summary_free INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 def _participants_nullable_last_seen(conn: sqlite3.Connection) -> None:
     """v2.12.0 (1.1b/C2): participants.last_seen must be NULLABLE.
 
@@ -1503,6 +1522,7 @@ def init_db() -> None:
     with _connect() as conn:
         conn.executescript(_load_schema())
         _floor_exempt_shape(conn)  # v2.11.0 (#81 F4): pre-column dbs converge here
+        _summary_free_shape(conn)  # 票9 ⑤: pre-column dbs converge here (same family)
         conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
         _backfill_credential_history(conn)  # batch2 2.1: deploy-time idempotent backfill (#2367/#2368)
         _, _boot_diag = _load_credential_registry(conn)  # #2403 §3.1 判(b): diag gets one DB-read outlet; reg unused (#2407 §3.4②)
@@ -1909,7 +1929,8 @@ def _author_usage(conn: sqlite3.Connection, thread_id: int, author: str) -> int:
     count raw comments); they also still satisfy the discussion floor."""
     n = conn.execute(
         "SELECT COUNT(*) FROM comments WHERE thread_id=? AND author=?"
-        " AND COALESCE(floor_exempt, 0) = 0",
+        " AND COALESCE(floor_exempt, 0) = 0"
+        " AND COALESCE(summary_free, 0) = 0",
         (thread_id, author),
     ).fetchone()[0]
     v = conn.execute(
@@ -2728,6 +2749,19 @@ def create_thread(
             names = [q.strip() for q in quorum]
             if len(set(names)) != len(names):
                 return "ERROR: quorum contains duplicate names"
+            # 票9 ② (rev 2, dsh #763): 硬闸 QUORUM_OPEN_CAP——只对带 quorum 的建帖
+            # 生效，先建先排；过渡条款：已 open 的存量照算不追溯关闭。触顶仍可投票
+            # （THREAD_CAP 只锁讨论——两处触顶文案明写 set_verdict 不受影响）。
+            open_q = conn.execute(
+                "SELECT COUNT(*) FROM threads WHERE status='open' AND quorum IS NOT NULL"
+            ).fetchone()[0]
+            if open_q >= QUORUM_OPEN_CAP:
+                ids = conn.execute(
+                    "SELECT id FROM threads WHERE status='open' AND quorum IS NOT NULL ORDER BY id"
+                ).fetchall()
+                idlist = ",".join("#%d" % r[0] for r in ids)
+                return (f"ERROR: open quorum threads = {open_q} (cap {QUORUM_OPEN_CAP}): "
+                        f"{idlist}; resolve or conclude them first.")
             # v2.9 L1 (thread #45): wake_infra declaration gate — BEFORE the
             # invitee auto-registration touches (a rejected thread must not
             # register anyone). v2.9.2 (#48 ②): the CREATOR is in the checked
@@ -2834,11 +2868,13 @@ def post_comment(
     file: str | None = None,
     line: int | None = None,
     severity: str | None = None,
+    summary: bool = False,
 ) -> str:
     """Post a top-level review comment in a thread.
 
     DISCUSSION CAP: threads hold at most 100 comments total (posts + replies).
     Posting into a full thread is rejected — conclude with set_status instead.
+    Voting (set_verdict) is NOT affected by this cap (票9 ①).
 
     Args:
         thread_id: the thread to comment on (from create_thread / list_threads).
@@ -2847,6 +2883,10 @@ def post_comment(
         file: optional file path the comment refers to.
         line: optional line number.
         severity: optional 'info' | 'minor' | 'major' | 'blocker'.
+        summary: 票9 ⑤ (rev 2, dsh #763) — 创建者专用收尾摘要。仅 thread 创建者可传
+            (他人传入即拒)；每帖第一条 summary=True 不计入 _author_usage(行级
+            summary_free 打标，服务端单点置位，沿 F4 floor_exempt 先例)，第二条起
+            按普通评论计费；仍受 THREAD_CAP 与日额约束。
 
     Returns: the new comment id and a short confirmation.
     """
@@ -2867,15 +2907,28 @@ def post_comment(
             return (
                 f"ERROR: thread #{thread_id} is locked — discussion cap reached "
                 f"({THREAD_CAP} comments). No further posts or replies accepted. "
-                f"Conclude the discussion with set_status(thread_id, 'resolved' or 'wontfix')."
+                f"Conclude the discussion with set_status(thread_id, 'resolved' or 'wontfix'). "
+                f"Voting (set_verdict) is NOT affected by this cap."
             )
         trow = conn.execute(
-            "SELECT per_author_budget, revision FROM threads WHERE id=?", (thread_id,)
+            "SELECT per_author_budget, revision, author FROM threads WHERE id=?", (thread_id,)
         ).fetchone()
         budget, t_rev = trow["per_author_budget"], trow["revision"]
+        # 票9 ⑤ (rev 2, dsh #763): 创建者收尾摘要——仅创建者可传；每帖第一条免费
+        # (summary_free 行级打标，服务端单点置位，沿 F4 floor_exempt 先例：客户端
+        # 无从伪造)；第二条起按普通评论计费；仍受 THREAD_CAP 与日额约束。
+        summary_free = False
+        if summary:
+            if author != trow["author"]:
+                return "ERROR: summary comments are creator-only"
+            prior = conn.execute(
+                "SELECT COUNT(*) FROM comments WHERE thread_id=? AND author=?"
+                " AND COALESCE(summary_free, 0) = 1", (thread_id, author),
+            ).fetchone()[0]
+            summary_free = prior == 0
         used = _author_usage(conn, thread_id, author)
         floor_exempt_post = False
-        if used >= budget:
+        if used >= budget and not summary_free:
             # v2.11.0 (#81 F4)：收口时刻的免费地板句——预算耗尽 ∧ F2 之后我仍在
             # 地板欠账 ∧ 其余活跃成员票全 pass（复用 blocking 判据，不自算）。
             # 行级 floor_exempt 标由服务端在本分支单点置位（post_comment 无此
@@ -2920,10 +2973,10 @@ def post_comment(
                 "if a close is blocked on this."
             )
         cur = conn.execute(
-            """INSERT INTO comments(thread_id, parent_id, author, body, file, line, severity, floor_exempt)
-               VALUES (?, NULL, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO comments(thread_id, parent_id, author, body, file, line, severity, floor_exempt, summary_free)
+               VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)""",
             (thread_id, author, body, file, line, severity,
-             1 if floor_exempt_post else 0),
+             1 if floor_exempt_post else 0, 1 if summary_free else 0),
         )
         cid = cur.lastrowid
         if floor_exempt_post:
@@ -2975,7 +3028,8 @@ def reply_comment(comment_id: int, author: str, body: str) -> str:
             return (
                 f"ERROR: thread #{row['thread_id']} is locked — discussion cap reached "
                 f"({THREAD_CAP} comments). No further posts or replies accepted. "
-                f"Conclude the discussion with set_status(thread_id, 'resolved' or 'wontfix')."
+                f"Conclude the discussion with set_status(thread_id, 'resolved' or 'wontfix'). "
+                f"Voting (set_verdict) is NOT affected by this cap."
             )
         trow = conn.execute(
             "SELECT per_author_budget, revision FROM threads WHERE id=?", (row["thread_id"],)
@@ -3183,6 +3237,12 @@ def get_thread(thread_id: int) -> str:
         f"Thread #{t['id']}: {_mask_credential_text(t['title'], registry)}  [{t['status']}]",
         f"  created: {t['created_at']}   comments: {len(all_comments)}/{THREAD_CAP}",
     ]
+    # 票9 ② (rev 2, dsh #763): open_quorum_count 整数字段——服务端可读，不靠文档口径。
+    with _connect_ro() as _ro_conn:
+        open_quorum_count = _ro_conn.execute(
+            "SELECT COUNT(*) FROM threads WHERE status='open' AND quorum IS NOT NULL"
+        ).fetchone()[0]
+    out.append(f"  open_quorum_count: {open_quorum_count} (cap {QUORUM_OPEN_CAP})")
     if t["quorum"]:
         stale_flag = f"   ⚠ stale-object: {stale}" if stale else ""
         out.append(f"  quorum: {names}   revision: {t['revision']}   budget: {usage or '—'}{stale_flag}")
@@ -4198,6 +4258,31 @@ def _token_blocked_face(conn: sqlite3.Connection, author: str) -> dict:
     }
 
 
+def _verdict_overdue(conn: sqlite3.Connection) -> list[str]:
+    """票9 ③ (rev 2, dsh #763): 催票名单——纯读（C3：不写审计、不计治理动作、
+    不推进游标）。定义 = 帖 open ∧ 非 wontfix ∧ 帖龄 >24h ∧ 该成员在 quorum 内
+    ∧ 当前无任何 verdict 行（never voted，任意修订）∧ 该成员活跃。暂缓者交给
+    C1 不催；帖龄 <24h 返回 []（空数组，不是缺字段）。"""
+    overdue: set[str] = set()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    trows = conn.execute(
+        "SELECT id, quorum, created_at FROM threads"
+        " WHERE status='open' AND quorum IS NOT NULL AND created_at < ?",
+        (cutoff,),
+    ).fetchall()
+    for tr in trows:
+        for n in json.loads(tr["quorum"]):
+            if conn.execute("SELECT 1 FROM verdicts WHERE thread_id=? AND author=?",
+                            (tr["id"], n)).fetchone() is not None:
+                continue                                    # 已有任何 verdict 行
+            prow = conn.execute("SELECT last_seen FROM participants WHERE author=?",
+                                (n,)).fetchone()
+            if prow is None or not _is_active(prow["last_seen"]):
+                continue                                    # 暂缓者交给 C1
+            overdue.add(n)
+    return sorted(overdue)
+
+
 def _awaiting_split(conn: sqlite3.Connection, author: str) -> tuple[list[int], list[dict]]:
     """把"我欠的票"拆成两族（v2.9.4 结构性修复，2026-10-24 事故立案）。
 
@@ -4593,6 +4678,12 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
             "SELECT COUNT(*) FROM threads WHERE status='open'"
         ).fetchone()[0]
         if author:
+            # 票9 ③ (rev 2, dsh #763): verdict_overdue — 纯读催票字段（C3 同款口径：
+            # 不写审计、不计治理动作、不推进游标，否则催票自己变成新的欠账门）。
+            # 定义 = 帖 open ∧ 非 wontfix ∧ 帖龄 >24h ∧ 该成员在 quorum 内 ∧
+            # 当前无任何 verdict 行（never voted）∧ 该成员活跃（暂缓者交给 C1）。
+            # 帖龄 <24h 时为 []（空数组，不是缺字段——反例测试钉死）。
+            verdict_overdue = _verdict_overdue(conn)
             # D2: open ∧ 非 wontfix ∧ quorum ∧ no verdict on current revision ∧ active.
             # v2.9.4 结构性修复：拆成 可动作 / 被 L1.5 阻塞 两族（见 _awaiting_split）。
             # 旧实现在这里把"创建者被门挡住"也列进待办，导致 watcher 反复唤醒却
@@ -4620,6 +4711,8 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
         "token_invalid": ti_tids,
         # v2.10 #77 档B：只读 latch，不触发唤醒。
         "token_blocked": tb_face,
+        # 票9 ③：催票名单（>24h 帖龄 ∧ quorum ∧ never voted ∧ 活跃；纯读 C3）。
+        "verdict_overdue": verdict_overdue,
     }
     header = "needs_attention: " + json.dumps(needs, ensure_ascii=False)
     if not rows:
