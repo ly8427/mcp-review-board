@@ -11,7 +11,7 @@
         裸 "resp" 红（#2461）；unknown-qname 是全表灯（见 UQ，单源不双写）
      D2 override 行 sink 为 resp:* 形 → fullmatch 先于 split 解包（#2461）
         ∧ 解析式配对 kind == rootkinds[name]（#2504 §1）
-  E  {行: sink=="none"} ⟺ SINK_NONE_LANDINGS（八穷尽落点的行粒度展开，15 行）
+  E  {行: sink=="none"} ⟺ SINK_NONE_LANDINGS（八穷尽落点的行粒度展开，17 行（454→475 派生期；+2=票7 2.2 标题哈希行））
   F  ∀行 class∈{identity, closed_domain}: fp ∉ FREE_TEXT_FP（家族派生禁手抄，
      #2392；EX1 已掩码下游 / EX2 len 计数 / EX3 SQL 嵌词 三条排除）
   键位① issuance 行 ⊆ ISSUANCE_FACES（#2393 §3①）
@@ -159,8 +159,9 @@ def main():
         mech = mf.sink_for(q, ROOTMAP, ROOTKINDS) if q in DERIVED_QNAMES else None
         if row["override_reason"] is None:
             # unknown_qname 已上移为全表 UQ 灯（pi #2568 (a)——单源不双写，
-            # dsh #2571 §1 附：与裸 resp 兄弟子句对齐）
-            if mech is not None and row["sink"] != mech:
+            # dsh #2571 §1 附：与裸 resp 兄弟子句对齐）。
+            # dsh #2578 §4(b)：qname 合法性显式表达，不依赖 sink_for 永不 None。
+            if q in DERIVED_QNAMES and row["sink"] != mech:
                 d1_bad.append((q, fp[:40], f"{row['sink']} != mech {mech}"))
         else:
             if mf.RESP_RE.fullmatch(row["sink"]):
@@ -231,13 +232,14 @@ def main():
     check("ERH 合成：override_reason=='' ∧ sink==机械 ⇒ 灯亮（(i) 判别格）",
           er_lamp(("_load_credential_registry", "synthetic-er"),
                   {"sink": mech_le, "class": "closed_domain", "override_reason": ""}))
-    # unknown-qname 全表灯（#2461；pi #2568 (a)：去 is None 子句——qname 合法性
-    # 与机械/override 分类正交；单源=本灯，D1 分支内不双写）
-    uq_bad = [k[0] for k in declared if k[0] not in DERIVED_QNAMES]
-    check("UQ unknown_qname 红（#2461，全表灯）", not uq_bad, str(uq_bad[:4]))
-    # UQ 合成（pi #2568）：ghost qname ∧ 非机械分类 ⇒ 灯亮（真表 0 ghost，B2 兜底）
+    # unknown-qname 全表灯（#2461；pi #2568 (a)）——pi #2581 §3：uq_lamp 上移
+    # 真灯之前、真灯改调 uq_lamp（合成灯驱动生产谓词，与 ER/ERH 同形——否则
+    # (ii) 形态回归不可观测，dsh #2578 §3 覆盖缺口）
     def uq_lamp(k):
         return k[0] not in DERIVED_QNAMES
+    uq_bad = [k[0] for k in declared if uq_lamp(k)]
+    check("UQ unknown_qname 红（#2461，全表灯）", not uq_bad, str(uq_bad[:4]))
+    # UQ 合成（pi #2568）：ghost qname ⇒ 灯亮（真表 0 ghost，B2 兜底）
     check("UQH 合成：no_such_qname ⇒ 灯亮（pi #2568）",
           uq_lamp(("no_such_qname", "synthetic-uq")))
     # resp-names 反真空锁（#2461，写死 24）
