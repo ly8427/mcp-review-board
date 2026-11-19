@@ -60,14 +60,17 @@ def main():
     check("A1 三列读数在返回体", "last_seen=" in r and "last_read=" in r
           and "last_delivered_id=" in r, r[:140])
     check("A2 participants.meta 逐字节不变（票5 绑定）", before == after)
+    # A3（Cursor Bugbot #52 修正）：基线取在第一次 preflight **之前**——一次性的
+    # 首调写入（审计/游标）否则会让计数恰好相等、C3 违规漏检。
     c = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
-    n_audit_after = c.execute("SELECT COUNT(*) FROM verdict_events").fetchone()[0]
+    n_events_before = c.execute("SELECT COUNT(*) FROM verdict_events").fetchone()[0]
     c.close()
     r2 = srv.preflight(author="anna")
     c = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
-    n_audit_after2 = c.execute("SELECT COUNT(*) FROM verdict_events").fetchone()[0]
+    n_events_after = c.execute("SELECT COUNT(*) FROM verdict_events").fetchone()[0]
     c.close()
-    check("A3 纯读：verdict_events 行数不变", n_audit_after == n_audit_after2)
+    check("A3 纯读：verdict_events 行数不变（基线=首调前）",
+          n_events_before == n_events_after, f"{n_events_before} → {n_events_after}")
     r = srv.preflight(author="nobody")
     check("A4 未注册 → 显式报错", r.startswith("ERROR: participant"), r[:100])
 

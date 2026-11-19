@@ -3,7 +3,7 @@
 """test_mask_faces.py — 声明表断言面（v11 ①，载荷 #2451 §2 + v4 #2461 +
 评审链 #2540-#2554 的可执行载体。表在 mask_faces.py 尾（#2442 §3 落点）。
 
-断言面（mask_faces.py docstring :22-35 逐条）：
+断言面（mask_faces.py docstring :22-53）：
   B  派生集 − 表行集 == ∅（每个派生点一行）
   C  ∀行: (行 ∈ WIRED) ⟺ NEEDS_MASK(行)   NEEDS_MASK = sink≠none ∧ class∉EXEMPT
   D  class ∈ CLASS ∧ (sink ∈ SINK ∨ RESP_RE.fullmatch(sink))
@@ -17,6 +17,7 @@
   键位① issuance 行 ⊆ ISSUANCE_FACES（#2393 §3①）
   键位② echo 行 ⊆ ECHO_FACES（#2393 §3②）
   audit 补丁 sink=audit 行必须在 AUDIT_ECHO 登记回声 resp 行（#2382 §3）
+  SA  模块源自检（SA1–SA3 三数 + SA4/SA6/SA7 装配单源）
 反例夹具：
   F-H  {title} 标 identity ⇒ F 谓词红（#2392 夹具 H）
   receipt  claim_token 回执行 ∈ WIRED ⇒ 红（#2382 红夹具 F）
@@ -266,8 +267,28 @@ def main():
     uq_lines = [ln for ln in tsrc.splitlines() if ln.lstrip().startswith("uq_bad =")]
     check("SA4 真灯行 = <lamp_all>(declared) 单次装配",
           len(uq_lines) == 1
-          and re.fullmatch(r"\s*uq_bad = \w+\(declared\)\s*", uq_lines[0]) is not None,
+          and re.fullmatch(r"\s*uq_bad = \w+\(declared\)\s*(?:#.*)?$", uq_lines[0]) is not None,
           str(uq_lines))
+    # SA6（dsh #2599 §3 射界缺口的第二层，pi #2600 修订面）：SA4 只盯字面（SA5 为本文件 SA 族的提案期编号，判据已并入 SA6）。
+    # 这里钉两处「位置」：uq_bad 全文件只有一处赋值（不认空白/复合算子的变体），
+    # 且 UQ 灯的**条件位**就是它——detail 参数里出现不算数。
+    uq_assign = [ln for ln in tsrc.splitlines()
+                 if re.match(r"^\s*uq_bad\s*[+\-*/]?=", ln)]
+    uq_use = [ln for ln in tsrc.splitlines()
+              if re.match(r'\s*check\("UQ [^"]*",\s*not uq_bad\s*,', ln)]
+    check("SA6 uq_bad 唯一赋值 ∧ UQ 灯条件位消费之",
+          len(uq_assign) == 1 and len(uq_use) == 1
+          and re.fullmatch(r"\s*uq_bad\s*=\s*\w+\(declared\)\s*(?:#.*)?", uq_assign[0]) is not None,
+          str((uq_assign, uq_use)))
+    # SA7（dsh #2601 §3 射界第二半，pi #2602 后补）：判据③ 的「真灯行只经它」——
+    # 真灯与 UQH 探针必须消费同一个装配函数。SA4 只认右值的形、UQH 只认本体行为，
+    # 两者之间那一格（换一个同签名函数的**名字**）今天无灯。
+    # 自读纪律：本段注释与正文都不得出现裸的 「名字+(某表)」 形，那会污染下面的取面。
+    uq_prod = re.findall(r"(\w+)\(declared\)", tsrc)
+    uq_prob = re.findall(r"(\w+)\(synth_table\)", tsrc)
+    check("SA7 真灯与 UQH 探针同厂（不是换厂）",
+          len(uq_prod) == 1 and len(uq_prob) == 1 and uq_prod == uq_prob,
+          str((uq_prod, uq_prob)))
 
     print(f"\n=== {len(PASS)} passed, {len(FAIL)} failed ===")
     if FAIL:

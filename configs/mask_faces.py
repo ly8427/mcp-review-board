@@ -225,7 +225,11 @@ class _Deriver(ast.NodeVisitor):
         if isinstance(node, ast.Call):
             f = node.func
             nm = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else None)
-            if nm in WRAPPERS and node.args:
+            # Cursor Bugbot (#52 review, commit 2a10feb): json.dumps 是 Attribute
+            # 调用（attr=dumps），裸名匹配永远够不到 → 包装器不解包、wired 不传播。
+            # 修法=Attribute 时用点号全名参与匹配（json.dumps 命中 WRAPPERS）。
+            dotted = ast.unparse(f) if isinstance(f, ast.Attribute) else None
+            if (nm in WRAPPERS or (dotted is not None and dotted in WRAPPERS)) and node.args:
                 if nm == "_mask_credential_text" and wired is not None:
                     wired.append(True)
                 return self.core(node.args[0], depth + 1, wired)
