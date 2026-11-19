@@ -156,6 +156,11 @@ def part_a_semantics():
         toks = {m: claim(tool, m) for m in ("a", "b", "c")}
 
         def sv(t, v, m, **kw):
+            # 方案 a L1：object 必带 flip 行——显式 note 也统一补行(缺行即拒)
+            if v == "object":
+                note = kw.get("note") or ""
+                if not any(ln.strip().lower().startswith("flip:") for ln in note.splitlines()):
+                    kw["note"] = (note + "\n" if note else "") + "flip: 证据到达后我改看法"
             return tool("set_verdict", {
                 "thread_id": t, "verdict": v, "author": m, "token": toks[m], **kw})
 
@@ -332,6 +337,11 @@ def run_governance_script(db, patch):
         toks = {m: claim(tool, m) for m in ("a", "b", "c")}
 
         def sv(t, v, m, **kw):
+            # 方案 a L1：object 必带 flip 行——显式 note 也统一补行(缺行即拒)
+            if v == "object":
+                note = kw.get("note") or ""
+                if not any(ln.strip().lower().startswith("flip:") for ln in note.splitlines()):
+                    kw["note"] = (note + "\n" if note else "") + "flip: 证据到达后我改看法"
             return tool("set_verdict", {
                 "thread_id": t, "verdict": v, "author": m, "token": toks[m], **kw})
 

@@ -242,7 +242,8 @@ def main():
     t2 = int(re.search(r"Created thread #(\d+)", r2).group(1))
 
     tok = re.search(r"\n  ([0-9a-f]{32})\n", SRV.claim_token("fxrev")).group(1)
-    NOTE_A = f"object: leaked {CRED_A} in body; " + "pad " * 45   # >160 字符
+    NOTE_A = (f"flip: 若 masked 形态在返回体中出现，我改投同意；object: leaked {CRED_A} in body; "
+              + "pad " * 45)   # >160 字符；含 flip: 行（方案 a L1）；凭据必须真入 note 才测得到遮蔽路径
     check("V1 set_verdict(object) accepted with token",
           "ERROR" not in SRV.set_verdict(thread_id=t1, verdict="object", author="fxrev",
                                          note=NOTE_A, token=tok),

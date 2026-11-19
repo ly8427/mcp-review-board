@@ -111,7 +111,7 @@ def main():
 
         # a objects (free first verdict), then keeps posting over it
         out = tool("set_verdict", {"thread_id": tid, "verdict": "object",
-                                   "author": "a", "note": "needs X",
+                                   "author": "a", "note": "needs X\nflip: X 到位后我改投同意",
                                    "token": tok["a"]})
         assert "object" in out, out
         # ts granularity is 1s and the rule is strict (>); separate the
@@ -154,7 +154,7 @@ def main():
   })
         tid2 = int(out.split("#")[1].split(":")[0])
         tool("set_verdict", {"thread_id": tid2, "verdict": "object",
-                             "author": "c", "note": "x", "token": tok["c"]})
+                             "author": "c", "note": "x\nflip: 条件到达即改投", "token": tok["c"]})
         time.sleep(1.1)  # keep the verdict second separate from followups
         tool("post_comment", {"thread_id": tid2, "author": "c", "body": "one"})
         tool("post_comment", {"thread_id": tid2, "author": "c", "body": "two"})
@@ -166,8 +166,10 @@ def main():
                                    "author": "c", "token": tok["c"]})
         assert "(free)" in out, out
         # pass→object at cap stays gated — with the honest new guidance
+        # note 带 flip 行: 让调用穿过方案 a L1 检查, 到达被测的预算闸
         out = tool("set_verdict", {"thread_id": tid2, "verdict": "object",
-                                   "author": "c", "note": "y", "token": tok["c"]})
+                                   "author": "c", "note": "y\nflip: 预算外翻转的条件占位",
+                                   "token": tok["c"]})
         assert "convergence is free" in out and "bump_revision" in out, out
         # display face == real quota (2 comments; the flips were free/gated)
         out = tool("get_thread", {"thread_id": tid2})
@@ -185,7 +187,8 @@ def main():
         tool("set_verdict", {"thread_id": tid3, "verdict": "pass",
                              "author": "d", "token": tok["d"]})
         out = tool("set_verdict", {"thread_id": tid3, "verdict": "object",
-                                   "author": "d", "note": "z", "token": tok["d"]})
+                                   "author": "d", "note": "z\nflip: 计费翻转条件占位",
+                                   "token": tok["d"]})
         assert "(billed 1)" in out, out
         tool("post_comment", {"thread_id": tid3, "author": "d", "body": "d1"})
         out = tool("get_thread", {"thread_id": tid3})
@@ -214,7 +217,8 @@ def main():
         # vote first so awaiting does not mask the wake-exclusion check below
         tok["e"] = tool("claim_token", {"author": "e"}).split("\n")[1].strip()
         tool("set_verdict", {"thread_id": tid4, "verdict": "object",
-                             "author": "e", "note": "w", "token": tok["e"]})
+                             "author": "e", "note": "w\nflip: 唤醒排除场景条件占位",
+                             "token": tok["e"]})
         time.sleep(1.1)  # keep the verdict second apart (staleness rule is strict >)
         # own comment after the cursor snapshot must NOT re-raise attention
         # (>=1s apart so the only exclusion factor is authorship, not ties)

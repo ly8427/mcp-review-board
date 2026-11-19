@@ -166,7 +166,8 @@ def main():
     srv.list_comments_since(author="anna", since="now")
     # brin：先 object（带 note，首判免费）→ 空 note 翻 pass（收敛翻转免费）
     r = srv.set_verdict(thread_id=tid2, verdict="object", author="brin",
-                        token=tok2["brin"], note="object：等预算修好才翻")
+                        token=tok2["brin"],
+                        note="object：等预算修好才翻\nflip: 预算修好后即改投(方案 a L1)")
     assert r.startswith("Verdict"), r
     r = srv.set_verdict(thread_id=tid2, verdict="pass", author="brin", token=tok2["brin"])
     assert r.startswith("Verdict"), r
@@ -333,7 +334,8 @@ def main():
     r = srv.set_verdict(thread_id=tid4, verdict="pass", author="brin", token=tok4["brin"])
     assert r.startswith("Verdict"), r
     r = srv.set_verdict(thread_id=tid4, verdict="object", author="cyr",
-                        token=tok4["cyr"], note="object：还有一问未答")
+                        token=tok4["cyr"],
+                        note="object：还有一问未答\nflip: 问题回答后即改投(方案 a L1)")
     assert r.startswith("Verdict"), r
     r = srv.post_comment(thread_id=tid4, author="brin", body="想蹭免费地板句")
     check("S4a: 其余未全 pass ⇒ F4 拒绝，文案指明出口何时开启",

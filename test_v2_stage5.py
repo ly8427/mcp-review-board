@@ -171,7 +171,7 @@ def main():
         tok3 = out.splitlines()[-1].strip()
         assert "Verdict recorded" in tool("set_verdict", {
             "thread_id": tid, "verdict": "object", "author": "a",
-            "token": tok3, "note": "for test"})
+            "token": tok3, "note": "for test\nflip: 令牌窗口场景条件占位"})
         # cleanup object -> pass so thread can resolve later; also member c
         # (c's L1.5 pre-vote token above is acked and still valid — reuse it)
         tool("set_verdict", {"thread_id": tid, "verdict": "pass",
