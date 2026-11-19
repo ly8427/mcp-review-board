@@ -89,7 +89,7 @@ def main():
                         note="flip: 当我改变看法时",
                         token=TOK["brin"])
     check("P1 vacuous flip 行被接受（机制强于声明即红，#2510 §5-2）",
-          r.startswith("Posted") or "flip_condition_missing" not in r, r[:140])
+          r.startswith("Verdict recorded"), r[:140])
     check("P2 vacuous 拒绝不重复计数（第一次 N1 已计 1 行，vacuous 接受不追加）",
           flip_missing_count(db, tid) == 1, str(flip_missing_count(db, tid)))
 
@@ -97,12 +97,12 @@ def main():
     r = srv.set_verdict(thread_id=tid, verdict="object", author="brin",
                         note="整体方向存疑\nflip: 若性能基准显示无回归，我改投同意",
                         token=TOK["brin"])
-    check("P3 真条件 flip 被接受", r.startswith("Posted") or "ERROR" not in r[:20], r[:140])
+    check("P3 真条件 flip 被接受", r.startswith("Verdict recorded"), r[:140])
 
     print("\n=== pass 票不受影响 ===")
     r = srv.set_verdict(thread_id=tid, verdict="pass", author="brin",
                         note="changed my mind", token=TOK["brin"])
-    check("PASS pass 票无需 flip 行", "flip-condition" not in r, r[:140])
+    check("PASS pass 票无需 flip 行", r.startswith("Verdict recorded"), r[:140])
 
     print(f"\n=== {len(PASS)} passed, {len(FAIL)} failed ===")
     if FAIL:
