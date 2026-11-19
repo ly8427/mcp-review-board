@@ -78,14 +78,16 @@ def main() -> None:
         c = sqlite3.connect(db2)
         c.executescript("""
             CREATE TABLE threads (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
+                title TEXT NOT NULL, context TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
                 created_at TEXT NOT NULL DEFAULT (datetime('now')));
             CREATE TABLE comments (id INTEGER PRIMARY KEY AUTOINCREMENT,
                 thread_id INTEGER NOT NULL, parent_id INTEGER, author TEXT NOT NULL,
                 body TEXT NOT NULL, file TEXT, line INTEGER, severity TEXT,
                 status TEXT NOT NULL DEFAULT 'open',
                 created_at TEXT NOT NULL DEFAULT (datetime('now')));
-            INSERT INTO threads(title) VALUES ('legacy thread');
+            INSERT INTO threads(title, context) VALUES
+                ('legacy thread', 'legacy background — any real v1 db carried this column');
             INSERT INTO comments(thread_id, author, body) VALUES (1, 'old-agent', 'kept?');
         """)
         c.commit(); c.close()

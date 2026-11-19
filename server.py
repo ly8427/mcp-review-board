@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS comments (
     status     TEXT    NOT NULL DEFAULT 'open',
     created_at TEXT    NOT NULL DEFAULT (datetime('now')),
     floor_exempt INTEGER NOT NULL DEFAULT 0,
+    cost_tokens INTEGER,
     summary_free INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments(thread_id);
@@ -210,7 +211,7 @@ SUSPEND_AFTER_HOURS = 24
 # --- v2 A1: participant registry / heartbeat --------------------------------
 # Single source of truth for the served version (v2.9.3 #55: was duplicated in
 # three literals — FastMCP serverInfo, /ping, PROTOCOL header — and drifted).
-PROTOCOL_VERSION = "2.13.1"
+PROTOCOL_VERSION = "2.13.2"
 mcp = FastMCP("ReviewBoard", version=PROTOCOL_VERSION)  # align serverInfo with pyproject
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -1077,6 +1078,7 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
   连续 3 次唤醒失败后 watcher 停止心跳,成员自然衰减为暂缓(≥24h 无心跳)。
 - 暂缓 = 冻结计票参与(非清除),心跳恢复即自动复权。
 - **暂缓 ≠ veto**(票9 rev2,dsh #763 §4):暂缓者不计入自动路计票(活跃名册),复权后其票自动重入。(b) 形态成员在本修订内无票时,自动关帖前须有一次用户侧可读告知——创建者 `wake_ledger:` 条目覆盖该成员(复用既有 ledger 闸),静默排除不存在。
+- **检索面扩展(票6 ①②③/#74 §1,版本闸三件套逐项)**:①结构——新增 threads_fts(external-content, content=threads, trigram)+ai/ad/au 三触发器+启动自检扩展(对象名单/行数/指纹覆盖新表),comments_fts DDL 不动;②返回契约——每命中必填 hit_type 枚举(comment|thread),thread 命中 comment_id=null/is_self=false,comment 命中新增 cost_tokens 读面字段;③参数语义——新增 hit_type(all|comment|thread)/author_filter(与 author 正交,author 现语义一字不改)/severity_filter(生效时 thread 命中不返回),post_comment 新增可选 cost_tokens 申报(默认空,不造填写义务)。隐私面结论(pi #2354):帖正文可检索(随 threads_fts),snippet 掩码同规则(_search_snippet 唯一落点);同评论剔除用例=凭据形态串照掩(40-hex commit id 直通)。
 
 ## 讨论帖
 - review 帖建议传 quorum 并在 context 写明对象/目的;发言表态后须落判定。
@@ -1445,6 +1447,18 @@ def _summary_free_shape(conn: sqlite3.Connection) -> None:
         )
 
 
+def _cost_tokens_shape(conn: sqlite3.Connection) -> None:
+    """票6 ③ (dsh #763 §1⑤): comments.cost_tokens — optional declared cost,
+    read-face only (#2461 同族: 不进 needs_attention、不进任何门). Additive
+    column, idempotent PRAGMA-guard fixup (same family as
+    _summary_free_shape); fresh DBs get it from schema.sql."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(comments)")}
+    if "cost_tokens" not in cols:
+        conn.execute(
+            "ALTER TABLE comments ADD COLUMN cost_tokens INTEGER"
+        )
+
+
 def _participants_nullable_last_seen(conn: sqlite3.Connection) -> None:
     """v2.12.0 (1.1b/C2): participants.last_seen must be NULLABLE.
 
@@ -1523,6 +1537,7 @@ def init_db() -> None:
         conn.executescript(_load_schema())
         _floor_exempt_shape(conn)  # v2.11.0 (#81 F4): pre-column dbs converge here
         _summary_free_shape(conn)  # 票9 ⑤: pre-column dbs converge here (same family)
+        _cost_tokens_shape(conn)   # 票6 ③: pre-column dbs converge here (same family)
         conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
         _backfill_credential_history(conn)  # batch2 2.1: deploy-time idempotent backfill (#2367/#2368)
         _, _boot_diag = _load_credential_registry(conn)  # #2403 §3.1 判(b): diag gets one DB-read outlet; reg unused (#2407 §3.4②)
@@ -1663,6 +1678,13 @@ _SEARCH_DDL = (
     "CREATE VIRTUAL TABLE IF NOT EXISTS comments_fts USING fts5("
     "body, thread_id UNINDEXED, author UNINDEXED, "
     "content=comments, content_rowid=id, tokenize='trigram')",
+    # 票6 ①/#74 §1① (dsh #759 §1① 三方 pass): NEW independent index face for
+    # THREAD bodies — external-content bound to threads (single-content-table
+    # rule means threads.context can never join comments_fts); title+context
+    # both indexed per the privacy conclusion (pi #2354: 帖正文可检索,掩码同规则).
+    # comments_fts DDL untouched.
+    "CREATE VIRTUAL TABLE IF NOT EXISTS threads_fts USING fts5("
+    "title, context, content=threads, content_rowid=id, tokenize='trigram')",
 )
 _SEARCH_TRIGGER_DDL = (
     # The three sync triggers keep the external-content index aligned with
@@ -1681,6 +1703,21 @@ _SEARCH_TRIGGER_DDL = (
        VALUES ('delete', old.id, old.body, old.thread_id, old.author);
        INSERT INTO comments_fts(rowid, body, thread_id, author)
        VALUES (new.id, new.body, new.thread_id, new.author);
+    END""",
+    # 票6 ①: the SAME three-trigger pattern for the threads index.
+    """CREATE TRIGGER IF NOT EXISTS threads_fts_ai AFTER INSERT ON threads BEGIN
+       INSERT INTO threads_fts(rowid, title, context)
+       VALUES (new.id, new.title, new.context);
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS threads_fts_ad AFTER DELETE ON threads BEGIN
+       INSERT INTO threads_fts(threads_fts, rowid, title, context)
+       VALUES ('delete', old.id, old.title, old.context);
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS threads_fts_au AFTER UPDATE ON threads BEGIN
+       INSERT INTO threads_fts(threads_fts, rowid, title, context)
+       VALUES ('delete', old.id, old.title, old.context);
+       INSERT INTO threads_fts(rowid, title, context)
+       VALUES (new.id, new.title, new.context);
     END""",
 )
 
@@ -1732,7 +1769,9 @@ def _search_tx(conn: sqlite3.Connection, work) -> None:
 
 
 def _search_fingerprint(c: sqlite3.Connection) -> str:
-    """Deterministic content fingerprint over (id, body) of every comment.
+    """Deterministic content fingerprint over (id, body) of every comment
+    PLUS (id, title, context) of every thread (票6 ① 自检③扩展: 指纹覆盖
+    threads_fts 的新表 — dsh #2355 §2 自检三处同改之三).
     Stronger for our threat model than FTS5 integrity-check alone: a dropped
     trigger + UPDATE keeps row COUNTS equal and the index internally
     consistent while its postings go stale — only comparing content hashes
@@ -1741,6 +1780,10 @@ def _search_fingerprint(c: sqlite3.Connection) -> str:
     h = hashlib.sha256()
     for cid, body in c.execute("SELECT id, body FROM comments ORDER BY id"):
         h.update(f"{cid}\x1f{body}\x1e".encode("utf-8", "surrogatepass"))
+    for tid, title, ctx in c.execute(
+            "SELECT id, title, context FROM threads ORDER BY id"):
+        h.update(f"{tid}\x1f{title or ''}\x1f{ctx or ''}\x1e".encode(
+            "utf-8", "surrogatepass"))
     return h.hexdigest()[:16]
 
 
@@ -1755,11 +1798,13 @@ def _search_apply(conn: sqlite3.Connection) -> None:
         for ddl in _SEARCH_TRIGGER_DDL:
             c.execute(ddl)
         c.execute("INSERT INTO comments_fts(comments_fts) VALUES('rebuild')")
+        c.execute("INSERT INTO threads_fts(threads_fts) VALUES('rebuild')")
         n = c.execute("SELECT COUNT(*) FROM comments").fetchone()[0]
+        nt = c.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
         c.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('search_index_ready', ?)",
             (json.dumps({"ts": _now_iso(), "sqlite": sqlite3.sqlite_version,
-                         "indexed_rows": n,
+                         "indexed_rows": n, "threads_indexed_rows": nt,
                          "fingerprint": _search_fingerprint(c)},
                         ensure_ascii=False),),
         )
@@ -1779,11 +1824,14 @@ def _search_repair(conn: sqlite3.Connection) -> None:
         for ddl in _SEARCH_TRIGGER_DDL:
             c.execute(ddl)
         c.execute("INSERT INTO comments_fts(comments_fts) VALUES('rebuild')")
+        c.execute("INSERT INTO threads_fts(threads_fts) VALUES('rebuild')")
         n = c.execute("SELECT COUNT(*) FROM comments").fetchone()[0]
+        nt = c.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
         c.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('search_index_ready', ?)",
             (json.dumps({"ts": _now_iso(), "sqlite": sqlite3.sqlite_version,
-                         "indexed_rows": n, "repaired": True,
+                         "indexed_rows": n, "threads_indexed_rows": nt,
+                         "repaired": True,
                          "fingerprint": _search_fingerprint(c)},
                         ensure_ascii=False),),
         )
@@ -1813,26 +1861,33 @@ def _search_bootstrap(conn: sqlite3.Connection) -> None:
             SEARCH_STATE.update(enabled=True, reason=None)
             return
         # v7: verify structure + consistency; repair if anything is off.
+        # 票6 ① 自检三处同改 (dsh #2355 §2): ①对象名单 4→8（threads_fts+三触发器
+        # 缺一即修）②行数等式加 threads 面 ③指纹/行数 marker 覆盖新表。
         marker_row = conn.execute(
             "SELECT value FROM meta WHERE key='search_index_ready'"
         ).fetchone()
         objs = conn.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE name IN"
-            " ('comments_fts','comments_fts_ai','comments_fts_ad','comments_fts_au')"
+            " ('comments_fts','comments_fts_ai','comments_fts_ad','comments_fts_au',"
+            "  'threads_fts','threads_fts_ai','threads_fts_ad','threads_fts_au')"
         ).fetchone()[0]
-        if marker_row is None or objs < 4:
+        if marker_row is None or objs < 8:
             _search_repair(conn)
             SEARCH_STATE.update(enabled=True, reason=None)
             return
         n_comments = conn.execute("SELECT COUNT(*) FROM comments").fetchone()[0]
         n_index = conn.execute("SELECT COUNT(*) FROM comments_fts").fetchone()[0]
+        n_threads = conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
+        n_tindex = conn.execute("SELECT COUNT(*) FROM threads_fts").fetchone()[0]
         try:
             marker = json.loads(marker_row[0])
         except (ValueError, TypeError):
             marker = {}
         consistent = (
             n_comments == n_index
+            and n_threads == n_tindex
             and marker.get("indexed_rows") == n_comments
+            and marker.get("threads_indexed_rows") == n_threads
             and marker.get("fingerprint") == _search_fingerprint(conn)
         )
         if not consistent:
@@ -2898,6 +2953,7 @@ def post_comment(
     line: int | None = None,
     severity: str | None = None,
     summary: bool = False,
+    cost_tokens: int | None = None,
 ) -> str:
     """Post a top-level review comment in a thread.
 
@@ -2921,6 +2977,10 @@ def post_comment(
     """
     if severity is not None and severity not in VALID_SEVERITIES:
         return f"ERROR: severity must be one of {VALID_SEVERITIES}, got {severity!r}"
+    # 票6 ③: cost_tokens 可选申报——不造填写义务(默认空), 只进读面, 不进任何门。
+    if cost_tokens is not None and (not isinstance(cost_tokens, int)
+                                    or isinstance(cost_tokens, bool) or cost_tokens < 0):
+        return "ERROR: cost_tokens must be a non-negative integer when provided"
     # batch2 2.1: loaded BEFORE the write txn (#2371 §2.2); `file` is a
     # caller-supplied free-text echoed in the receipt (负例 C face).
     _registry, _mask_diag = _load_registry_ro()
@@ -3002,10 +3062,10 @@ def post_comment(
                 "if a close is blocked on this."
             )
         cur = conn.execute(
-            """INSERT INTO comments(thread_id, parent_id, author, body, file, line, severity, floor_exempt, summary_free)
-               VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO comments(thread_id, parent_id, author, body, file, line, severity, floor_exempt, summary_free, cost_tokens)
+               VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (thread_id, author, body, file, line, severity,
-             1 if floor_exempt_post else 0, 1 if summary_free else 0),
+             1 if floor_exempt_post else 0, 1 if summary_free else 0, cost_tokens),
         )
         cid = cur.lastrowid
         if floor_exempt_post:
@@ -3301,6 +3361,15 @@ def get_thread(thread_id: int, page: int | None = None, per_page: int = 20) -> s
         f"Thread #{t['id']}: {_mask_credential_text(t['title'], registry)}  [{t['status']}]",
         f"  created: {t['created_at']}   comments: {len(all_comments)}/{THREAD_CAP}",
     ]
+    # 票6 ③: 帖面汇总——只进读面, 不进任何门 (trae #612 §5: 数字一旦进判定,
+    # 会变成新的表演面); 未申报为 null 的行不计入。
+    with _connect_ro() as _ro_conn:
+        cost_sum = _ro_conn.execute(
+            'SELECT COALESCE(SUM(cost_tokens), 0), COUNT(cost_tokens) FROM comments'
+            ' WHERE thread_id=? AND cost_tokens IS NOT NULL', (t['id'],),
+        ).fetchone()
+    if cost_sum[1]:
+        out.append(f'  cost_tokens: {cost_sum[0]} (declared by {cost_sum[1]} comment(s))')
     # 票9 ② (rev 2, dsh #763): open_quorum_count 整数字段——服务端可读，不靠文档口径。
     with _connect_ro() as _ro_conn:
         open_quorum_count = _ro_conn.execute(
@@ -4886,6 +4955,9 @@ def search_comments(
     after: str | None = None,
     before: str | None = None,
     limit: int = 20,
+    hit_type: str = "all",
+    author_filter: str | None = None,
+    severity_filter: str | None = None,
 ) -> str:
     """Cross-thread full-text search over comment bodies (v2.8, threads
     #39/#40). Pure read, ZERO governance semantics: hits are archaeology /
@@ -4944,6 +5016,19 @@ def search_comments(
         after / before: comment time window (absolute 'YYYY-MM-DD HH:MM:SS'
             or relative '30m'/'2h'/'1d', same parser as list_comments_since).
         limit: max hits to return, 1..50 (default 20).
+        hit_type: 票6 ①/#74 §1① — 'all' (default) | 'comment' | 'thread'.
+            REQUIRED enum on every returned hit (pi #762: 必填枚举,非有则带);
+            thread hits carry comment_id=null, is_self=false (无作者可判).
+        author_filter: 票6 ②/#74 §1③ — filters COMMENT hits by comment author;
+            与 author 并存、语义正交; author 现语义(is_self hint)一字不改
+            (冻结契约 #759 §1③). Thread hits unaffected (帖无此维).
+        severity_filter: 票6 ② — filters comment hits by severity;
+            ACTIVE ⇒ thread hits are NOT returned (帖无 severity, #759 §1③).
+        cost_tokens: (read face) every comment hit carries the row's optional
+            declared cost (票6 ③: 只进读面,不进任何门; 未申报为 null).
+
+    Returns: JSON with per-hit `hit_type` (comment|thread), thread hits with
+        comment_id=null / is_self=false / snippet via _search_snippet.
     """
     t0 = time.monotonic()
     budget_s = SEARCH_TIMEOUT_MS / 1000.0
@@ -4997,6 +5082,22 @@ def search_comments(
         return payload("error", None,
                        extra={"error": f"limit must be 1..{SEARCH_MAX_LIMIT}"},
                        complete=False)
+    # 票6 ②/#74 §1①③ (dsh #759 §1): 新参数校验 —— hit_type 必填枚举
+    # (返回体每命中都带, pi #762); author_filter 与 author 正交; severity_filter
+    # 生效时 thread 命中一律不返回 (帖无 severity)。
+    if hit_type not in ("all", "comment", "thread"):
+        return payload("error", None,
+                       extra={"error": "hit_type must be all|comment|thread"},
+                       complete=False)
+    if author_filter is not None and (not isinstance(author_filter, str)
+                                      or not author_filter.strip()):
+        return payload("error", None,
+                       extra={"error": "author_filter must be a non-empty string"},
+                       complete=False)
+    if severity_filter is not None and severity_filter not in VALID_SEVERITIES:
+        return payload("error", None,
+                       extra={"error": f"severity_filter must be one of {VALID_SEVERITIES}"},
+                       complete=False)
 
     # --- routing --------------------------------------------------------------
     if syntax == SEARCH_SYNTAX_FTS5:
@@ -5033,6 +5134,12 @@ def search_comments(
     if before is not None:
         where.append("c.created_at < ?")
         params.append(_parse_since(before))
+    if author_filter is not None:
+        where.append("c.author = ?")
+        params.append(author_filter)
+    if severity_filter is not None:
+        where.append("c.severity = ?")
+        params.append(severity_filter)
     where_sql = " AND ".join(where) if where else "1=1"
 
     fts_from = ("comments_fts JOIN comments c ON c.id = comments_fts.rowid"
@@ -5055,6 +5162,7 @@ def search_comments(
         registry, _mask_diag = _load_credential_registry(conn)
         base_sql = (
             f"SELECT c.id, c.thread_id, c.author, c.body, c.created_at,"
+            f" c.cost_tokens,"
             f" th.title AS th_title, th.status AS th_status, {rank_sel}"
             f" FROM {fts_from}{threads_join} WHERE {where_sql}")
         total = conn.execute(
@@ -5079,12 +5187,14 @@ def search_comments(
             ).fetchall()
             ctx = sorted(ctx_rows, key=lambda n: n["id"])
             results.append({
+                "hit_type": "comment",
                 "comment_id": r["id"],
                 "thread_id": r["thread_id"],
                 "thread_title": _mask_credential_text(r["th_title"] or "", registry),
                 "thread_status": r["th_status"],
                 "author": r["author"],
                 "timestamp": r["created_at"],
+                "cost_tokens": r["cost_tokens"],
                 "snippet": _search_snippet(r["body"], terms, SEARCH_SNIPPET_CAP, registry),
                 "rank": r["rank"],
                 "is_self": bool(author and r["author"] == author),
@@ -5094,6 +5204,53 @@ def search_comments(
                     for n in ctx
                 ],
             })
+        # 票6 ①/#74 §1① thread-hit branch (try-body level — NOT inside the
+        # comment loop; 0 comment hits must still yield thread hits):
+        # threads_fts MATCH (FTS routes) or LIKE (like_scan); severity_filter
+        # 生效 ⇒ thread 命中一律不返回 (#759 §1③——帖无 severity); 每命中
+        # hit_type="thread" + comment_id null + is_self=false; snippet 落点
+        # 唯一=_search_snippet(#2355 §3)。
+        if hit_type in ("all", "thread") and severity_filter is None:
+            t_where, t_params = [], []
+            if route in (SEARCH_ROUTE_FTS, SEARCH_ROUTE_FTS_LIKE):
+                t_where.append(
+                    "t.id IN (SELECT rowid FROM threads_fts WHERE threads_fts MATCH ?)")
+                t_params.append(match_expr)
+            for t in (like_terms if syntax == SEARCH_SYNTAX_LITERAL else []):
+                t_where.append("(t.title LIKE ? ESCAPE '\\' OR t.context LIKE ? ESCAPE '\\')")
+                t_params += [f"%{_like_literal(t)}%", f"%{_like_literal(t)}%"]
+            if thread_id is not None:
+                t_where.append("t.id = ?")
+                t_params.append(thread_id)
+            if status is not None and status != "all":
+                t_where.append("t.status = ?")
+                t_params.append(status)
+            t_where_sql = " AND ".join(t_where) if t_where else "1=1"
+            trows = conn.execute(
+                "SELECT t.id, t.title, t.context, t.author, t.status, t.created_at"
+                f" FROM threads t WHERE {t_where_sql} ORDER BY t.id DESC LIMIT ?",
+                t_params + [limit],
+            ).fetchall()
+            for tr in trows:
+                title_m = _mask_credential_text(tr["title"] or "", registry)
+                raw_title = tr["title"] or ""
+                hit_text = raw_title if any(
+                    t.lower() in raw_title.lower() for t in terms) else (tr["context"] or "")
+                results.append({
+                    "hit_type": "thread",
+                    "thread_id": tr["id"],
+                    "comment_id": None,
+                    "thread_title": title_m,
+                    "thread_status": tr["status"],
+                    "author": tr["author"],
+                    "timestamp": tr["created_at"],
+                    "cost_tokens": None,
+                    "snippet": _search_snippet(hit_text, terms, SEARCH_SNIPPET_CAP, registry),
+                    "rank": None,
+                    "is_self": False,
+                    "context": [],
+                })
+            total += len(trows)
         return payload("ok", route, results, total=total)
     except sqlite3.Error as e:
         if time.monotonic() >= deadline:

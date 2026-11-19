@@ -353,9 +353,8 @@ def load_server_src(path=SERVER) -> str:
 #     chain #2540-#2554; rows = full derived set, assertion B set-equality) ---
 #
 # SINK_NONE_LANDINGS: row-granularity expansion of the 8 frozen call-sites
-# (#2382 §3 verbatim list; #2380 §2③ exhaustive scan — 17 rows on the current
-# tree [454→475 派生期；+2 = 票7 2.2 标题哈希存储行，理由自带]). A new none row
-# beyond this set ⇒ E red.
+# (#2382 §3 verbatim list; #2380 §2③ exhaustive scan — 15 rows on the current
+# tree). A new none row beyond this set ⇒ E red.
 # ISSUANCE_FACES: claim_token three receipts merge into ONE row (same fp,
 # #2387 §4 行集权威) + form_b nonce (sink 为 none, #2379 §2.3).
 # ECHO_FACES: six frozen sites (#2393 §3②/#2395 §2) merge to 5 rows (set_quorum
@@ -373,6 +372,9 @@ SINK_NONE_LANDINGS = frozenset({
     ('_read_epoch', 'const:F6_READ_EPOCH_CODE'),
     ('_search_fingerprint', 'name:body'),
     ('_search_fingerprint', 'name:cid'),
+    ('_search_fingerprint', 'name:ctx'),
+    ('_search_fingerprint', 'name:tid'),
+    ('_search_fingerprint', 'name:title'),
     ('create_thread', 'call:hashlib.sha256(title.strip().encode()).hexdigest()'),
     ('main', "SEARCH_STATE['reason']"),
     ('main', "SEARCH_STATE['sqlite']"),
@@ -711,6 +713,8 @@ DECLARED = {
         "sink": 'log', "class": 'closed_domain', "override_reason": None},
     ('_search_apply.work', "call:c.execute('SELECT COUNT(*) FROM comments').fetchone()"): {
         "sink": 'log', "class": 'closed_domain', "override_reason": None},
+    ('_search_apply.work', "call:c.execute('SELECT COUNT(*) FROM threads').fetchone()"): {
+        "sink": 'log', "class": 'closed_domain', "override_reason": None},
     ('_search_apply.work', 'name:sqlite3'): {
         "sink": 'log', "class": 'closed_domain', "override_reason": None},
     ('_search_bootstrap', 'name:e'): {
@@ -725,11 +729,19 @@ DECLARED = {
         "sink": 'none', "class": 'mask', "override_reason": 'E 穷尽落点(#2382 §3/#2380 §2③)'},  # 指纹存储面不外显；掩码禁入（改指纹语义）
     ('_search_fingerprint', 'name:cid'): {
         "sink": 'none', "class": 'closed_domain', "override_reason": 'E 穷尽落点(#2382 §3/#2380 §2③)'},
+    ('_search_fingerprint', 'name:ctx'): {
+        "sink": 'none', "class": 'closed_domain', "override_reason": 'E 穷尽落点(#2382 §3/#2380 §2③)'},
+    ('_search_fingerprint', 'name:tid'): {
+        "sink": 'none', "class": 'closed_domain', "override_reason": 'E 穷尽落点(#2382 §3/#2380 §2③)'},
+    ('_search_fingerprint', 'name:title'): {
+        "sink": 'none', "class": 'mask', "override_reason": 'E 穷尽落点(#2382 §3/#2380 §2③)'},  # 指纹存储面不外显；掩码禁入（改指纹语义）
     ('_search_repair.work', 'call:_now_iso()'): {
         "sink": 'log', "class": 'closed_domain', "override_reason": None},
     ('_search_repair.work', 'call:_search_fingerprint(c)'): {
         "sink": 'log', "class": 'closed_domain', "override_reason": None},
     ('_search_repair.work', "call:c.execute('SELECT COUNT(*) FROM comments').fetchone()"): {
+        "sink": 'log', "class": 'closed_domain', "override_reason": None},
+    ('_search_repair.work', "call:c.execute('SELECT COUNT(*) FROM threads').fetchone()"): {
         "sink": 'log', "class": 'closed_domain', "override_reason": None},
     ('_search_repair.work', 'name:sqlite3'): {
         "sink": 'log', "class": 'closed_domain', "override_reason": None},
@@ -904,6 +916,8 @@ DECLARED = {
     ('get_thread', 'call:_author_usage(conn, thread_id, a)'): {
         "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
     ('get_thread', 'call:_ro_conn.execute("SELECT COUNT(*) FROM threads WHERE status=\'ope'): {
+        "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
+    ('get_thread', "call:_ro_conn.execute('SELECT COALESCE(SUM(cost_tokens), 0), COUNT(co"): {
         "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
     ('get_thread', "call:json.loads(t['quorum'])"): {
         "sink": 'resp:tool:get_thread', "class": 'closed_domain', "override_reason": None},
@@ -1257,6 +1271,8 @@ DECLARED = {
         "sink": 'resp:tool:search_comments', "class": 'closed_domain', "override_reason": None},
     ('search_comments', 'const:SEARCH_ROUTE_FTS'): {
         "sink": 'resp:tool:search_comments', "class": 'closed_domain', "override_reason": None},
+    ('search_comments', 'const:VALID_SEVERITIES'): {
+        "sink": 'resp:tool:search_comments', "class": 'closed_domain', "override_reason": None},
     ('search_comments', "n['author']"): {
         "sink": 'resp:tool:search_comments', "class": 'closed_domain', "override_reason": None},
     ('search_comments', "n['body']"): {
@@ -1265,12 +1281,16 @@ DECLARED = {
         "sink": 'resp:tool:search_comments', "class": 'closed_domain', "override_reason": None},
     ('search_comments', 'name:e'): {
         "sink": 'resp:tool:search_comments', "class": 'closed_domain', "override_reason": None},
+    ('search_comments', 'name:t_where'): {
+        "sink": 'resp:tool:search_comments', "class": 'closed_domain', "override_reason": None},
     ('search_comments', 'param:status'): {
         "sink": 'resp:tool:search_comments', "class": 'closed_domain', "override_reason": None},
     ('search_comments', "r['author']"): {
         "sink": 'resp:tool:search_comments', "class": 'closed_domain', "override_reason": None},
     ('search_comments', "r['body']"): {
         "sink": 'resp:tool:search_comments', "class": 'mask', "override_reason": None},
+    ('search_comments', "r['cost_tokens']"): {
+        "sink": 'resp:tool:search_comments', "class": 'closed_domain', "override_reason": None},
     ('search_comments', "r['created_at']"): {
         "sink": 'resp:tool:search_comments', "class": 'closed_domain', "override_reason": None},
     ('search_comments', "r['id']"): {
@@ -1283,6 +1303,16 @@ DECLARED = {
         "sink": 'resp:tool:search_comments', "class": 'mask', "override_reason": None},
     ('search_comments', "r['thread_id']"): {
         "sink": 'resp:tool:search_comments', "class": 'closed_domain', "override_reason": None},
+    ('search_comments', "tr['author']"): {
+        "sink": 'resp:tool:search_comments', "class": 'closed_domain', "override_reason": None},
+    ('search_comments', "tr['created_at']"): {
+        "sink": 'resp:tool:search_comments', "class": 'closed_domain', "override_reason": None},
+    ('search_comments', "tr['id']"): {
+        "sink": 'resp:tool:search_comments', "class": 'closed_domain', "override_reason": None},
+    ('search_comments', "tr['status']"): {
+        "sink": 'resp:tool:search_comments', "class": 'closed_domain', "override_reason": None},
+    ('search_comments', "tr['title']"): {
+        "sink": 'resp:tool:search_comments', "class": 'mask', "override_reason": None},
     ('search_comments.payload', 'amb:Dict'): {
         "sink": 'resp:tool:search_comments', "class": 'closed_domain', "override_reason": None},
     ('search_comments.payload', 'param:complete'): {

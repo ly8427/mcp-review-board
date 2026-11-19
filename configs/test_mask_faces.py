@@ -11,7 +11,7 @@
         裸 "resp" 红（#2461）；unknown-qname 是全表灯（见 UQ，单源不双写）
      D2 override 行 sink 为 resp:* 形 → fullmatch 先于 split 解包（#2461）
         ∧ 解析式配对 kind == rootkinds[name]（#2504 §1）
-  E  {行: sink=="none"} ⟺ SINK_NONE_LANDINGS（八穷尽落点的行粒度展开，17 行（454→475 派生期；+2=票7 2.2 标题哈希行））
+  E  {行: sink=="none"} ⟺ SINK_NONE_LANDINGS（八穷尽落点的行粒度展开，20 行（454→475→489 派生期；+5=2.2 标题哈希×2+2.1 细项指纹 title 行+search 检索面新行——随树登记））
   F  ∀行 class∈{identity, closed_domain}: fp ∉ FREE_TEXT_FP（家族派生禁手抄，
      #2392；EX1 已掩码下游 / EX2 len 计数 / EX3 SQL 嵌词 三条排除）
   键位① issuance 行 ⊆ ISSUANCE_FACES（#2393 §3①）
@@ -260,6 +260,14 @@ def main():
           str(mask_src.count("sink=none")))
     check("SA3 不可执行并句 SINK ∪ RESP_RE == 0（dsh #2544 §3）",
           mask_src.count("SINK ∪ RESP_RE") == 0)
+    # SA4（dsh #2593 §2 判据③ 可执行化 / pi #2597 收）：真灯行 = 对 declared 的
+    # 单次装配调用，不得内联谓词或推导——否则 UQH 探针绕不过真灯，M2 型逃逸仍全绿
+    tsrc = open(os.path.join(HERE, "test_mask_faces.py"), encoding="utf-8").read()
+    uq_lines = [ln for ln in tsrc.splitlines() if ln.lstrip().startswith("uq_bad =")]
+    check("SA4 真灯行 = <lamp_all>(declared) 单次装配",
+          len(uq_lines) == 1
+          and re.fullmatch(r"\s*uq_bad = \w+\(declared\)\s*", uq_lines[0]) is not None,
+          str(uq_lines))
 
     print(f"\n=== {len(PASS)} passed, {len(FAIL)} failed ===")
     if FAIL:
