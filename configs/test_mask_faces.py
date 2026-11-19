@@ -11,7 +11,7 @@
         裸 "resp" 红（#2461）；unknown-qname 是全表灯（见 UQ，单源不双写）
      D2 override 行 sink 为 resp:* 形 → fullmatch 先于 split 解包（#2461）
         ∧ 解析式配对 kind == rootkinds[name]（#2504 §1）
-  E  {行: sink=="none"} ⟺ SINK_NONE_LANDINGS（八穷尽落点的行粒度展开，20 行（454→475→489 派生期；+5=2.2 标题哈希×2+2.1 细项指纹 title 行+search 检索面新行——随树登记））
+  E  {行: sink=="none"} ⟺ SINK_NONE_LANDINGS（八穷尽落点的行粒度展开，20 行（475→489 派生期，随树登记——2.1 细项/搜索面各代新增 none 行照 E1 集合等式并入））
   F  ∀行 class∈{identity, closed_domain}: fp ∉ FREE_TEXT_FP（家族派生禁手抄，
      #2392；EX1 已掩码下游 / EX2 len 计数 / EX3 SQL 嵌词 三条排除）
   键位① issuance 行 ⊆ ISSUANCE_FACES（#2393 §3①）

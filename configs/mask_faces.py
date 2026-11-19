@@ -357,7 +357,7 @@ def load_server_src(path=SERVER) -> str:
 #     chain #2540-#2554; rows = full derived set, assertion B set-equality) ---
 #
 # SINK_NONE_LANDINGS: row-granularity expansion of the 8 frozen call-sites
-# (#2382 §3 verbatim list; #2380 §2③ exhaustive scan — 15 rows on the current
+# (#2382 §3 verbatim list; #2380 §2③ exhaustive scan — 20 rows on the current
 # tree). A new none row beyond this set ⇒ E red.
 # ISSUANCE_FACES: claim_token three receipts merge into ONE row (same fp,
 # #2387 §4 行集权威) + form_b nonce (sink 为 none, #2379 §2.3).
