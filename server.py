@@ -135,7 +135,9 @@ CREATE TABLE IF NOT EXISTS comments (
     severity   TEXT,
     status     TEXT    NOT NULL DEFAULT 'open',
     created_at TEXT    NOT NULL DEFAULT (datetime('now')),
-    floor_exempt INTEGER NOT NULL DEFAULT 0
+    floor_exempt INTEGER NOT NULL DEFAULT 0,
+    cost_tokens INTEGER,
+    summary_free INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments(thread_id);
 CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments(parent_id);
@@ -190,6 +192,10 @@ PORT = int(os.environ.get("REVIEWBOARD_PORT", "8765"))
 # post_comment / reply_comment — a full thread rejects new posts and tells the
 # agent to conclude with set_status. Set REVIEWBOARD_THREAD_CAP to override (tests).
 THREAD_CAP = int(os.environ.get("REVIEWBOARD_THREAD_CAP", "100"))
+# 票9 ② (rev 2, dsh #763): 硬闸——同时 open 的 quorum 帖上限，只对带 quorum 的
+# create_thread 生效，先建先排；free threads 不受限。触顶仍可投票（THREAD_CAP
+# 只锁讨论——两处触顶文案明写 set_verdict 不受影响）。
+QUORUM_OPEN_CAP = int(os.environ.get("REVIEWBOARD_QUORUM_OPEN_CAP", "3"))
 
 VALID_STATUSES = ("open", "resolved", "wontfix")
 VALID_SEVERITIES = ("info", "minor", "major", "blocker")
@@ -205,7 +211,7 @@ SUSPEND_AFTER_HOURS = 24
 # --- v2 A1: participant registry / heartbeat --------------------------------
 # Single source of truth for the served version (v2.9.3 #55: was duplicated in
 # three literals — FastMCP serverInfo, /ping, PROTOCOL header — and drifted).
-PROTOCOL_VERSION = "2.13.0"
+PROTOCOL_VERSION = "2.13.2"
 mcp = FastMCP("ReviewBoard", version=PROTOCOL_VERSION)  # align serverInfo with pyproject
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -312,6 +318,19 @@ def _relative(utc: str | None) -> str:
     return f"{int(secs // 86400)} 天前"
 
 
+def _epoch(utc: str | None) -> int:
+    """UTC timestamp string → epoch seconds (0 on unparsable). UI v2 sidebar:
+    client recency buckets compare against Date.now()/1000 — same UTC basis,
+    no timezone conversion (design rule)."""
+    if not utc:
+        return 0
+    try:
+        return int(datetime.strptime(utc, "%Y-%m-%d %H:%M:%S")
+                   .replace(tzinfo=timezone.utc).timestamp())
+    except ValueError:
+        return 0
+
+
 def _is_active(last_seen: str | None, now: datetime | None = None) -> bool:
     """The one shared activity predicate (claude #52: 单点口径). Stage 1 uses it
     for display; stage 3b wires it into every governance write path."""
@@ -350,6 +369,175 @@ def _oneline(s: str, limit: int) -> str:
     faces: verdict/gate notes stay scannable; the full text lives in storage)."""
     flat = " ".join(s.split())
     return flat if len(flat) <= limit else flat[:limit] + "…"
+
+
+# --- credential masking (batch2 2.1, #113 v9) ---------------------------------
+# Identity layer over the board's own credentials (tokens / form_b nonces).
+# Design pins (thread #113, v5..v9 closed spec):
+#   * candidate enumeration is UNCONDITIONAL and belongs to the identity
+#     layer; the shape layer only controls whether UNREGISTERED candidates
+#     are masked too (REVIEWBOARD_MASK_SHAPE_LAYER=1, default off — host
+#     ruling #2362). Layer definition sentence pinned in #2370 §4.
+#   * candidate = exactly-32 lowercase-hex with BOTH boundaries non-hex
+#     (#2357/#2358 §3): a bare {32} would carve 32 out of 40-hex commit ids.
+#     Leftovers (documented, not bugs): hex-glued tokens, uppercase-hex
+#     legacy credentials, non-32-hex key material ("密钥串"无形态).
+#   * judgment = sha256(candidate RAW bytes, no strip) ∈ registry — same
+#    口径 as _token_ok (#2360 §2-③).
+#   * masking is LENGTH-PRESERVING (first 4 + 28 '*'): faces mask FIRST and
+#     slice AFTER (先掩后截断), positions computed on the ORIGINAL text —
+#     equal length keeps start = max(0, pos - cap//4) alive (#2358 §2).
+#   * registry = CURRENT ∪ HISTORY credential set (#2360 §2-① wording:
+#     "当前凭据集合"; rotation keeps old members via cred_hash_* rows).
+#   * issuance surfaces are wiring-FORBIDDEN (claim_token receipts resp
+#     ×3 ∪ form_b nonce log/file delivery — #2382/#2393 §3①); masking
+#     them would break token issuance / (b) admission.
+CRED_HASH_KEY_PREFIX = "cred_hash_"
+_CRED_CANDIDATE_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])")
+
+
+def _mask_credential_text(text: str, registry: frozenset) -> str:
+    """Mask registered 32-hex credentials inside a free-text surface.
+
+    Pure function (no DB access — the registry is loaded ONCE per face at
+    the face entry, #2365 §2). Identity layer always on; shape layer off
+    unless REVIEWBOARD_MASK_SHAPE_LAYER=1. Length-preserving by contract."""
+    if not registry or not text:
+        return text
+    shape_layer = os.environ.get("REVIEWBOARD_MASK_SHAPE_LAYER", "0") == "1"
+
+    def _repl(m: re.Match) -> str:
+        cand = m.group(0)
+        if hashlib.sha256(cand.encode()).hexdigest() in registry or shape_layer:
+            return cand[:4] + "*" * 28
+        return cand
+
+    return _CRED_CANDIDATE_RE.sub(_repl, text)
+
+
+def _load_credential_registry(conn: sqlite3.Connection) -> tuple[frozenset, list[str]]:
+    """Current ∪ history credential-identity set, loaded once per face entry.
+
+    Sources (v9 registry = 当前∪历史, #2360 §2-② / #2366 §1):
+      participants.meta.token_hash            (current tokens)
+      meta.form_b_pending_*.nonce_sha256      (pending nonces)
+      meta.cred_hash_<sha256> rows            (history: issuance-time appends
+                                               + deploy-time idempotent backfill)
+    Loader contract (#2365 §2 / #2366 §2): a single bad row is SKIPPED with a
+    diag entry — never raises into the read face; loader failure = empty set
+    + diag, callers answer status="ok".
+    Diag outlet (#2403 §3.1 判(b)): face-level call sites intentionally discard
+    diag (masking stays fail-open, zero per-face chatter); init_db audits a
+    non-empty diag once per boot (action=cred_mask_diag) so a corrupt-row
+    dropout of token_hash is observable until the human reset resolves it.
+    "Observable" = DB-read only (#2407 §3.3): the audit row has NULL
+    thread_id and is therefore invisible in every MCP face (get_thread
+    filters WHERE thread_id=?); read it via SELECT ... FROM verdict_events
+    WHERE action='cred_mask_diag'. Precedents: f6_read_epoch_init,
+    search_disabled — same NULL-thread_id shape, no new face (version gate).
+    Known lazy coupling (#2407 §3.2): this row raises MAX(id) seen by a
+    _floor_wm_epoch computed on THIS boot of a legacy db (eff +1) — harmless,
+    the row's action never matches the bump_revision query; do not "fix".
+    """
+    creds: set[str] = set()
+    diag: list[str] = []
+    try:
+        for r in conn.execute("SELECT author, meta FROM participants").fetchall():
+            state, meta = _meta_obj(r["meta"])
+            if state in META_CORRUPT:
+                diag.append(f"participants:{r['author']}:skip:{state}")
+                continue
+            if state != META_DICT:
+                continue
+            h = meta.get("token_hash")
+            if isinstance(h, str) and h:
+                creds.add(h)
+    except sqlite3.Error as e:
+        diag.append(f"participants:scan_error:{_oneline(str(e), 80)}")
+    try:
+        for r in conn.execute(
+            "SELECT key, value FROM meta WHERE key LIKE 'form_b_pending_%'"
+        ).fetchall():
+            try:
+                obj = json.loads(r["value"])
+            except META_PARSE_ERRORS:
+                diag.append(f"meta:{r['key']}:skip:unparsable")
+                continue
+            h = obj.get("nonce_sha256") if isinstance(obj, dict) else None
+            if isinstance(h, str) and h:
+                creds.add(h)
+    except sqlite3.Error as e:
+        diag.append(f"meta:pending_scan_error:{_oneline(str(e), 80)}")
+    try:
+        for r in conn.execute(
+            "SELECT key FROM meta WHERE key LIKE 'cred\\_hash\\_%' ESCAPE '\\'"
+        ).fetchall():
+            creds.add(r["key"][len(CRED_HASH_KEY_PREFIX):])
+    except sqlite3.Error as e:
+        diag.append(f"meta:history_scan_error:{_oneline(str(e), 80)}")
+    return frozenset(c for c in creds if c), diag
+
+
+def _load_registry_ro() -> tuple[frozenset, list[str]]:
+    """Loader for faces that have no live connection at the wiring point
+    (#2370 §5②: the registry never rides a write transaction)."""
+    conn = _connect_ro()
+    try:
+        return _load_credential_registry(conn)
+    finally:
+        conn.close()
+
+
+def _cred_history_record(conn: sqlite3.Connection, cred_sha256: str) -> None:
+    """One-key-one-row history append (#2365 §1: no single-key JSON array —
+    claim_token has no _begin_write, two concurrent claims would lose updates
+    in a read-modify-write). INSERT OR IGNORE is single-statement atomic
+    (form_b_pending_* precedent). VALUE is pinned to FIRST-SEEN/issuance time
+    (#2403 §3.2: REPLACE let the per-boot backfill rewrite alive credentials'
+    values to boot time — row-idempotent but not byte-idempotent; any future
+    credential-age/rotation reading would be wrong from the first restart).
+    The key already carries the hash — a second readable copy would be a free
+    leak."""
+    conn.execute(
+        "INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)",
+        (f"{CRED_HASH_KEY_PREFIX}{cred_sha256}", _now_iso()),
+    )
+
+
+def _backfill_credential_history(conn: sqlite3.Connection) -> int:
+    """Deploy-time ONE-SHOT idempotent backfill (#2367 §1 修法(a), #2368 §1):
+    credentials alive at deploy time exist only as participants.meta.token_hash
+    / pending nonce_sha256 current values — after the first rotation/reset the
+    plaintext would be unmaskable forever. Idempotent (INSERT OR IGNORE on a
+    deterministic key — byte-idempotent: existing rows keep their first-seen
+    value, #2403 §3.2); runs once per boot inside init_db; corrupt rows are
+    skipped (loader同口径, never raises into startup).
+    Return n = credentials SEEN, not rows inserted (#2407 §3.4①: OR IGNORE
+    keeps counting duplicates); the sole caller (init_db) discards it."""
+    n = 0
+    try:
+        for r in conn.execute("SELECT author, meta FROM participants").fetchall():
+            state, meta = _meta_obj(r["meta"])
+            if state in META_CORRUPT or state != META_DICT:
+                continue
+            h = meta.get("token_hash")
+            if isinstance(h, str) and h:
+                _cred_history_record(conn, h)
+                n += 1
+        for r in conn.execute(
+            "SELECT key, value FROM meta WHERE key LIKE 'form_b_pending_%'"
+        ).fetchall():
+            try:
+                obj = json.loads(r["value"])
+            except META_PARSE_ERRORS:
+                continue
+            h = obj.get("nonce_sha256") if isinstance(obj, dict) else None
+            if isinstance(h, str) and h:
+                _cred_history_record(conn, h)
+                n += 1
+    except sqlite3.Error:
+        return n
+    return n
 
 
 # --- v2.9.2 F6 / v2.9.3 票3 (thread #53): heartbeat-rhythm gate --------------
@@ -889,6 +1077,8 @@ PROTOCOL = f"""# Review Board 协议 v{PROTOCOL_VERSION}
 - 心跳语义 =「可参与性信号」(备注 D):LLM 调用与带失败闸门的 watcher 探针都续 last_seen;
   连续 3 次唤醒失败后 watcher 停止心跳,成员自然衰减为暂缓(≥24h 无心跳)。
 - 暂缓 = 冻结计票参与(非清除),心跳恢复即自动复权。
+- **暂缓 ≠ veto**(票9 rev2,dsh #763 §4):暂缓者不计入自动路计票(活跃名册),复权后其票自动重入。(b) 形态成员在本修订内无票时,自动关帖前须有一次用户侧可读告知——创建者 `wake_ledger:` 条目覆盖该成员(复用既有 ledger 闸),静默排除不存在。
+- **检索面扩展(票6 ①②③/#74 §1,版本闸三件套逐项)**:①结构——新增 threads_fts(external-content, content=threads, trigram)+ai/ad/au 三触发器+启动自检扩展(对象名单/行数/指纹覆盖新表),comments_fts DDL 不动;②返回契约——每命中必填 hit_type 枚举(comment|thread),thread 命中 comment_id=null/is_self=false,comment 命中新增 cost_tokens 读面字段;③参数语义——新增 hit_type(all|comment|thread)/author_filter(与 author 正交,author 现语义一字不改)/severity_filter(生效时 thread 命中不返回),post_comment 新增可选 cost_tokens 申报(默认空,不造填写义务)。隐私面结论(pi #2354):帖正文可检索(随 threads_fts),snippet 掩码同规则(_search_snippet 唯一落点);同评论剔除用例=凭据形态串照掩(40-hex commit id 直通)。
 
 ## 讨论帖
 - review 帖建议传 quorum 并在 context 写明对象/目的;发言表态后须落判定。
@@ -1148,6 +1338,7 @@ def list_participants() -> str:
         ).fetchall()
     if not rows:
         return "No participants registered yet. Any author-carrying call registers."
+    registry, _mask_diag = _load_registry_ro()  # batch2 2.1: wake-error is a free-text echo (#2371 §1)
     lines = ["Participants:"]
     for r in rows:
         state, meta = _meta_obj(r["meta"])  # 空 BLOB 不塌缩 (#1622 P2)
@@ -1164,7 +1355,7 @@ def list_participants() -> str:
                   else "活跃" if idle_secs < DISPLAY_IDLE_MIN * 60 else "⚠️停摆")
         extra = f"  [meta_unparsable: state={state}]" if corrupt else ""
         if meta.get("last_wake_error"):
-            extra += f"  [wake-error: {meta['last_wake_error']}]"
+            extra += f"  [wake-error: {_mask_credential_text(str(meta['last_wake_error']), registry)}]"
         lines.append(
             f"  {r['author']} [{status}] heartbeat {_relative(last)} (first seen {_relative(r['first_seen'])}){extra}"
         )
@@ -1240,6 +1431,31 @@ def _floor_exempt_shape(conn: sqlite3.Connection) -> None:
     if "floor_exempt" not in cols:
         conn.execute(
             "ALTER TABLE comments ADD COLUMN floor_exempt INTEGER NOT NULL DEFAULT 0"
+        )
+
+
+def _summary_free_shape(conn: sqlite3.Connection) -> None:
+    """票9 ⑤ (rev 2, dsh #763): comments.summary_free — additive column,
+    idempotent every-start fixup (same PRAGMA guard pattern as
+    _floor_exempt_shape; O(1) metadata ALTER, no version-ladder step).
+    Marks the creator's ONE free per-thread summary post (#2465 同族：行级
+    打标由服务端单点置位，客户端无从伪造). Fresh DBs get it from schema.sql."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(comments)")}
+    if "summary_free" not in cols:
+        conn.execute(
+            "ALTER TABLE comments ADD COLUMN summary_free INTEGER NOT NULL DEFAULT 0"
+        )
+
+
+def _cost_tokens_shape(conn: sqlite3.Connection) -> None:
+    """票6 ③ (dsh #763 §1⑤): comments.cost_tokens — optional declared cost,
+    read-face only (#2461 同族: 不进 needs_attention、不进任何门). Additive
+    column, idempotent PRAGMA-guard fixup (same family as
+    _summary_free_shape); fresh DBs get it from schema.sql."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(comments)")}
+    if "cost_tokens" not in cols:
+        conn.execute(
+            "ALTER TABLE comments ADD COLUMN cost_tokens INTEGER"
         )
 
 
@@ -1320,7 +1536,14 @@ def init_db() -> None:
     with _connect() as conn:
         conn.executescript(_load_schema())
         _floor_exempt_shape(conn)  # v2.11.0 (#81 F4): pre-column dbs converge here
+        _summary_free_shape(conn)  # 票9 ⑤: pre-column dbs converge here (same family)
+        _cost_tokens_shape(conn)   # 票6 ③: pre-column dbs converge here (same family)
         conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+        _backfill_credential_history(conn)  # batch2 2.1: deploy-time idempotent backfill (#2367/#2368)
+        _, _boot_diag = _load_credential_registry(conn)  # #2403 §3.1 判(b): diag gets one DB-read outlet; reg unused (#2407 §3.4②)
+        if _boot_diag:
+            _audit(conn, "system", "cred_mask_diag",
+                   note=f"entries={len(_boot_diag)} first={_oneline(';'.join(_boot_diag), 160)}")
         row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
         if row is None:
             # legacy pre-meta database: identify & complete its shape, then stamp.
@@ -1455,6 +1678,13 @@ _SEARCH_DDL = (
     "CREATE VIRTUAL TABLE IF NOT EXISTS comments_fts USING fts5("
     "body, thread_id UNINDEXED, author UNINDEXED, "
     "content=comments, content_rowid=id, tokenize='trigram')",
+    # 票6 ①/#74 §1① (dsh #759 §1① 三方 pass): NEW independent index face for
+    # THREAD bodies — external-content bound to threads (single-content-table
+    # rule means threads.context can never join comments_fts); title+context
+    # both indexed per the privacy conclusion (pi #2354: 帖正文可检索,掩码同规则).
+    # comments_fts DDL untouched.
+    "CREATE VIRTUAL TABLE IF NOT EXISTS threads_fts USING fts5("
+    "title, context, content=threads, content_rowid=id, tokenize='trigram')",
 )
 _SEARCH_TRIGGER_DDL = (
     # The three sync triggers keep the external-content index aligned with
@@ -1473,6 +1703,21 @@ _SEARCH_TRIGGER_DDL = (
        VALUES ('delete', old.id, old.body, old.thread_id, old.author);
        INSERT INTO comments_fts(rowid, body, thread_id, author)
        VALUES (new.id, new.body, new.thread_id, new.author);
+    END""",
+    # 票6 ①: the SAME three-trigger pattern for the threads index.
+    """CREATE TRIGGER IF NOT EXISTS threads_fts_ai AFTER INSERT ON threads BEGIN
+       INSERT INTO threads_fts(rowid, title, context)
+       VALUES (new.id, new.title, new.context);
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS threads_fts_ad AFTER DELETE ON threads BEGIN
+       INSERT INTO threads_fts(threads_fts, rowid, title, context)
+       VALUES ('delete', old.id, old.title, old.context);
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS threads_fts_au AFTER UPDATE ON threads BEGIN
+       INSERT INTO threads_fts(threads_fts, rowid, title, context)
+       VALUES ('delete', old.id, old.title, old.context);
+       INSERT INTO threads_fts(rowid, title, context)
+       VALUES (new.id, new.title, new.context);
     END""",
 )
 
@@ -1524,7 +1769,9 @@ def _search_tx(conn: sqlite3.Connection, work) -> None:
 
 
 def _search_fingerprint(c: sqlite3.Connection) -> str:
-    """Deterministic content fingerprint over (id, body) of every comment.
+    """Deterministic content fingerprint over (id, body) of every comment
+    PLUS (id, title, context) of every thread (票6 ① 自检③扩展: 指纹覆盖
+    threads_fts 的新表 — dsh #2355 §2 自检三处同改之三).
     Stronger for our threat model than FTS5 integrity-check alone: a dropped
     trigger + UPDATE keeps row COUNTS equal and the index internally
     consistent while its postings go stale — only comparing content hashes
@@ -1533,6 +1780,10 @@ def _search_fingerprint(c: sqlite3.Connection) -> str:
     h = hashlib.sha256()
     for cid, body in c.execute("SELECT id, body FROM comments ORDER BY id"):
         h.update(f"{cid}\x1f{body}\x1e".encode("utf-8", "surrogatepass"))
+    for tid, title, ctx in c.execute(
+            "SELECT id, title, context FROM threads ORDER BY id"):
+        h.update(f"{tid}\x1f{title or ''}\x1f{ctx or ''}\x1e".encode(
+            "utf-8", "surrogatepass"))
     return h.hexdigest()[:16]
 
 
@@ -1547,11 +1798,13 @@ def _search_apply(conn: sqlite3.Connection) -> None:
         for ddl in _SEARCH_TRIGGER_DDL:
             c.execute(ddl)
         c.execute("INSERT INTO comments_fts(comments_fts) VALUES('rebuild')")
+        c.execute("INSERT INTO threads_fts(threads_fts) VALUES('rebuild')")
         n = c.execute("SELECT COUNT(*) FROM comments").fetchone()[0]
+        nt = c.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
         c.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('search_index_ready', ?)",
             (json.dumps({"ts": _now_iso(), "sqlite": sqlite3.sqlite_version,
-                         "indexed_rows": n,
+                         "indexed_rows": n, "threads_indexed_rows": nt,
                          "fingerprint": _search_fingerprint(c)},
                         ensure_ascii=False),),
         )
@@ -1571,11 +1824,14 @@ def _search_repair(conn: sqlite3.Connection) -> None:
         for ddl in _SEARCH_TRIGGER_DDL:
             c.execute(ddl)
         c.execute("INSERT INTO comments_fts(comments_fts) VALUES('rebuild')")
+        c.execute("INSERT INTO threads_fts(threads_fts) VALUES('rebuild')")
         n = c.execute("SELECT COUNT(*) FROM comments").fetchone()[0]
+        nt = c.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
         c.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('search_index_ready', ?)",
             (json.dumps({"ts": _now_iso(), "sqlite": sqlite3.sqlite_version,
-                         "indexed_rows": n, "repaired": True,
+                         "indexed_rows": n, "threads_indexed_rows": nt,
+                         "repaired": True,
                          "fingerprint": _search_fingerprint(c)},
                         ensure_ascii=False),),
         )
@@ -1605,26 +1861,33 @@ def _search_bootstrap(conn: sqlite3.Connection) -> None:
             SEARCH_STATE.update(enabled=True, reason=None)
             return
         # v7: verify structure + consistency; repair if anything is off.
+        # 票6 ① 自检三处同改 (dsh #2355 §2): ①对象名单 4→8（threads_fts+三触发器
+        # 缺一即修）②行数等式加 threads 面 ③指纹/行数 marker 覆盖新表。
         marker_row = conn.execute(
             "SELECT value FROM meta WHERE key='search_index_ready'"
         ).fetchone()
         objs = conn.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE name IN"
-            " ('comments_fts','comments_fts_ai','comments_fts_ad','comments_fts_au')"
+            " ('comments_fts','comments_fts_ai','comments_fts_ad','comments_fts_au',"
+            "  'threads_fts','threads_fts_ai','threads_fts_ad','threads_fts_au')"
         ).fetchone()[0]
-        if marker_row is None or objs < 4:
+        if marker_row is None or objs < 8:
             _search_repair(conn)
             SEARCH_STATE.update(enabled=True, reason=None)
             return
         n_comments = conn.execute("SELECT COUNT(*) FROM comments").fetchone()[0]
         n_index = conn.execute("SELECT COUNT(*) FROM comments_fts").fetchone()[0]
+        n_threads = conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
+        n_tindex = conn.execute("SELECT COUNT(*) FROM threads_fts").fetchone()[0]
         try:
             marker = json.loads(marker_row[0])
         except (ValueError, TypeError):
             marker = {}
         consistent = (
             n_comments == n_index
+            and n_threads == n_tindex
             and marker.get("indexed_rows") == n_comments
+            and marker.get("threads_indexed_rows") == n_threads
             and marker.get("fingerprint") == _search_fingerprint(conn)
         )
         if not consistent:
@@ -1656,12 +1919,20 @@ def _like_literal(term: str) -> str:
     return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _search_snippet(body: str, terms: list[str], cap: int) -> str:
+def _search_snippet(body: str, terms: list[str], cap: int,
+                    registry: frozenset = frozenset()) -> str:
     """Snippet built AROUND the first hit (v2 §7; A12/#40 boundary cases):
     earliest occurrence of any term; window centered ahead of it; ellipses
     when cut. Falls back to the head when no literal occurrence exists
     (folding differences like über/ÜBER can make MATCH hit without a plain
-    substring — the head is honest, a wrong window is not)."""
+    substring — the head is honest, a wrong window is not).
+
+    batch2 2.1 (#113 v9): `pos` is still computed on the ORIGINAL text
+    (#2358 §2: self-search keeps its center); the slice is taken from the
+    MASKED full text — masking is length-preserving, so start/window offsets
+    are unaffected and window edges can never leak a ≤31-hex plaintext
+    fragment (slice-then-mask hole closed). Registry loaded ONCE at the
+    search_comments entry and passed in — this stays a pure function."""
     body = str(body)
     pos = -1
     for t in terms:
@@ -1670,10 +1941,11 @@ def _search_snippet(body: str, terms: list[str], cap: int) -> str:
             pos = p
     if pos < 0:
         pos = 0
+    masked = _mask_credential_text(body, registry) if registry else body
     start = max(0, pos - cap // 4)
-    window = body[start:start + cap]
+    window = masked[start:start + cap]
     prefix = "…" if start > 0 else ""
-    suffix = "…" if start + cap < len(body) else ""
+    suffix = "…" if start + cap < len(masked) else ""
     return prefix + window + suffix
 
 
@@ -1712,7 +1984,8 @@ def _author_usage(conn: sqlite3.Connection, thread_id: int, author: str) -> int:
     count raw comments); they also still satisfy the discussion floor."""
     n = conn.execute(
         "SELECT COUNT(*) FROM comments WHERE thread_id=? AND author=?"
-        " AND COALESCE(floor_exempt, 0) = 0",
+        " AND COALESCE(floor_exempt, 0) = 0"
+        " AND COALESCE(summary_free, 0) = 0",
         (thread_id, author),
     ).fetchone()[0]
     v = conn.execute(
@@ -2068,6 +2341,47 @@ def _audit_blocked_once(conn, thread_id: int, revision: int, reason: str,
     return False
 
 
+def _reissue_window_end(conn: sqlite3.Connection, author: str, meta: dict) -> dict:
+    """batch2 1.4 (dsh #2351 §1 single-source contract): THE reissue-window
+    arithmetic — the enforcement face (claim_token) and the read face
+    (_token_blocked_face) both call this and only this, so the window a user
+    is TOLD about can never diverge from the window actually enforced.
+
+    Bindings (carried verbatim into the PR doc):
+    1. hours judged ONLY by meta["token_acked_via"] == "auto" — never inferred
+       from a latch tier (read faces don't infer write-point knowledge).
+    2. no governance activity at all ⇒ window_end=None: that is "no window",
+       NOT "a window ending in the future"; never fall back to the ack time.
+    3. an unparsable last-activity stamp is EXPLICIT ("unparsable" +
+       reason=unparsable_last_activity), never a silently vanished segment.
+       Enforcement stays fail-closed on it (via _hours_since()==0.0 ⇒ locked).
+    4. acceptance is the equality read_end == enforce_end within one sampling
+       (fixtures: no activity / re-governance after ack / auto tier) —
+       symbol anchors only, line numbers forbidden on this chain (#2351 §1.4).
+
+    Returns {"hours": float, "window_end": None | "unparsable" | timestamp str,
+    "reason": str, "last": raw last-activity stamp or None}.
+    """
+    hours = (AUTO_ACK_REISSUE_HOURS if meta.get("token_acked_via") == "auto"
+             else REISSUE_AFTER_HOURS)
+    last = conn.execute(
+        "SELECT created_at FROM verdict_events WHERE author=?"
+        " AND action IN ('verdict','verdict_free','bump_revision','set_quorum')"
+        " ORDER BY id DESC LIMIT 1", (author,),
+    ).fetchone()
+    if last is None:
+        return {"hours": hours, "window_end": None,
+                "reason": "unlocked_no_governance_activity", "last": None}
+    raw = last["created_at"]
+    try:
+        end_dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S") + timedelta(hours=hours)
+        return {"hours": hours, "window_end": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "reason": "governance_inactivity", "last": raw}
+    except ValueError:
+        return {"hours": hours, "window_end": "unparsable",
+                "reason": "unparsable_last_activity", "last": raw}
+
+
 @mcp.tool
 def claim_token(author: str) -> str:
     """Issue (or reissue) your governance token — two-phase (v2.1; v2.3 two-tier acks).
@@ -2109,6 +2423,7 @@ def claim_token(author: str) -> str:
             meta.update(token_hash=hashlib.sha256(token.encode()).hexdigest(),
                         token_acked=False, token_issued_at=_now_iso())
             _set_meta(conn, author, meta)
+            _cred_history_record(conn, meta["token_hash"])  # batch2 2.1: history append (#113 v9)
             _audit(conn, author, "token_issue", note="provisional (unacked)")
             return (f"Token issued for '{author}' (shown ONCE; {hint}):\n  {token}\n"
                     f"Governance calls (set_verdict / bump_revision / set_quorum) require it.")
@@ -2128,6 +2443,7 @@ def claim_token(author: str) -> str:
             meta.update(token_hash=hashlib.sha256(token.encode()).hexdigest(),
                         token_acked=False, token_issued_at=_now_iso())
             _set_meta(conn, author, meta)
+            _cred_history_record(conn, meta["token_hash"])  # batch2 2.1: history append
             _audit(conn, author, "token_reissue",
                    note="unacked free reissue (v2.1: claimant never persisted)")
             return (f"Token REISSUED for '{author}' — previous unacked token "
@@ -2136,13 +2452,13 @@ def claim_token(author: str) -> str:
         # (governance use without proven persistence) gets the short lock;
         # only an EXPLICIT ack (persisted + read back) enjoys the full 24h.
         via = meta.get("token_acked_via", "explicit")
-        window_h = AUTO_ACK_REISSUE_HOURS if via == "auto" else REISSUE_AFTER_HOURS
-        last = conn.execute(
-            "SELECT created_at FROM verdict_events WHERE author=?"
-            " AND action IN ('verdict','verdict_free','bump_revision','set_quorum')"
-            " ORDER BY id DESC LIMIT 1", (author,),
-        ).fetchone()
-        if last is None or _hours_since(last["created_at"]) >= window_h:
+        # batch2 1.4 (dsh #2351 §1): window arithmetic is single-sourced in
+        # _reissue_window_end — this face and _token_blocked_face answer the
+        # same window from the same sampling. hours judgment = ONLY
+        # meta["token_acked_via"] == "auto". Unparsable last-activity stays
+        # fail-closed here (_hours_since()==0.0 ⇒ no reissue), same as before.
+        win = _reissue_window_end(conn, author, meta)
+        if win["window_end"] is None or _hours_since(win["last"]) >= win["hours"]:
             # v2.12.0 (1.1a): inside the THEN block — the lock-window reject at
             # the end of this function is the ELSE side, so anchoring on the last
             # textual ERROR would have produced dead code (#1183 §二.2).
@@ -2152,6 +2468,7 @@ def claim_token(author: str) -> str:
                         token_acked=False, token_acked_at=None,
                         token_acked_via=None, token_issued_at=_now_iso())
             _set_meta(conn, author, meta)
+            _cred_history_record(conn, meta["token_hash"])  # batch2 2.1: history append
             _audit(conn, author, "token_reissue",
                    note=(f"{'auto' if via == 'auto' else 'acked'} reissue after "
                          f"window ({'auto-ack short lock' if via == 'auto' else 'governance inactivity'})"))
@@ -2159,8 +2476,8 @@ def claim_token(author: str) -> str:
         return (
             f"ERROR: token for '{author}' is issued AND acknowledged via '{via}' "
             f"({'transient possession only — short lock' if via == 'auto' else 'durable possession'}). "
-            f"Reissue unlocks after {window_h:g}h without governance activity "
-            f"(last: {last['created_at']}); for an urgent human-authorized reset "
+            f"Reissue unlocks after {win['hours']:g}h without governance activity "
+            f"(last: {win['last']}); for an urgent human-authorized reset "
             f"use reset_token(human_override=True)."
         )
 
@@ -2441,6 +2758,7 @@ def create_thread(
     author: str | None = None,
     quorum: list[str] | None = None,
     per_author_budget: int | None = None,
+    form_b_nonce: str | None = None,
 ) -> str:
     """Start a new review topic.
 
@@ -2470,6 +2788,9 @@ def create_thread(
     """
     if per_author_budget is not None and (per_author_budget < 1 or per_author_budget > 100):
         return "ERROR: per_author_budget must be in [1, 100]"
+    # batch2 2.1: registry loaded on its own query_only connection BEFORE the
+    # write txn (#2371 §2.2 — 装载提前 _begin_write 之前; never rides the write).
+    _registry, _mask_diag = _load_registry_ro()
     with db() as conn:
         _begin_write(conn)
         exempt = None
@@ -2484,6 +2805,47 @@ def create_thread(
             names = [q.strip() for q in quorum]
             if len(set(names)) != len(names):
                 return "ERROR: quorum contains duplicate names"
+            # 票9 ② (rev 2, dsh #763): 硬闸 QUORUM_OPEN_CAP——只对带 quorum 的建帖
+            # 生效，先建先排；过渡条款：已 open 的存量照算不追溯关闭。触顶仍可投票
+            # （THREAD_CAP 只锁讨论——两处触顶文案明写 set_verdict 不受影响）。
+            open_q = conn.execute(
+                "SELECT COUNT(*) FROM threads WHERE status='open' AND quorum IS NOT NULL"
+            ).fetchone()[0]
+            if open_q >= QUORUM_OPEN_CAP:
+                ids = conn.execute(
+                    "SELECT id FROM threads WHERE status='open' AND quorum IS NOT NULL ORDER BY id"
+                ).fetchall()
+                idlist = ",".join("#%d" % r[0] for r in ids)
+                return (f"ERROR: open quorum threads = {open_q} (cap {QUORUM_OPEN_CAP}): "
+                        f"{idlist}; resolve or conclude them first.")
+            # 票7 2.2: initiate nonce 消费——绑定 (创建者, 标题哈希, 名单) 三者全对
+            # 且未过期未消费才放行；不符即拒（fail-closed：建帖后无法补，#2349 §2）。
+            # 校验位置在任何邀请注册之前——被拒的建帖不得注册任何人（L1 门同款纪律）。
+            if form_b_nonce is not None:
+                th = hashlib.sha256(title.strip().encode()).hexdigest()[:16]
+                marker_row = conn.execute("SELECT value FROM meta WHERE key=?",
+                                          (f"form_b_initiate_{th}",)).fetchone()
+                ok, why = False, "no initiate nonce for this title hash"
+                if marker_row is not None:
+                    pend = json.loads(marker_row[0])
+                    if pend.get("consumed"):
+                        why = "initiate nonce already consumed"
+                    elif pend.get("creator") != author:
+                        why = "initiate nonce creator mismatch"
+                    elif float(pend.get("expires_at", 0)) < datetime.now(timezone.utc).timestamp():
+                        why = "initiate nonce expired (TTL 24h)"
+                    elif not set(names) <= set(pend.get("names", [])):
+                        why = "quorum names not covered by the initiate nonce binding"
+                    else:
+                        ok = True
+                if not ok:
+                    return f"ERROR: form_b_nonce rejected: {why}"
+                pend["consumed"] = True
+                conn.execute("UPDATE meta SET value=? WHERE key=?",
+                             (json.dumps(pend, ensure_ascii=False),
+                              f"form_b_initiate_{th}"))
+                _audit(conn, author, "form_b_initiate_consumed",
+                       note=f"names={pend.get('names')}; title_hash={th}")
             # v2.9 L1 (thread #45): wake_infra declaration gate — BEFORE the
             # invitee auto-registration touches (a rejected thread must not
             # register anyone). v2.9.2 (#48 ②): the CREATOR is in the checked
@@ -2560,7 +2922,7 @@ def create_thread(
             # writes meta.invited_at and leaves last_seen NULL for a new name.
             _invite(conn, q, tid)
     return (
-        f"Created thread #{tid}: {title}\n"
+        f"Created thread #{tid}: {_mask_credential_text(title, _registry)}\n"  # batch2 2.1: receipt title face
         f"Share this id with the other reviewers. New members: read get_protocol first."
     )
 
@@ -2590,11 +2952,14 @@ def post_comment(
     file: str | None = None,
     line: int | None = None,
     severity: str | None = None,
+    summary: bool = False,
+    cost_tokens: int | None = None,
 ) -> str:
     """Post a top-level review comment in a thread.
 
     DISCUSSION CAP: threads hold at most 100 comments total (posts + replies).
     Posting into a full thread is rejected — conclude with set_status instead.
+    Voting (set_verdict) is NOT affected by this cap (票9 ①).
 
     Args:
         thread_id: the thread to comment on (from create_thread / list_threads).
@@ -2603,11 +2968,22 @@ def post_comment(
         file: optional file path the comment refers to.
         line: optional line number.
         severity: optional 'info' | 'minor' | 'major' | 'blocker'.
+        summary: 票9 ⑤ (rev 2, dsh #763) — 创建者专用收尾摘要。仅 thread 创建者可传
+            (他人传入即拒)；每帖第一条 summary=True 不计入 _author_usage(行级
+            summary_free 打标，服务端单点置位，沿 F4 floor_exempt 先例)，第二条起
+            按普通评论计费；仍受 THREAD_CAP 与日额约束。
 
     Returns: the new comment id and a short confirmation.
     """
     if severity is not None and severity not in VALID_SEVERITIES:
         return f"ERROR: severity must be one of {VALID_SEVERITIES}, got {severity!r}"
+    # 票6 ③: cost_tokens 可选申报——不造填写义务(默认空), 只进读面, 不进任何门。
+    if cost_tokens is not None and (not isinstance(cost_tokens, int)
+                                    or isinstance(cost_tokens, bool) or cost_tokens < 0):
+        return "ERROR: cost_tokens must be a non-negative integer when provided"
+    # batch2 2.1: loaded BEFORE the write txn (#2371 §2.2); `file` is a
+    # caller-supplied free-text echoed in the receipt (负例 C face).
+    _registry, _mask_diag = _load_registry_ro()
     with db() as conn:
         _begin_write(conn)
         _touch(conn, author)
@@ -2620,15 +2996,28 @@ def post_comment(
             return (
                 f"ERROR: thread #{thread_id} is locked — discussion cap reached "
                 f"({THREAD_CAP} comments). No further posts or replies accepted. "
-                f"Conclude the discussion with set_status(thread_id, 'resolved' or 'wontfix')."
+                f"Conclude the discussion with set_status(thread_id, 'resolved' or 'wontfix'). "
+                f"Voting (set_verdict) is NOT affected by this cap."
             )
         trow = conn.execute(
-            "SELECT per_author_budget, revision FROM threads WHERE id=?", (thread_id,)
+            "SELECT per_author_budget, revision, author FROM threads WHERE id=?", (thread_id,)
         ).fetchone()
         budget, t_rev = trow["per_author_budget"], trow["revision"]
+        # 票9 ⑤ (rev 2, dsh #763): 创建者收尾摘要——仅创建者可传；每帖第一条免费
+        # (summary_free 行级打标，服务端单点置位，沿 F4 floor_exempt 先例：客户端
+        # 无从伪造)；第二条起按普通评论计费；仍受 THREAD_CAP 与日额约束。
+        summary_free = False
+        if summary:
+            if author != trow["author"]:
+                return "ERROR: summary comments are creator-only"
+            prior = conn.execute(
+                "SELECT COUNT(*) FROM comments WHERE thread_id=? AND author=?"
+                " AND COALESCE(summary_free, 0) = 1", (thread_id, author),
+            ).fetchone()[0]
+            summary_free = prior == 0
         used = _author_usage(conn, thread_id, author)
         floor_exempt_post = False
-        if used >= budget:
+        if used >= budget and not summary_free:
             # v2.11.0 (#81 F4)：收口时刻的免费地板句——预算耗尽 ∧ F2 之后我仍在
             # 地板欠账 ∧ 其余活跃成员票全 pass（复用 blocking 判据，不自算）。
             # 行级 floor_exempt 标由服务端在本分支单点置位（post_comment 无此
@@ -2673,10 +3062,10 @@ def post_comment(
                 "if a close is blocked on this."
             )
         cur = conn.execute(
-            """INSERT INTO comments(thread_id, parent_id, author, body, file, line, severity, floor_exempt)
-               VALUES (?, NULL, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO comments(thread_id, parent_id, author, body, file, line, severity, floor_exempt, summary_free, cost_tokens)
+               VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (thread_id, author, body, file, line, severity,
-             1 if floor_exempt_post else 0),
+             1 if floor_exempt_post else 0, 1 if summary_free else 0, cost_tokens),
         )
         cid = cur.lastrowid
         if floor_exempt_post:
@@ -2693,10 +3082,10 @@ def post_comment(
         recompute_thread(conn, thread_id)
     loc = ""
     if file:
-        loc = f" at {file}" + (f":{line}" if line else "")
+        loc = f" at {_mask_credential_text(file, _registry)}" + (f":{line}" if line else "")
     sev = f" [{severity}]" if severity else ""
     free_tag = " (free floor comment — budget untouched, v2.11.0 #81 F4)" if floor_exempt_post else ""
-    return f"Posted comment #{cid} in thread #{thread_id} by {author}{sev}{loc}.{free_tag}{stale_note}"
+    return f"Posted comment #{cid} in thread #{thread_id} by {author}{sev}{loc}.{free_tag}{_mask_credential_text(stale_note, _registry)}"  # batch2 2.1: stale receipt note face (F-ratchet, declaration table)
 
 
 @mcp.tool
@@ -2713,6 +3102,9 @@ def reply_comment(comment_id: int, author: str, body: str) -> str:
 
     Returns: the new reply comment id.
     """
+    # batch2 2.1: registry loaded BEFORE the write txn (#2371 §2.2 装载提前) —
+    # the stale receipt note face is masked at assembly (declaration table row).
+    _registry, _mask_diag = _load_registry_ro()
     with db() as conn:
         _begin_write(conn)
         _touch(conn, author)
@@ -2728,7 +3120,8 @@ def reply_comment(comment_id: int, author: str, body: str) -> str:
             return (
                 f"ERROR: thread #{row['thread_id']} is locked — discussion cap reached "
                 f"({THREAD_CAP} comments). No further posts or replies accepted. "
-                f"Conclude the discussion with set_status(thread_id, 'resolved' or 'wontfix')."
+                f"Conclude the discussion with set_status(thread_id, 'resolved' or 'wontfix'). "
+                f"Voting (set_verdict) is NOT affected by this cap."
             )
         trow = conn.execute(
             "SELECT per_author_budget, revision FROM threads WHERE id=?", (row["thread_id"],)
@@ -2787,7 +3180,32 @@ def reply_comment(comment_id: int, author: str, body: str) -> str:
         # can be the last thing the discussion floor was waiting for.
         recompute_thread(conn, row["thread_id"])
     free_tag = " (free floor comment — budget untouched, v2.11.0 #81 F4)" if floor_exempt_post else ""
-    return f"Posted reply #{cid} to comment #{comment_id} by {author}.{free_tag}{stale_note}"
+    return f"Posted reply #{cid} to comment #{comment_id} by {author}.{free_tag}{_mask_credential_text(stale_note, _registry)}"  # batch2 2.1: stale receipt note face (F-ratchet, declaration table)
+
+
+@mcp.tool
+def preflight(author: str) -> str:
+    """1.2a (#86 残件, 票5 绑定): READ-ONLY eligibility preflight — the three
+    columns a watcher needs (last_seen / last_read / last_delivered_id) with
+    ZERO write side effects: query-only connection, no _touch, no cursor
+    advance (C3 by construction). Acceptance = participants.meta byte-identical
+    before/after the call.
+
+    Args:
+        author: the member to query (self-check before a governance action).
+
+    Returns: the three columns verbatim, or an explicit not-registered error.
+    """
+    with _connect_ro() as conn:
+        row = conn.execute(
+            "SELECT author, last_seen, last_read, last_delivered_id"
+            " FROM participants WHERE author=?", (author,),
+        ).fetchone()
+    if row is None:
+        return f"ERROR: participant {author!r} not registered"
+    return (f"preflight {row['author']}: last_seen={row['last_seen']!r}"
+            f" last_read={row['last_read']!r}"
+            f" last_delivered_id={row['last_delivered_id']!r}")
 
 
 @mcp.tool
@@ -2805,6 +3223,7 @@ def list_threads(status: str | None = None) -> str:
     if status != "all" and status not in VALID_STATUSES:
         return f"ERROR: status must be one of {VALID_STATUSES} or 'all', got {status!r}"
     with db() as conn:
+        registry, _mask_diag = _load_credential_registry(conn)  # batch2 2.1: title face
         if status == "all":
             rows = conn.execute(
                 """SELECT t.id, t.title, t.status, t.created_at, t.quorum,
@@ -2833,22 +3252,32 @@ def list_threads(status: str | None = None) -> str:
     lines = ["Threads:"]
     for r in rows:
         flag = f"  ⚠ stale-object:{stale_by_id[r['id']]}" if r["id"] in stale_by_id else ""
-        lines.append(f"  #{r['id']} [{r['status']}] {r['title']}  ({r['n']} comments, {r['created_at']}){flag}")
+        lines.append(f"  #{r['id']} [{r['status']}] {_mask_credential_text(r['title'], registry)}  ({r['n']} comments, {r['created_at']}){flag}")
     return "\n".join(lines)
 
 
 @mcp.tool
-def get_thread(thread_id: int) -> str:
+def get_thread(thread_id: int, page: int | None = None, per_page: int = 20) -> str:
     """Get a whole thread: its metadata plus the full comment tree (replies
     shown nested under their parent).
 
+    1.2c (#86 残件, #1049 §四②): optional pagination over TOP-LEVEL comments —
+    page=None (default) renders everything exactly as before (watcher/SDK
+    read face unchanged); page=N renders the Nth window of top-level comments
+    (replies stay attached to their parent), with a `page: p/P` marker line.
+
     Args:
         thread_id: the thread to read.
+        page: optional 1-based page over top-level comments (None = all).
+        per_page: top-level comments per page (1..100, default 20).
 
-    Returns: a formatted view of the thread and all comments with their reply
+    Returns: a formatted view of the thread and comments with their reply
         structure, authors, severity, file:line, and status.
     """
     with db() as conn:
+        # batch2 2.1: registry loaded once at the face entry (title / note /
+        # gate note / context / file / body are all free-text echoes here).
+        registry, _mask_diag = _load_credential_registry(conn)
         t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
         if t is None:
             return f"ERROR: thread #{thread_id} does not exist"
@@ -2929,9 +3358,24 @@ def get_thread(thread_id: int) -> str:
                                       "set_quorum", "human_override"):
                     gate_events.append(ev)
     out = [
-        f"Thread #{t['id']}: {t['title']}  [{t['status']}]",
+        f"Thread #{t['id']}: {_mask_credential_text(t['title'], registry)}  [{t['status']}]",
         f"  created: {t['created_at']}   comments: {len(all_comments)}/{THREAD_CAP}",
     ]
+    # 票6 ③: 帖面汇总——只进读面, 不进任何门 (trae #612 §5: 数字一旦进判定,
+    # 会变成新的表演面); 未申报为 null 的行不计入。
+    with _connect_ro() as _ro_conn:
+        cost_sum = _ro_conn.execute(
+            'SELECT COALESCE(SUM(cost_tokens), 0), COUNT(cost_tokens) FROM comments'
+            ' WHERE thread_id=? AND cost_tokens IS NOT NULL', (t['id'],),
+        ).fetchone()
+    if cost_sum[1]:
+        out.append(f'  cost_tokens: {cost_sum[0]} (declared by {cost_sum[1]} comment(s))')
+    # 票9 ② (rev 2, dsh #763): open_quorum_count 整数字段——服务端可读，不靠文档口径。
+    with _connect_ro() as _ro_conn:
+        open_quorum_count = _ro_conn.execute(
+            "SELECT COUNT(*) FROM threads WHERE status='open' AND quorum IS NOT NULL"
+        ).fetchone()[0]
+    out.append(f"  open_quorum_count: {open_quorum_count} (cap {QUORUM_OPEN_CAP})")
     if t["quorum"]:
         stale_flag = f"   ⚠ stale-object: {stale}" if stale else ""
         out.append(f"  quorum: {names}   revision: {t['revision']}   budget: {usage or '—'}{stale_flag}")
@@ -2946,7 +3390,7 @@ def get_thread(thread_id: int) -> str:
             if v is not None:
                 seg = f"    {n}: {v['verdict']} @ {v['updated_at']} [{liveness[n]}]"
                 if v["note"]:
-                    seg += (f"  note: {_oneline(str(v['note']), 160)}"
+                    seg += (f"  note: {_oneline(_mask_credential_text(str(v['note']), registry), 160)}"  # batch2 2.1: 先掩后截断 (#2371 §2.1)
                             f" [n={len(' '.join(str(v['note'] or '').split()))};"
                             f" full: configs/rb-notes.py {thread_id}]")
                 if trails.get(n):
@@ -2966,7 +3410,7 @@ def get_thread(thread_id: int) -> str:
                 rev = f" r{ev['revision']}" if ev["revision"] is not None else ""
                 parts.append(
                     f"{ev['created_at']} {ev['action']}{rev} by {ev['author']}"
-                    f" ({_oneline(str(ev['note'] or ''), 120)})")
+                    f" ({_oneline(_mask_credential_text(str(ev['note'] or ''), registry), 120)})")
             out.append("  gate: " + " · ".join(parts))
 
     by_parent: dict[int | None, list[sqlite3.Row]] = {}
@@ -2975,7 +3419,8 @@ def get_thread(thread_id: int) -> str:
 
     if t["context"]:
         out.append("  context:")
-        for line in str(t["context"]).splitlines():
+        masked_ctx = _mask_credential_text(str(t["context"]), registry)  # batch2 2.1: 先掩后切行 (负例 D)
+        for line in masked_ctx.splitlines():
             out.append(f"    {line}")
     out.append("")
 
@@ -2983,16 +3428,31 @@ def get_thread(thread_id: int) -> str:
         indent = "  " * depth
         loc = ""
         if comment["file"]:
-            loc = f" {comment['file']}" + (f":{comment['line']}" if comment["line"] else "")
+            loc = f" {_mask_credential_text(comment['file'], registry)}" + (f":{comment['line']}" if comment["line"] else "")
         sev = f" [{comment['severity']}]" if comment["severity"] else ""
         st = f" ({comment['status']})" if comment["status"] != "open" else ""
         out.append(f"{indent}- #{comment['id']} {comment['author']}{sev}{st}{loc}:")
-        for line in str(comment["body"]).splitlines():
+        for line in _mask_credential_text(str(comment["body"]), registry).splitlines():
             out.append(f"{indent}    {line}")
         for child in by_parent.get(comment["id"], []):
             render(child, depth + 1)
 
-    for top in by_parent.get(None, []):
+    # 1.2c (#86 残件): optional top-level pagination — page=None renders all
+    # (default unchanged); page=N slices the TOP-LEVEL parent list (replies
+    # stay attached to their parent, never orphaned by a page boundary).
+    tops = by_parent.get(None, [])
+    if page is not None:
+        if page < 1:
+            return "ERROR: page must be >= 1 (page=None renders everything)"
+        per_page = max(1, min(int(per_page), 100))
+        total_pages = max(1, -(-len(tops) // per_page))
+        if page > total_pages:
+            return (f"ERROR: page {page} out of range "
+                    f"(total_pages={total_pages}, top-level={len(tops)}, per_page={per_page})")
+        tops = tops[(page - 1) * per_page: page * per_page]
+        out.append(f"  page: {page}/{total_pages} (top-level; per_page={per_page};"
+                   f" page=None for all)")
+    for top in tops:
         render(top, 0)
 
     if not all_comments:
@@ -3411,12 +3871,20 @@ def set_quorum(
 # --- v2.9.2 (#47 ①): form-b admission — user-side nonce ---------------------
 @mcp.tool
 def request_form_b(
-    thread_id: int,
+    thread_id: int | None,
     author: str,
     names: list[str],
     token: str | None = None,
+    purpose: str = "add",
+    title: str | None = None,
 ) -> str:
     """Creator-only: request (b)-form member admission for an OPEN thread.
+
+    票7 2.2 (pi #2349 §2): purpose="initiate" = 建帖前发起——thread_id 必须为
+    None、title 必填；nonce 绑 (标题哈希, quorum 名单, 发起者名)，由
+    create_thread(form_b_nonce=…) 在建帖时消费（绑定不符/TTL 过期即拒）。
+    「先建空帖再补 nonce」视同未过验收：initiate 模式带 thread_id 一律拒。
+    消费面 confirm_form_b/TTL 24h（add 模式）复用不动。
 
     The nonce is delivered USER-SIDE ONLY (server log + data/form_b_nonce.txt);
     it NEVER appears in any tool return or agent-visible context (dsh #492 1.1:
@@ -3431,8 +3899,59 @@ def request_form_b(
     not credentials.
     """
     import secrets as _secrets
+    if purpose not in ("add", "initiate"):
+        return f"ERROR: purpose must be 'add' or 'initiate', got {purpose!r}"
+    if purpose == "initiate" and thread_id is not None:
+        # 票7 2.2：「先建空帖再补 nonce」视同未过验收——initiate 只许建帖前发起。
+        return ("ERROR: initiate mode is pre-thread only (thread_id must be None; "
+                "creating a thread first and back-filling a nonce is a validation failure)")
+    if purpose == "add" and thread_id is None:
+        return "ERROR: add mode requires an existing thread (thread_id)"
+    if purpose == "initiate" and (not isinstance(title, str) or not title.strip()):
+        return "ERROR: initiate mode requires title (the nonce binds to the title hash)"
     with db() as conn:
         _begin_write(conn)
+        if purpose == "initiate":
+            # 票7 2.2：建帖前发起——nonce 绑 (标题哈希, quorum 名单, 发起者名)。
+            # 消费=create_thread(form_b_nonce=…) 建帖时校验；TTL 与 add 模式同。
+            _tok_err = _token_gate(conn, author, token, where="request_form_b")
+            if _tok_err:
+                return _tok_err
+            if not names or not all(isinstance(n, str) and n.strip() for n in names):
+                return "ERROR: names must be a non-empty list of strings"
+            _touch(conn, author)
+            clean = [n.strip() for n in names]
+            th = hashlib.sha256(title.strip().encode()).hexdigest()[:16]
+            nonce = _secrets.token_hex(16)
+            now = datetime.now(timezone.utc)
+            pending = {
+                "names": clean,
+                "creator": author,
+                "issued_at": _now_iso(),
+                "expires_at": (now.timestamp() + FORM_B_TTL_S),
+                "nonce_sha256": hashlib.sha256(nonce.encode()).hexdigest(),
+                "consumed": False,
+                "title_hash": th,
+                "purpose": "initiate",
+            }
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                         (f"form_b_initiate_{th}", json.dumps(pending, ensure_ascii=False)))
+            _cred_history_record(conn, pending["nonce_sha256"])
+            _audit(conn, author, "form_b_initiated",
+                   note=f"names={clean}; title_hash={th}; ttl={FORM_B_TTL_S}s; consumed-by=create_thread")
+            line = (f"[form_b] initiate (pre-thread) creator={author} names={clean} "
+                    f"title_hash={th} nonce={nonce} (expires {FORM_B_TTL_S // 3600}h; "
+                    f"user hands it to create_thread(form_b_nonce='…'))")
+            print(line, flush=True)
+            try:
+                p = DATA_DIR / "form_b_nonce.txt"
+                p.write_text(line + "\n", encoding="utf-8")
+            except OSError:
+                pass
+            return (f"form_b initiate nonce requested (pre-thread; names={clean}) — "
+                    f"delivered to the USER side only. Hand it to "
+                    f"create_thread(form_b_nonce='…') with the SAME title and names; "
+                    f"a thread created without consuming it cannot be back-filled.")
         t = conn.execute("SELECT * FROM threads WHERE id=?", (thread_id,)).fetchone()
         if t is None:
             return f"ERROR: thread #{thread_id} does not exist"
@@ -3468,6 +3987,7 @@ def request_form_b(
         }
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
                      (f"form_b_pending_{thread_id}", json.dumps(pending, ensure_ascii=False)))
+        _cred_history_record(conn, pending["nonce_sha256"])  # batch2 2.1: history append (#2368 §2)
         _audit(conn, author, "form_b_requested", thread_id=thread_id,
                note=f"names={clean}; nonce delivered user-side only (log + data/form_b_nonce.txt); ttl={FORM_B_TTL_S}s")
         # 用户侧交付面：服务器 stdout（→ server.log）+ 用户文件。绝不进返回体。
@@ -3575,8 +4095,12 @@ def register_meta(
                      (json.dumps(meta, ensure_ascii=False), author))
         _audit(conn, author, "register_meta",
                note=f"contract={contract}; entry={entry or ''} (consistency declaration, not gate truth)")
+        # batch2 2.1: `entry` is caller free-text echoed to the caller (#2373
+        # #20; the audit-note twin is masked at the read face — gate note point).
+        _reg2, _diag2 = _load_registry_ro()
+        masked_entry = _mask_credential_text(entry, _reg2) if entry else entry
         return (f"Meta registered for {author}: contract=({contract})"
-                + (f", entry={entry}" if entry else "")
+                + (f", entry={masked_entry}" if entry else "")
                 + ". This is a consistency declaration only — declarations that mismatch "
                   "it are audited (meta_mismatch), not rejected.")
 
@@ -3897,7 +4421,8 @@ def _token_blocked_face(conn: sqlite3.Connection, author: str) -> dict:
     #1553 §三): "manual" — read back as stored (the tier is written at the
     latch write point where the cause is known; this face never infers one
     from since/revision), exit = human reset or the reissue window end
-    (auto-ack 1h / explicit 24h from ack); and "break_glass" — a corrupt
+    (auto-ack 1h / explicit 24h; anchor = last governance activity, single
+    source _reissue_window_end — batch2 1.4 #2351 §1); and "break_glass" — a corrupt
     row's home: its bytes are unreadable and must not be written (reset is
     the only authorized overwrite), so the state itself is the cause and the
     entry is derived from _meta_state exactly like the meta_unparsable face
@@ -3917,15 +4442,19 @@ def _token_blocked_face(conn: sqlite3.Connection, author: str) -> dict:
         return {}
     latch = meta.get("token_blocked") or {}
     window = ""
-    if meta and meta.get("token_acked") and meta.get("token_acked_at"):
-        hours = (AUTO_ACK_REISSUE_HOURS if meta.get("token_acked_via") == "auto"
-                 else REISSUE_AFTER_HOURS)
-        try:
-            ends = datetime.strptime(meta["token_acked_at"], "%Y-%m-%d %H:%M:%S") \
-                + timedelta(hours=hours)
-            window = f" | window_ends_at={ends.strftime('%Y-%m-%d %H:%M:%S')}"
-        except ValueError:
-            pass
+    if meta and meta.get("token_acked"):
+        # batch2 1.4 (dsh #2351 §1): same single-source window as claim_token —
+        # anchor = last governance activity, NEVER "from ack" (the old second
+        # clock answered a future window when governance had since occurred,
+        # and a fake one when there was no activity at all). Parse failure is
+        # an explicit sentinel, never a silently vanished segment.
+        win = _reissue_window_end(conn, author, meta)
+        if win["window_end"] is None:
+            window = " | window_ends_at=unlocked (no governance activity yet)"
+        elif win["window_end"] == "unparsable":
+            window = f" | window_ends_at=unparsable | window_diag={win['reason']}"
+        else:
+            window = f" | window_ends_at={win['window_end']}"
     return {
         # Pre-batch3 entries carry no tier field; the mismatch branch was their
         # only writer, so "manual" is the migration default (not an inference —
@@ -3934,6 +4463,31 @@ def _token_blocked_face(conn: sqlite3.Connection, author: str) -> dict:
               "exit": f"reset_token(human_override=True){window}"}
         for tid, e in latch.items()
     }
+
+
+def _verdict_overdue(conn: sqlite3.Connection) -> list[str]:
+    """票9 ③ (rev 2, dsh #763): 催票名单——纯读（C3：不写审计、不计治理动作、
+    不推进游标）。定义 = 帖 open ∧ 非 wontfix ∧ 帖龄 >24h ∧ 该成员在 quorum 内
+    ∧ 当前无任何 verdict 行（never voted，任意修订）∧ 该成员活跃。暂缓者交给
+    C1 不催；帖龄 <24h 返回 []（空数组，不是缺字段）。"""
+    overdue: set[str] = set()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    trows = conn.execute(
+        "SELECT id, quorum, created_at FROM threads"
+        " WHERE status='open' AND quorum IS NOT NULL AND created_at < ?",
+        (cutoff,),
+    ).fetchall()
+    for tr in trows:
+        for n in json.loads(tr["quorum"]):
+            if conn.execute("SELECT 1 FROM verdicts WHERE thread_id=? AND author=?",
+                            (tr["id"], n)).fetchone() is not None:
+                continue                                    # 已有任何 verdict 行
+            prow = conn.execute("SELECT last_seen FROM participants WHERE author=?",
+                                (n,)).fetchone()
+            if prow is None or not _is_active(prow["last_seen"]):
+                continue                                    # 暂缓者交给 C1
+            overdue.add(n)
+    return sorted(overdue)
 
 
 def _awaiting_split(conn: sqlite3.Connection, author: str) -> tuple[list[int], list[dict]]:
@@ -4331,6 +4885,12 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
             "SELECT COUNT(*) FROM threads WHERE status='open'"
         ).fetchone()[0]
         if author:
+            # 票9 ③ (rev 2, dsh #763): verdict_overdue — 纯读催票字段（C3 同款口径：
+            # 不写审计、不计治理动作、不推进游标，否则催票自己变成新的欠账门）。
+            # 定义 = 帖 open ∧ 非 wontfix ∧ 帖龄 >24h ∧ 该成员在 quorum 内 ∧
+            # 当前无任何 verdict 行（never voted）∧ 该成员活跃（暂缓者交给 C1）。
+            # 帖龄 <24h 时为 []（空数组，不是缺字段——反例测试钉死）。
+            verdict_overdue = _verdict_overdue(conn)
             # D2: open ∧ 非 wontfix ∧ quorum ∧ no verdict on current revision ∧ active.
             # v2.9.4 结构性修复：拆成 可动作 / 被 L1.5 阻塞 两族（见 _awaiting_split）。
             # 旧实现在这里把"创建者被门挡住"也列进待办，导致 watcher 反复唤醒却
@@ -4344,6 +4904,7 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
             awaiting = "not_implemented"
             blocked_verdict = []
             ti_tids, due_face, tb_face = [], [], {}
+            verdict_overdue = []          # 票9 ③：author-less 轮询同字段在场（空数组）
     needs = {
         "new_comments": len(rows),
         "mentions_me": mentions,
@@ -4358,18 +4919,23 @@ def list_comments_since(since: str = "1h", author: str | None = None) -> str:
         "token_invalid": ti_tids,
         # v2.10 #77 档B：只读 latch，不触发唤醒。
         "token_blocked": tb_face,
+        # 票9 ③：催票名单（>24h 帖龄 ∧ quorum ∧ never voted ∧ 活跃；纯读 C3）。
+        "verdict_overdue": verdict_overdue,
     }
     header = "needs_attention: " + json.dumps(needs, ensure_ascii=False)
     if not rows:
         return f"{header}\nNo comments since {cutoff}."
+    registry, _mask_diag = _load_registry_ro()  # batch2 2.1: preview/file are free-text echoes
     lines = [header, f"Comments since {cutoff} ({len(rows)}):"]
     for r in rows:
         loc = ""
         if r["file"]:
-            loc = f" {r['file']}" + (f":{r['line']}" if r["line"] else "")
+            loc = f" {_mask_credential_text(r['file'], registry)}" + (f":{r['line']}" if r["line"] else "")
         sev = f" [{r['severity']}]" if r["severity"] else ""
         reply = f" (reply to #{r['parent_id']})" if r["parent_id"] else ""
-        body_preview = str(r["body"]).replace("\n", " ")
+        # batch2 2.1: mask FIRST, then flatten/truncate (#2370 §5①) — the mask
+        # is length-preserving, so the 157+... arithmetic is untouched.
+        body_preview = _mask_credential_text(str(r["body"]), registry).replace("\n", " ")
         if len(body_preview) > 160:
             body_preview = body_preview[:157] + "..."
         lines.append(
@@ -4389,6 +4955,9 @@ def search_comments(
     after: str | None = None,
     before: str | None = None,
     limit: int = 20,
+    hit_type: str = "all",
+    author_filter: str | None = None,
+    severity_filter: str | None = None,
 ) -> str:
     """Cross-thread full-text search over comment bodies (v2.8, threads
     #39/#40). Pure read, ZERO governance semantics: hits are archaeology /
@@ -4447,6 +5016,19 @@ def search_comments(
         after / before: comment time window (absolute 'YYYY-MM-DD HH:MM:SS'
             or relative '30m'/'2h'/'1d', same parser as list_comments_since).
         limit: max hits to return, 1..50 (default 20).
+        hit_type: 票6 ①/#74 §1① — 'all' (default) | 'comment' | 'thread'.
+            REQUIRED enum on every returned hit (pi #762: 必填枚举,非有则带);
+            thread hits carry comment_id=null, is_self=false (无作者可判).
+        author_filter: 票6 ②/#74 §1③ — filters COMMENT hits by comment author;
+            与 author 并存、语义正交; author 现语义(is_self hint)一字不改
+            (冻结契约 #759 §1③). Thread hits unaffected (帖无此维).
+        severity_filter: 票6 ② — filters comment hits by severity;
+            ACTIVE ⇒ thread hits are NOT returned (帖无 severity, #759 §1③).
+        cost_tokens: (read face) every comment hit carries the row's optional
+            declared cost (票6 ③: 只进读面,不进任何门; 未申报为 null).
+
+    Returns: JSON with per-hit `hit_type` (comment|thread), thread hits with
+        comment_id=null / is_self=false / snippet via _search_snippet.
     """
     t0 = time.monotonic()
     budget_s = SEARCH_TIMEOUT_MS / 1000.0
@@ -4500,6 +5082,22 @@ def search_comments(
         return payload("error", None,
                        extra={"error": f"limit must be 1..{SEARCH_MAX_LIMIT}"},
                        complete=False)
+    # 票6 ②/#74 §1①③ (dsh #759 §1): 新参数校验 —— hit_type 必填枚举
+    # (返回体每命中都带, pi #762); author_filter 与 author 正交; severity_filter
+    # 生效时 thread 命中一律不返回 (帖无 severity)。
+    if hit_type not in ("all", "comment", "thread"):
+        return payload("error", None,
+                       extra={"error": "hit_type must be all|comment|thread"},
+                       complete=False)
+    if author_filter is not None and (not isinstance(author_filter, str)
+                                      or not author_filter.strip()):
+        return payload("error", None,
+                       extra={"error": "author_filter must be a non-empty string"},
+                       complete=False)
+    if severity_filter is not None and severity_filter not in VALID_SEVERITIES:
+        return payload("error", None,
+                       extra={"error": f"severity_filter must be one of {VALID_SEVERITIES}"},
+                       complete=False)
 
     # --- routing --------------------------------------------------------------
     if syntax == SEARCH_SYNTAX_FTS5:
@@ -4536,6 +5134,12 @@ def search_comments(
     if before is not None:
         where.append("c.created_at < ?")
         params.append(_parse_since(before))
+    if author_filter is not None:
+        where.append("c.author = ?")
+        params.append(author_filter)
+    if severity_filter is not None:
+        where.append("c.severity = ?")
+        params.append(severity_filter)
     where_sql = " AND ".join(where) if where else "1=1"
 
     fts_from = ("comments_fts JOIN comments c ON c.id = comments_fts.rowid"
@@ -4552,8 +5156,13 @@ def search_comments(
             return payload("timeout", route, complete=False)
         conn.set_progress_handler(
             lambda: 1 if time.monotonic() >= deadline else 0, 500)
+        # batch2 2.1: registry loaded ONCE on the same query_only connection
+        # (#2365 §2 — never inside _search_snippet, called up to 150×/query);
+        # loader failure = empty set + diag, the face still answers ok.
+        registry, _mask_diag = _load_credential_registry(conn)
         base_sql = (
             f"SELECT c.id, c.thread_id, c.author, c.body, c.created_at,"
+            f" c.cost_tokens,"
             f" th.title AS th_title, th.status AS th_status, {rank_sel}"
             f" FROM {fts_from}{threads_join} WHERE {where_sql}")
         total = conn.execute(
@@ -4578,21 +5187,70 @@ def search_comments(
             ).fetchall()
             ctx = sorted(ctx_rows, key=lambda n: n["id"])
             results.append({
+                "hit_type": "comment",
                 "comment_id": r["id"],
                 "thread_id": r["thread_id"],
-                "thread_title": r["th_title"],
+                "thread_title": _mask_credential_text(r["th_title"] or "", registry),
                 "thread_status": r["th_status"],
                 "author": r["author"],
                 "timestamp": r["created_at"],
-                "snippet": _search_snippet(r["body"], terms, SEARCH_SNIPPET_CAP),
+                "cost_tokens": r["cost_tokens"],
+                "snippet": _search_snippet(r["body"], terms, SEARCH_SNIPPET_CAP, registry),
                 "rank": r["rank"],
                 "is_self": bool(author and r["author"] == author),
                 "context": [
                     {"comment_id": n["id"], "author": n["author"],
-                     "snippet": _search_snippet(n["body"], terms, SEARCH_CONTEXT_CAP)}
+                     "snippet": _search_snippet(n["body"], terms, SEARCH_CONTEXT_CAP, registry)}
                     for n in ctx
                 ],
             })
+        # 票6 ①/#74 §1① thread-hit branch (try-body level — NOT inside the
+        # comment loop; 0 comment hits must still yield thread hits):
+        # threads_fts MATCH (FTS routes) or LIKE (like_scan); severity_filter
+        # 生效 ⇒ thread 命中一律不返回 (#759 §1③——帖无 severity); 每命中
+        # hit_type="thread" + comment_id null + is_self=false; snippet 落点
+        # 唯一=_search_snippet(#2355 §3)。
+        if hit_type in ("all", "thread") and severity_filter is None:
+            t_where, t_params = [], []
+            if route in (SEARCH_ROUTE_FTS, SEARCH_ROUTE_FTS_LIKE):
+                t_where.append(
+                    "t.id IN (SELECT rowid FROM threads_fts WHERE threads_fts MATCH ?)")
+                t_params.append(match_expr)
+            for t in (like_terms if syntax == SEARCH_SYNTAX_LITERAL else []):
+                t_where.append("(t.title LIKE ? ESCAPE '\\' OR t.context LIKE ? ESCAPE '\\')")
+                t_params += [f"%{_like_literal(t)}%", f"%{_like_literal(t)}%"]
+            if thread_id is not None:
+                t_where.append("t.id = ?")
+                t_params.append(thread_id)
+            if status is not None and status != "all":
+                t_where.append("t.status = ?")
+                t_params.append(status)
+            t_where_sql = " AND ".join(t_where) if t_where else "1=1"
+            trows = conn.execute(
+                "SELECT t.id, t.title, t.context, t.author, t.status, t.created_at"
+                f" FROM threads t WHERE {t_where_sql} ORDER BY t.id DESC LIMIT ?",
+                t_params + [limit],
+            ).fetchall()
+            for tr in trows:
+                title_m = _mask_credential_text(tr["title"] or "", registry)
+                raw_title = tr["title"] or ""
+                hit_text = raw_title if any(
+                    t.lower() in raw_title.lower() for t in terms) else (tr["context"] or "")
+                results.append({
+                    "hit_type": "thread",
+                    "thread_id": tr["id"],
+                    "comment_id": None,
+                    "thread_title": title_m,
+                    "thread_status": tr["status"],
+                    "author": tr["author"],
+                    "timestamp": tr["created_at"],
+                    "cost_tokens": None,
+                    "snippet": _search_snippet(hit_text, terms, SEARCH_SNIPPET_CAP, registry),
+                    "rank": None,
+                    "is_self": False,
+                    "context": [],
+                })
+            total += len(trows)
         return payload("ok", route, results, total=total)
     except sqlite3.Error as e:
         if time.monotonic() >= deadline:
@@ -4632,8 +5290,15 @@ def _lag_band(secs: float) -> str:
 _LAG_ORDER = {"当天内": 0, "3 天内": 1, "更久": 2}
 
 
-def _profile_numbers(conn: sqlite3.Connection, author: str) -> dict:
+def _profile_numbers(conn: sqlite3.Connection, author: str,
+                     registry: frozenset = frozenset()) -> dict:
     """v2.2 reliability profile — THE one aggregation (tool and board share it).
+
+    batch2 2.1: `registry` is passed by the reliability_profile face only;
+    the one free-text member (last_wake_error, written into a json.dumps
+    container below) is masked at the write point (#2376 §2 subassign族).
+    The board's _profile_brief path consumes ints only and passes no registry
+    (its wake-error face is the static tooltip, not an echo — #2371 §1).
 
     Derived-only: pure reads; callers pass a query_only connection (附录 F2)
     so even a buggy or hostile aggregation cannot write. Zero governance
@@ -4733,7 +5398,7 @@ def _profile_numbers(conn: sqlite3.Connection, author: str) -> dict:
                  "A1 ⚠️ 徽章即同一信号,画像不吞掉它"),
     }
     if wake_err:
-        participation["watcher_gate"]["last_wake_error"] = wake_err
+        participation["watcher_gate"]["last_wake_error"] = _mask_credential_text(wake_err, registry)
 
     # ---- judgment (endogenous ground truth — display only) ----
     # verdict_free and verdict carry the SAME judgment semantics (only the
@@ -4907,7 +5572,8 @@ def reliability_profile(author: str) -> str:
     """
     conn = _connect_ro()
     try:
-        data = _profile_numbers(conn, author)
+        registry, _mask_diag = _load_credential_registry(conn)  # batch2 2.1
+        data = _profile_numbers(conn, author, registry)
     finally:
         conn.close()
     return json.dumps(data, ensure_ascii=False, indent=1)
@@ -4916,6 +5582,7 @@ def reliability_profile(author: str) -> str:
 # --- read-only HTML board --------------------------------------------------
 def _board_html() -> str:
     with _connect() as conn:
+        registry, _mask_diag = _load_credential_registry(conn)  # batch2 2.1: titles/context/body/file face
         threads = conn.execute(
             """SELECT t.*, (SELECT COUNT(*) FROM comments c WHERE c.thread_id = t.id) AS n
                FROM threads t ORDER BY t.id DESC"""
@@ -4923,6 +5590,20 @@ def _board_html() -> str:
         by_thread: dict[int, list[sqlite3.Row]] = {}
         for c in conn.execute("SELECT * FROM comments ORDER BY created_at ASC").fetchall():
             by_thread.setdefault(c["thread_id"], []).append(c)
+        # UI v2 (用户指令 2026-11-18): sidebar index data — per-thread last
+        # activity/speaker + a global recent-comments feed. Same read-only
+        # display path, no writes (C3 by construction).
+        thread_last: dict[int, tuple[str, str]] = {}
+        for tid, cs in by_thread.items():
+            lc = cs[-1]  # comments collected ASC → last element is latest
+            thread_last[tid] = (lc["created_at"], lc["author"])
+        for t in threads:
+            thread_last.setdefault(t["id"], (t["created_at"], t["author"]))
+        recent = conn.execute(
+            """SELECT c.*, t.title AS t_title FROM comments c
+               JOIN threads t ON t.id = c.thread_id
+               ORDER BY c.created_at DESC, c.id DESC LIMIT 12"""
+        ).fetchall()
         participants = conn.execute(
             "SELECT author, last_seen, meta FROM participants ORDER BY last_seen DESC"
         ).fetchall()
@@ -4989,20 +5670,56 @@ def _board_html() -> str:
             f"<span class='p'>{mark} {escape(p['author'])} {_relative(last)}{err}{brief_html}</span>"
         )
 
-    # v2.12.2 (DEBT #17): sidebar thread index — same threads the main column
-    # renders, each entry a link to its per-thread anchor (#t{id}); titles
-    # escape()d, full text in title= since CSS truncates visually.
+    # UI v2 (用户指令 2026-11-18): sidebar rebuilt as a filterable index —
+    # search box (票号/标题/发言者), status chips, sort modes, a global
+    # recent-comments feed (answers "最新发言在哪个帖"), and recency-grouped
+    # thread rows carrying last-speaker + relative time. Filtering/sorting is
+    # client-side over data- attributes; filter state persists across the 20s
+    # auto-refresh via sessionStorage (same store the folder uses).
+    feed = []
+    for c in recent:
+        snip = " ".join(_mask_credential_text(c["body"] or "", registry).split())[:48]
+        ft = _mask_credential_text(c["t_title"] or "", registry)
+        feed.append(
+            f"<a class='frow' href='#c{c['id']}' title='#{c['thread_id']} {escape(ft)}'>"
+            f"<span class='ftime'>{_relative(c['created_at'])}</span>"
+            f"<span class='fwho'>{escape(c['author'])}</span>"
+            f"<span class='ftid'>#{c['thread_id']}</span>"
+            f"<span class='fsnip'>{escape(snip) or '(空)'}</span></a>"
+        )
     side = [
-        f"<div class='side-h'>Threads ({len(threads)})</div>",
+        "<div class='side-h'>Board Index</div>",
+        "<input id='q' type='search' placeholder='过滤：票号 / 标题 / 发言者' autocomplete='off'>",
+        "<div class='chips' id='stchips'>"
+        "<button class='chip on' data-st='all'>全部</button>"
+        "<button class='chip' data-st='open'>open</button>"
+        "<button class='chip' data-st='resolved'>resolved</button>"
+        "<button class='chip' data-st='wontfix'>wontfix</button></div>",
+        "<div class='chips' id='sortchips'>"
+        "<button class='chip on' data-sort='recent'>最近更新</button>"
+        "<button class='chip' data-sort='id'>票号</button>"
+        "<button class='chip' data-sort='n'>评论数</button></div>",
+        "<div class='side-h'>最新发言</div>",
+        "<div id='feed'>" + "".join(feed) + "</div>",
+        f"<div class='side-h' id='list-h'>Threads ({len(threads)})</div>",
         "<a href='#' onclick='scrollTo(0,0);return false'>▲ top</a>",
+        "<div id='tlist'>",
     ]
     for t in threads:
+        ts, spk = thread_last[t["id"]]
+        m_title = _mask_credential_text(t["title"], registry)
+        spks = " ".join(sorted({c["author"] for c in by_thread.get(t["id"], [])}))
         aw = " ⏳" if t["id"] in awaiting_map else ""
         side.append(
-            f"<a href='#t{t['id']}' title='{escape(t['title'])}'>"
-            f"#{t['id']} {escape(t['title'])}"
-            f"<span class='cnt st-{t['status']}'>{t['n']}·{t['status']}{aw}</span></a>"
+            f"<a class='trow' href='#t{t['id']}' data-id='{t['id']}' data-st='{t['status']}'"
+            f" data-last='{_epoch(ts)}' data-n='{t['n']}' data-spk='{escape(spks)}'"
+            f" title='{escape(m_title)}'>"
+            f"<span class='row1'><span class='dot st-{t['status']}'></span>"
+            f"<span class='tid'>#{t['id']}</span>"
+            f"<span class='ttl'>{escape(m_title)}</span></span>"
+            f"<span class='tmeta'>{escape(spk)} · {_relative(ts)} · {t['n']} 条{aw}</span></a>"
         )
+    side.append("</div>")
 
     parts = [
         "<!doctype html><html><head><meta charset='utf-8'>",
@@ -5011,7 +5728,7 @@ def _board_html() -> str:
         "html{color-scheme:light}",
         "body{font-family:system-ui,sans-serif;margin:0;color:#222;background:#fff}",
         "#layout{display:flex;max-width:1400px;margin:0 auto;padding:0 16px;gap:22px}",
-        "#sidebar{width:280px;flex-shrink:0;position:sticky;top:0;max-height:100vh;overflow-y:auto;padding:14px 0;font-size:.85rem}",
+        "#sidebar{width:320px;flex-shrink:0;position:sticky;top:0;max-height:100vh;overflow-y:auto;padding:12px 10px;font-size:.85rem;background:#f6f8fa;border-right:1px solid #e3e6ea;box-sizing:border-box}",
         "#main{flex:1;min-width:0;padding:24px 0}",
         "h1{font-size:1.4rem;margin:.5em 0} h2{font-size:1.1rem;margin-top:1.5em;border-bottom:1px solid #ddd;padding-bottom:4px;scroll-margin-top:12px}",
         ".meta{color:#888;font-size:.85rem} .badge{font-size:.75rem;padding:1px 6px;border-radius:3px;background:#eee;margin-left:6px}",
@@ -5020,11 +5737,25 @@ def _board_html() -> str:
         ".c{margin:8px 0;scroll-margin-top:12px}.reply{margin-left:24px;border-left:2px solid #eee;padding-left:12px}",
         ".p{margin-right:14px;font-size:.85rem} .await{background:#fff3cd;padding:1px 8px;border-radius:10px;font-size:.75rem}",
         "details{margin-top:2em} summary{cursor:pointer;color:#888;font-size:.85rem}",
-        "#sidebar .side-h{font-weight:600;margin:4px 0}",
+        "#sidebar .side-h{font-weight:600;margin:10px 0 4px}",
         "#sidebar a{display:block;padding:3px 6px;border-radius:4px;color:inherit;text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
-        "#sidebar a:hover{background:#eef1f4}",
-        "#sidebar .cnt{color:#999;font-size:.75rem;margin-left:4px}",
-        "#sidebar .st-open{color:#b35900}#sidebar .st-resolved{color:#1a7f37}#sidebar .st-wontfix{color:#888}",
+        "#sidebar a:hover{background:#e9eef4}",
+        "#q{width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #cdd3da;border-radius:6px;font-size:.85rem;margin:2px 0 6px;background:#fff}",
+        ".chip{border:1px solid #cdd3da;background:#fff;border-radius:12px;padding:2px 10px;font-size:.75rem;cursor:pointer;margin:0 4px 4px 0;color:#555}",
+        ".chip.on{background:#2563eb;border-color:#2563eb;color:#fff}",
+        "#feed{border:1px solid #e3e6ea;border-radius:6px;background:#fff;padding:4px;margin:2px 0 4px;max-height:190px;overflow-y:auto}",
+        "#feed .frow{padding:3px 6px;font-size:.75rem;line-height:1.5}",
+        ".ftime{color:#8a919a;margin-right:6px}.fwho{font-weight:600;margin-right:6px;color:#1f2933}",
+        ".ftid{color:#2563eb;margin-right:6px;white-space:nowrap}.fsnip{color:#5f6b76}",
+        "#tlist .trow{padding:5px 7px}",
+        "#tlist .row1{display:flex;align-items:center;gap:4px;min-width:0}",
+        "#tlist .dot{flex-shrink:0;width:8px;height:8px;border-radius:50%;background:#999}",
+        "#tlist .dot.st-open{background:#e08600}#tlist .dot.st-resolved{background:#1a7f37}#tlist .dot.st-wontfix{background:#aaa}",
+        "#tlist .tid{flex-shrink:0;font-weight:600;color:#4b5563;font-variant-numeric:tabular-nums}",
+        "#tlist .ttl{flex:1;min-width:0}",
+        "#tlist .tmeta{display:block;color:#8a919a;font-size:.72rem;margin:1px 0 0 13px}",
+        "#tlist .grp{font-size:.7rem;color:#8a919a;font-weight:600;letter-spacing:.4px;margin:9px 0 2px;padding-left:7px}",
+        "#tlist .hide{display:none!important}",
         ".foldbtn{display:block;margin:-4px 0 8px;background:none;border:none;color:#1a7f37;cursor:pointer;font-size:.8rem;padding:2px 4px}",
         "pre.folded{max-height:9em;overflow:hidden}",
         # line-clamp cuts at whole-line boxes even with taller CJK fallback
@@ -5050,7 +5781,7 @@ def _board_html() -> str:
             if aw else ""
         )
         parts.append(
-            f"<h2 id='t{t['id']}'>#{t['id']} {escape(t['title'])} "
+            f"<h2 id='t{t['id']}'>#{t['id']} {escape(_mask_credential_text(t['title'], registry))} "
             f"<span class='badge {t['status']}'>{t['status']}</span>{aw_html}</h2>"
         )
         parts.append(f"<div class='meta'>{t['n']} comment(s) · created {t['created_at']}</div>")
@@ -5059,7 +5790,7 @@ def _board_html() -> str:
             # synthetic cid 'ctx{id}' keeps sessionStorage keys collision-free
             parts.append(
                 f"<pre class='cbody' data-cid='ctx{t['id']}' "
-                f"data-len='{len(t['context'])}'>{escape(t['context'])}</pre>"
+                f"data-len='{len(t['context'])}'>{escape(_mask_credential_text(t['context'], registry))}</pre>"
             )
 
         comments = by_thread.get(t["id"], [])
@@ -5070,7 +5801,7 @@ def _board_html() -> str:
         def render(c: sqlite3.Row, depth: int) -> None:
             loc = ""
             if c["file"]:
-                loc = f" · <code>{escape(str(c['file']))}" + (
+                loc = f" · <code>{escape(_mask_credential_text(str(c['file']), registry))}" + (
                     f":{c['line']}" if c["line"] else ""
                 ) + "</code>"
             sev = (
@@ -5092,7 +5823,7 @@ def _board_html() -> str:
                 f"<div><b>#{c['id']} {escape(c['author'])}</b>{sev}{st}{loc} "
                 f"<span class='meta'>{c['created_at']}</span>"
                 f"<a class='plink meta' href='#c{c['id']}'>¶</a></div>"
-                f"<pre class='cbody' data-len='{blen}' data-cid='{c['id']}'>{escape(c['body'])}</pre></div>"
+                f"<pre class='cbody' data-len='{blen}' data-cid='{c['id']}'>{escape(_mask_credential_text(c['body'], registry))}</pre></div>"
             )
             for child in by_parent.get(c["id"], []):
                 render(child, depth + 1)
@@ -5111,6 +5842,55 @@ def _board_html() -> str:
     # folded with an expand/collapse toggle; per-comment state persists across
     # the 20s auto-refresh via sessionStorage, and a #cN hash target always
     # expands so an anchor jump never lands on a hidden body.
+    parts.append(
+        "<script>(function(){"
+        "var rows=[].slice.call(document.querySelectorAll('#tlist .trow'));"
+        "var sess=null;try{sess=window.sessionStorage}catch(e){}"
+        "var q=document.getElementById('q'),list=document.getElementById('tlist'),"
+        "lh=document.getElementById('list-h');"
+        "var chips=[].slice.call(document.querySelectorAll('#stchips .chip')),"
+        "sorts=[].slice.call(document.querySelectorAll('#sortchips .chip'));"
+        "var st=(sess&&sess.getItem('rb-idx-st'))||'all',"
+        "sort=(sess&&sess.getItem('rb-idx-sort'))||'recent',"
+        "qv=(sess&&sess.getItem('rb-idx-q'))||'';"
+        "q.value=qv;"
+        "function setOn(arr,v,k){arr.forEach(function(b){b.classList.toggle('on',b.dataset[k]===v)})}"
+        "setOn(chips,st,'st');setOn(sorts,sort,'sort');"
+        "var GRP=[[3600,'1 小时内'],[86400,'24 小时内'],[259200,'3 天内'],[604800,'一周内'],[2592000,'一个月内'],[1e15,'更早']];"
+        "function render(){"
+        "var term=q.value.trim().toLowerCase(),now=Date.now()/1000;"
+        "var vis=rows.filter(function(r){"
+        "if(st!=='all'&&r.dataset.st!==st)return false;"
+        "if(term){var hay=(r.dataset.id+' '+r.dataset.spk+' '+r.textContent).toLowerCase();"
+        "if(hay.indexOf(term)<0)return false;}"
+        "return true;});"
+        "if(sort==='id')vis.sort(function(a,b){return +b.dataset.id-+a.dataset.id});"
+        "else if(sort==='n')vis.sort(function(a,b){return +b.dataset.n-+a.dataset.n});"
+        "else vis.sort(function(a,b){return +b.dataset.last-+a.dataset.last});"
+        "list.innerHTML='';"
+        "var lastG=null;"
+        "vis.forEach(function(r){"
+        "if(sort==='recent'){var d=now-(+r.dataset.last||0),g=GRP[GRP.length-1][1];"
+        "for(var i=0;i<GRP.length;i++){if(d<GRP[i][0]){g=GRP[i][1];break}}"
+        "if(g!==lastG){var h=document.createElement('div');h.className='grp';h.textContent=g;"
+        "list.appendChild(h);lastG=g;}}"
+        "list.appendChild(r);});"
+        "if(!vis.length){var e=document.createElement('div');e.className='grp';"
+        "e.textContent='（无匹配帖子）';list.appendChild(e);}"
+        "lh.textContent='Threads '+vis.length+'/'+rows.length;"
+        "}"
+        "q.oninput=function(){if(sess)sess.setItem('rb-idx-q',q.value);render();};"
+        "chips.forEach(function(b){b.onclick=function(){st=b.dataset.st;"
+        "if(sess)sess.setItem('rb-idx-st',st);setOn(chips,st,'st');render();};});"
+        "sorts.forEach(function(b){b.onclick=function(){sort=b.dataset.sort;"
+        "if(sess)sess.setItem('rb-idx-sort',sort);setOn(sorts,sort,'sort');render();};});"
+        "render();"
+        "if(qv&&sess&&sess.getItem('rb-idx-focus')==='1'){q.focus();"
+        "try{q.setSelectionRange(qv.length,qv.length)}catch(e){}}"
+        "q.onfocus=function(){if(sess)sess.setItem('rb-idx-focus','1')};"
+        "q.onblur=function(){if(sess)sess.setItem('rb-idx-focus','0')};"
+        "})();</script>"
+    )
     parts.append(
         "<script>(function(){"
         "var FOLD_AT=700,K='rb-fold-';"

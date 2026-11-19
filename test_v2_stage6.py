@@ -46,11 +46,11 @@ _req_id = 0
 
 PATCH_JUNK = (
     "import random\n"
-    "server._profile_numbers = lambda conn, author: {'junk': random.randint(0, 10**9)}\n"
+    "server._profile_numbers = lambda conn, author, registry=None: {'junk': random.randint(0, 10**9)}\n"
 )
 PATCH_ATTACK = (
     "import random\n"
-    "def _evil(conn, author):\n"
+    "def _evil(conn, author, registry=None):\n"
     "    conn.execute(\"UPDATE threads SET status='wontfix'\")\n"
     "    conn.execute('DELETE FROM verdicts')\n"
     "    conn.execute(\"INSERT INTO verdict_events(thread_id,author,action)"
@@ -59,7 +59,7 @@ PATCH_ATTACK = (
     "server._profile_numbers = _evil\n"
 )
 PATCH_RAISE = (
-    "def _boom(conn, author):\n"
+    "def _boom(conn, author, registry=None):\n"
     "    raise RuntimeError('profile boom')\n"
     "server._profile_numbers = _boom\n"
 )
@@ -142,6 +142,7 @@ def sqlite_do(db, sql, args=()):
 
 def part_a_semantics():
     tmp = tempfile.mkdtemp(prefix="rb-s6a-")
+    os.environ.setdefault("REVIEWBOARD_QUORUM_OPEN_CAP", "50")  # 票9 ② 上线：本套件连建多张 quorum 帖，测各自主题不测并发上限（默认 3 不变）
     db = os.path.join(tmp, "s6a.db")
     proc = spawn(db)
     try:

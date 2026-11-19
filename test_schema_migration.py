@@ -8,11 +8,15 @@ Covers:
   c) idempotent re-init -> same version, same board id
   d) db NEWER than the server -> loud refusal to start
   e) /attention exposes a STABLE board_id across server restarts (HTTP level)
-  f) schema.sql and the embedded _SCHEMA_FALLBACK create an IDENTICAL table
-     set — the manual-sync debt is guarded by a test, not by hope
+  f) schema.sql and the embedded _SCHEMA_FALLBACK create identical schemas —
+     f1 table sets, f2 columns/FK/PK, f3 indexes (index_list + index_xinfo),
+     f4 AUTOINCREMENT boolean; the full coverage contract (covered faces and
+     registered blind faces) lives in-suite in the f2 comment block — the
+     manual-sync debt is guarded by a test, not by hope
 """
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -74,14 +78,16 @@ def main() -> None:
         c = sqlite3.connect(db2)
         c.executescript("""
             CREATE TABLE threads (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
+                title TEXT NOT NULL, context TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
                 created_at TEXT NOT NULL DEFAULT (datetime('now')));
             CREATE TABLE comments (id INTEGER PRIMARY KEY AUTOINCREMENT,
                 thread_id INTEGER NOT NULL, parent_id INTEGER, author TEXT NOT NULL,
                 body TEXT NOT NULL, file TEXT, line INTEGER, severity TEXT,
                 status TEXT NOT NULL DEFAULT 'open',
                 created_at TEXT NOT NULL DEFAULT (datetime('now')));
-            INSERT INTO threads(title) VALUES ('legacy thread');
+            INSERT INTO threads(title, context) VALUES
+                ('legacy thread', 'legacy background — any real v1 db carried this column');
             INSERT INTO comments(thread_id, author, body) VALUES (1, 'old-agent', 'kept?');
         """)
         c.commit(); c.close()
@@ -188,6 +194,137 @@ def main() -> None:
         names = lambda cx: {r[0] for r in cx.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         check("f1 schema.sql == embedded fallback (table sets)", names(ta) == names(tb))
+        # f2 (dsh #2421 §5, extended by live mutation M-A2; FK half already
+        # anticipated by dsh #2423 §4 — foreign_key_list, not a mutation
+        # find): column-level
+        # parity. f1 only compares table NAME sets; PRAGMA table_info alone
+        # still misses FKs — M-A2 (column-level REFERENCES delta on one side)
+        # kept a table_info-only f2 green, because foreign keys live in
+        # PRAGMA foreign_key_list, not table_info. So compare per-table
+        # (name, type, notnull, dflt_value, pk) tuples AND projected
+        # foreign_key_list columns across ALL tables, instead of hand-copying
+        # either DDL into a second textual source.
+        # Coverage contract (dsh #2425 §1 choice (a), extended per dsh
+        # #2430 §2): f2 covers what the column/FK PRAGMAs expose — NOT
+        # NULL, DEFAULT, FK (projected columns, see below), PK via the
+        # r[5] slot (live carrier: verdicts composite PK). f3 (below)
+        # wires PRAGMA index_list, covering indexes — origin='c' (live
+        # carrier: idx_comments_thread/parent/created, schema.sql:34-36)
+        # and origin='u' (UNIQUE; the #2427 §3.2 "not wired yet" tier is
+        # now wired) — projection (name, unique, origin, partial) drops
+        # seq (bookkeeping); index columns read via index_xinfo as ordered
+        # (name, desc, coll) tuples over key=1 rows (dsh #2433 §2 choice
+        # (a): desc/coll close the index-column COLLATE face). f4
+        # (below) covers AUTOINCREMENT as a comment-stripped per-table
+        # boolean (dsh #2430 §2.2 choice (a) — attribute presence only,
+        # NOT a normalized full-DDL text diff, so #2421 §7 SQL-comment
+        # normalization stays out; load-bearing: comments.id non-reuse
+        # underpins the delivery-watermark injectivity argument
+        # (server.py ~:4451) and the #944 to_v premise).
+        # NOT covered / registered: CHECK — no pragma face (live carrier
+        # verdicts.verdict CHECK, identical on both sides today). COLLATE:
+        # the index-column face is wired via xinfo.coll (above); column-level
+        # COLLATE surfaces only through an index on that column, otherwise no
+        # pragma face — registered. partial is a 0/1 presence bit only — the
+        # WHERE predicate text is NOT compared (dsh #2433 §3 choice (b):
+        # wiring it needs a normalized sqlite_master diff, i.e. the #2421 §7
+        # cost; zero carriers today — schema.sql has no WHERE). Expression
+        # indexes project name=None, expression text not compared —
+        # registered. WITHOUT ROWID / STRICT: NOT fully blind, correcting
+        # dsh #2433 §4 (a static claim — measured M-S1): under either, the
+        # table_info notnull bit reads 1 (vs 0) on PK columns that are not
+        # a rowid alias and not already declared NOT NULL, so a one-side
+        # mutation there goes f2-red (live: participants.author, meta.key;
+        # M-S1 reproduced f2 — differing tables: ['participants']).
+        # Residual blind faces, registered — evidence tiers kept apart
+        # (dsh #2436 §3): measured = verdicts (composite PK columns already
+        # NOT NULL — all-green on one-side STRICT, M-S2, AND one-side
+        # WITHOUT ROWID, M-S3); static-only (semantic scan, no measured
+        # cell) = STRICT/WITHOUT ROWID on threads/comments/verdict_events
+        # (INTEGER PRIMARY KEY = rowid alias, no bit to flip — inferred,
+        # not run; cite as inference, not measurement).
+        # WITHOUT ROWID additionally can't coexist with AUTOINCREMENT
+        # (SQLite rejects the combo), so comments/threads/verdict_events
+        # carry that incidental guard; verdicts has none. Choice (b)
+        # (normalized sqlite_master.sql text diff) would cover these and all
+        # remaining faces but drags SQL-comment normalization (#2421 §7)
+        # from low-realism to mandatory; declined for now.
+        tables = names(ta) | names(tb)
+        shape = lambda cx, t: (  # noqa: E731
+            sorted((r[1], r[2], r[3], r[4], r[5])
+                   for r in cx.execute(f"PRAGMA table_info({t})")),
+            # FK half compares projected columns (table, from, to,
+            # on_update, on_delete, match) — dsh #2427 §3.1. The full row
+            # carries id/seq = declaration-order bookkeeping, so a
+            # semantically-equal FK set written in a different order on
+            # one side false-reds (live carrier: comments declares two
+            # FKs; M-F1 repro'd red on the full-row shape, green here).
+            # key=repr kept: 'to' may be None.
+            sorted(((r[2], r[3], r[4], r[5], r[6], r[7])
+                    for r in cx.execute(f"PRAGMA foreign_key_list({t})")),
+                   key=repr))
+        differing = sorted(t for t in tables if shape(ta, t) != shape(tb, t))
+        # this suite's check() is (label, ok) only — fold the failing tables
+        # into the label so a red names what to fix (batch2 suite carries a
+        # detail slot; here the label is the outlet). Label names both
+        # halves: table_info+pk and projected FK columns — both
+        # load-bearing.
+        f2_label = ("f2 schema.sql == embedded fallback "
+                    "(table_info+pk + FK projected columns per table)")
+        if differing:
+            f2_label += f" — differing tables: {differing}"
+        check(f2_label, not differing)
+        # f3 (dsh #2430 §2.1, exit (i); xinfo upgrade per dsh #2433 §2
+        # choice (a)): index parity — one PRAGMA closes both open families:
+        # origin='c' (normal indexes; live carrier idx_comments_*,
+        # schema.sql:34-36) and origin='u' (UNIQUE — the #2427 §3.2
+        # "not wired yet" tier, wired here). Projection (name, unique,
+        # origin, partial) drops seq (bookkeeping); columns read via
+        # index_xinfo as ordered (name, desc, coll) tuples over key=1 rows
+        # — desc/coll close the index-column COLLATE/DESC faces (coll
+        # 'NOCASE' vs 'BINARY' projects differently), the auxiliary rowid
+        # entry (key=0) stays out, and the xinfo `key` column itself is
+        # not compared (auxiliary columns are not key face). partial is
+        # presence-only (contract above). key=repr kept: expression-index
+        # names may be None.
+        idx_shape = lambda cx, t: sorted(  # noqa: E731
+            ((r[1], r[2], r[3], r[4],
+              tuple((i[2], i[3], i[4])
+                    for i in cx.execute(f"PRAGMA index_xinfo({r[1]})") if i[5]))
+             for r in cx.execute(f"PRAGMA index_list({t})")),
+            key=repr)
+        idx_diff = sorted(t for t in tables if idx_shape(ta, t) != idx_shape(tb, t))
+        f3_label = ("f3 schema.sql == embedded fallback "
+                    "(index_list+index_xinfo per table)")
+        if idx_diff:
+            f3_label += f" — differing tables: {idx_diff}"
+        check(f3_label, not idx_diff)
+        # f4 (dsh #2430 §2.2, choice (a)): AUTOINCREMENT presence per
+        # table, read from sqlite_master.sql with SQL comments stripped —
+        # an attribute boolean, NOT a normalized full-DDL diff, so the
+        # #2421 §7 comment-normalization quagmire stays out. Load-bearing:
+        # comments.id non-reuse is the stated premise of the delivery
+        # watermark injectivity argument (server.py ~:4451) and of #944
+        # to_v. Known edge (theoretical, registered): the keyword inside
+        # a DDL string literal would false-positive — zero carriers today.
+        def ai_bool(cx, t):
+            row = cx.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (t,)).fetchone()
+            if row is None or row[0] is None:
+                return False  # missing-row / NULL-sql guard only — internal
+                # tables DO carry sql: sqlite_sequence measures as
+                # CREATE TABLE sqlite_sequence(name,seq) on 3.45.1, so that
+                # path is dead today (false premise fixed, dsh #2436 §4)
+            s = re.sub(r"/\*.*?\*/", " ", row[0], flags=re.S)
+            s = re.sub(r"--[^\n]*", " ", s)
+            return "AUTOINCREMENT" in s.upper()
+        ai_diff = sorted(t for t in tables if ai_bool(ta, t) != ai_bool(tb, t))
+        f4_label = ("f4 schema.sql == embedded fallback "
+                    "(AUTOINCREMENT per table, comment-stripped boolean)")
+        if ai_diff:
+            f4_label += f" — differing tables: {ai_diff}"
+        check(f4_label, not ai_diff)
         ta.close(); tb.close()  # dsh #444: same WinError 32 shape as the v2.8 matrix had
 
         # g) v5 -> v6 (issue #3): id-cursor column added + backfill semantics.

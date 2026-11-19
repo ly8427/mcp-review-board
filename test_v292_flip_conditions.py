@@ -106,6 +106,9 @@ def mk_free(db, srv, author):
 def main():
     tmp = tempfile.mkdtemp(prefix="rb-flip51-")
     db = os.path.join(tmp, "f.db")
+    # 票9 ② (QUORUM_OPEN_CAP=3) 上线后，本夹具连建多张 quorum 帖会撞闸——本套件
+    # 测的是翻转条件不是并发上限，env 抬高闸（默认 3 不变，见 server.py 常量处）。
+    os.environ["REVIEWBOARD_QUORUM_OPEN_CAP"] = "50"
     srv = fx.stub_env(db)
     srv.init_db()
 

@@ -78,6 +78,7 @@ def probe(author):
 def main():
     global DB
     tmp = tempfile.mkdtemp(prefix="rb-s7-")
+    os.environ.setdefault("REVIEWBOARD_QUORUM_OPEN_CAP", "50")  # 票9 ② 上线：本套件连建多张 quorum 帖，测各自主题不测并发上限（默认 3 不变）
     DB = os.path.join(tmp, "s7.db")
     env = dict(os.environ, REVIEWBOARD_PORT=str(PORT), REVIEWBOARD_DB=DB)
     proc = subprocess.Popen(

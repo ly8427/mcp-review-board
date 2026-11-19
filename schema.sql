@@ -27,8 +27,11 @@ CREATE TABLE IF NOT EXISTS comments (
     severity   TEXT,                          -- optional: info | minor | major | blocker
     status     TEXT    NOT NULL DEFAULT 'open', -- open | resolved | wontfix
     created_at TEXT    NOT NULL DEFAULT (datetime('now')),
-    floor_exempt INTEGER NOT NULL DEFAULT 0   -- v2.11.0 (#81 F4): server-set only; exempt row
+    floor_exempt INTEGER NOT NULL DEFAULT 0,  -- v2.11.0 (#81 F4): server-set only; exempt row
                                                -- satisfies the floor but does NOT consume budget
+    cost_tokens INTEGER,                      -- 票6 ③: optional declared cost, read-face only
+    summary_free INTEGER NOT NULL DEFAULT 0   -- 票9 ⑤ (dsh #763): creator's ONE free per-thread
+                                               -- summary; does NOT consume budget (THREAD_CAP still binds)
 );
 
 CREATE INDEX IF NOT EXISTS idx_comments_thread ON comments(thread_id);

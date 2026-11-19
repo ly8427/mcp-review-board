@@ -136,3 +136,16 @@ jobs:
         run: python test_v2_stage8.py
       - name: v2 stage9
         run: python test_v2_stage9.py
+      # 批次2 新套件（接手面 #2491；套件清单与 #2570 回执一致）
+      # mask declaration（configs/test_mask_faces.py）为「一树×一解释器」快照
+      # 收据：指纹经 ast.unparse，跨解释器引号形态不保证稳定（grok #2565 实测
+      # 3.12.3/3.12.10 同 commit 一红一绿）——不在三档矩阵里验证；本地于快照
+      # 解释器跑（24/27 条含 SA 结构灯），评审核销在 board #120 完成。
+      - name: batch2 reissue window
+        run: python test_batch2_reissue_window.py
+      - name: ticket-9 rev2
+        run: python test_v213_ticket9.py
+      - name: 1.2a/1.2c
+        run: python test_v213_12ac.py
+      - name: 2.1 search fine-grain
+        run: python test_v213_search21.py
