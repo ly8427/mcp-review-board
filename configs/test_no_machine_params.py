@@ -92,6 +92,18 @@ odiff = ('diff --git a/x b/x\n'
          '+c55' + 's4 octal\n')
 ho = nmp.scan_diff(odiff)
 check("B5 八进制转义中文名解码", len(ho) == 1 and ho[0][0] == "文.md", str(ho))
+ndiff = ('diff --git a/x b/x\n'
+         '+++ foo.txt\n'
+         '@@ -0,0 +1 @@\n'
+         '+vles' + 's://noprefix-first-file\n')
+hn = nmp.scan_diff(ndiff)
+check("B6 无前缀首文件不吞新增行(置 None 会漏)", len(hn) == 1 and hn[0][0] == "foo.txt", str(hn))
+ddiff = ('diff --git a/gone b/gone\n'
+         '--- b/gone\n'
+         '+++ /dev/null\n'
+         '@@ -1 +0,0 @@\n'
+         '-removed line\n')
+check("B7 /dev/null 删除侧无新增行", nmp.scan_diff(ddiff) == [])
 
 print("=== diff 解析与自免 ===")
 diff_sample = ("diff --git a/docs/DEBT.md b/docs/DEBT.md\n"

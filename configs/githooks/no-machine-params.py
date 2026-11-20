@@ -131,13 +131,18 @@ def _added_lines(diff_text):
         if raw.startswith("diff --git "):
             path = None
         elif raw.startswith("+++ "):
+            # Bugbot 二轮 High: 不认识的形式置 None 会让后续新增行被自免逻辑
+            # 吞掉(=整文件不扫)——noprefix 等形式直接当路径; /dev/null 是删除
+            # 侧(无新增行), 保留原值
             p = raw[4:]
             if p.startswith("b/"):
                 path = p[2:]
-            elif p.startswith('"b/'):
+            elif p.startswith('"'):
                 path = _unquote_git_path(p)
+            elif p == "/dev/null":
+                pass
             else:
-                path = None
+                path = p
         elif raw.startswith("@@"):
             # @@ -a,b +c,d @@ ⇒ 新文件起始行 c
             try:
@@ -181,7 +186,8 @@ def main():
     pts = pointers()
     if mode == "--staged":
         diff = subprocess.run(
-            ["git", "-c", "core.quotepath=false", "diff", "--cached",
+            ["git", "-c", "core.quotepath=false", "-c", "diff.noprefix=false",
+             "-c", "diff.mnemonicPrefix=false", "diff", "--cached",
              "-U0", "--no-color"],
             capture_output=True, text=True,
             encoding="utf-8", errors="replace").stdout
@@ -225,15 +231,24 @@ def main():
                 rng = mb.stdout.strip() + ".." + local_sha
             else:
                 rng = remote_sha + ".." + local_sha
-            revs = subprocess.run(
-                ["git", "rev-list", rng],
-                capture_output=True, text=True).stdout.split()
-            for sha in revs:
-                diff = subprocess.run(
+            revs_run = subprocess.run(
+                ["git", "rev-list", rng], capture_output=True, text=True)
+            # Bugbot 二轮 Medium: 子命令失败 ⇒ 输出空 ⇒ 静默放行——fail-closed
+            if revs_run.returncode != 0:
+                print("[机器参数闸] rev-list 失败, 拒绝推送(fail-closed)。",
+                      file=sys.stderr)
+                sys.exit(1)
+            for sha in revs_run.stdout.split():
+                dt = subprocess.run(
                     ["git", "-c", "core.quotepath=false", "diff-tree", "-p",
                      "--root", "--no-commit-id", "-U0", "--no-color", sha],
                     capture_output=True, text=True, encoding="utf-8",
-                    errors="replace").stdout
+                    errors="replace")
+                if dt.returncode != 0:
+                    print(f"[机器参数闸] diff-tree {sha[:12]} 失败,"
+                          " 拒绝推送(fail-closed)。", file=sys.stderr)
+                    sys.exit(1)
+                diff = dt.stdout
                 hits = scan_diff(diff, allowed, pts)
                 if hits:
                     print(f"[机器参数闸] 推送范围 {parts[2]} 的提交 "
