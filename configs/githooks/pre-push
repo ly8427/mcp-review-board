@@ -1,0 +1,16 @@
+#!/bin/sh
+# 机器参数闸·推送前(兜底层, 2026-11-20 事故设立)——扫待推送提交范围的新增行。
+# 即使某次提交绕过了提交前闸(如别的会话/工具所做), 推送这道也会扫到。
+dir=$(dirname "$0")
+PY=""
+for cand in python3 python; do
+  if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "import sys" >/dev/null 2>&1; then
+    PY="$cand"
+    break
+  fi
+done
+if [ -z "$PY" ]; then
+  echo "[机器参数闸] 找不到可用的 python, 拒绝推送(fail-closed)。装 Python 或修复 PATH 后重试。"
+  exit 1
+fi
+exec "$PY" "$dir/no-machine-params.py" --pre-push
