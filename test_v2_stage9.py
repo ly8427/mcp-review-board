@@ -268,12 +268,24 @@ def main():
         assert "active quorum unanimous: a pass · b pass" in gate, gate
     finally:
         # dsh #1327 §三-3: 外层也包 —— send_signal/wait 抛也要跑到断言与 rmtree
+        # DEBT #14 (pi #1375 §四): exited 旗标——wait 正常返回才允许终局 DB 读;
+        # 未退净时该读抛 OperationalError 会把 TimeoutExpired 真因顶掉(__context__ 链)。
+        exited = False
         try:
             proc.send_signal(signal.SIGTERM)
             proc.wait(timeout=10)
+            exited = True
         finally:
+            # DEBT #15 (dsh #1377 §四): 超时路径补 kill——否则孤儿进程占 8779,
+            # 下一轮 wait_port 立即成功、全部流量打到上一轮孤儿(另一个 DB)上。
+            if not exited:
+                proc.kill()
+                try:
+                    proc.wait(timeout=10)
+                except Exception:
+                    pass
             try:
-                if c_suspended:
+                if c_suspended and exited:
                     row = sqlite3.connect(DB).execute(
                         "SELECT last_seen FROM participants WHERE author='c'"
                     ).fetchone()
