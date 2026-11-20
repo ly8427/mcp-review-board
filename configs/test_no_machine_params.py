@@ -39,8 +39,8 @@ def check(name, cond, detail=""):
     print(("  ✅ " if cond else " ❌ ") + name + (f" — {detail}" if detail and not cond else ""))
 
 
-def hits(line, allowed=frozenset()):
-    return nmp.scan_line(line, allowed)
+def hits(line, allowed=frozenset(), pointers=()):
+    return nmp.scan_line(line, allowed, pointers)
 
 
 print("=== 负控制：泄漏形态必拦（2026-11-20 事故原文形态） ===")
@@ -63,6 +63,18 @@ check("P6 普通中文行放行", hits("备用实例换押订阅内活节点、�
 print("=== 白名单机制 ===")
 check("W1 白名单外 IP 默认拦", hits(DNS_IP) != [], "默认应拦")
 check("W2 白名单生效后放行", hits(DNS_IP, allowed={DNS_IP}) == [])
+
+print("=== 敏感指针（2026-11-20 二次事故后增设） ===")
+PTR = "deadbeefcafe"  # 合成编号——本文件受闸扫描零豁免, 禁写真实事故编号
+check("S1 完整编号命中", hits("see commit " + PTR, pointers=(PTR,)) != [])
+check("S2 7位短号命中", hits("rewrote in " + PTR[:7], pointers=(PTR,)) != [])
+check("S3 大小写不敏感", hits("SHA " + PTR.upper(), pointers=(PTR,)) != [])
+check("S4 无关十六进制不误报", hits("tag deadbeefcafe fine", pointers=("1234567",)) == [])
+# 真实名单文件回归锁: 源码不写真实编号(闸会拦), 只验文件结构
+rl = nmp.pointers()
+check("S5 名单非空且每条>=7位十六进制", len(rl) >= 2 and all(
+    len(x) >= 7 and all(c in "0123456789abcdef" for c in x) for x in rl),
+    f"entries={len(rl)}")
 
 print("=== diff 解析与自免 ===")
 diff_sample = ("diff --git a/docs/DEBT.md b/docs/DEBT.md\n"

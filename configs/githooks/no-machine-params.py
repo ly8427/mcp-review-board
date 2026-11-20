@@ -13,11 +13,16 @@
      其余 IP 须精确列入 ip-allowlist.txt (显式决定, 进 diff 可审计)
   2. 已知 VPN 节点标签族 c55s<digit>
   3. 代理/订阅配置特征: vless:// vmess:// trojan:// ssr:// ss:// guiNDB guiConfigs
+  4. 敏感指针——指向已删除敏感内容的旧提交编号(sensitive-pointers.txt,
+     2026-11-20 二次事故后增设: 历史重写后旧 SHA=钥匙, 7 位短号也够打开;
+     历史重写的收尾步骤必须把被覆盖的旧编号登记进该文件)
 
 边界(如实载明): 只拦"长得像"的形态; 其他形态的机器信息(主机名等)不在此网内,
 由 PR 评审 + Bugbot 独立审查兜底。自免: configs/githooks/ 自身文件不扫
 (扫描器源码含模式字面量——自举悖论), 该目录下的敏感内容不受此闸保护。
+本闸只覆盖 git 路径; 经 API 发的评论/正文走 --scan-file 模式先扫再发。
 """
+import os
 import re
 import subprocess
 import sys
@@ -29,21 +34,28 @@ MARKERS = ("vless://", "vmess://", "trojan://", "ssr://", "ss://",
 SELF_DIR_PREFIX = "configs/githooks/"
 
 
-def allowlist():
-    """ip-allowlist.txt 的精确 IP 集合(文件缺失/无条目 ⇒ 空集)。"""
-    import os
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "ip-allowlist.txt")
-    out = set()
+def _data_lines(name):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    out = []
     try:
         with open(path, encoding="utf-8") as f:
             for ln in f:
                 ln = ln.split("#", 1)[0].strip()
                 if ln:
-                    out.add(ln)
+                    out.append(ln)
     except OSError:
         pass
     return out
+
+
+def allowlist():
+    """ip-allowlist.txt 的精确 IP 集合(文件缺失/无条目 ⇒ 空集)。"""
+    return set(_data_lines("ip-allowlist.txt"))
+
+
+def pointers():
+    """sensitive-pointers.txt 的敏感提交编号(小写化; 文件缺失 ⇒ 空表)。"""
+    return [x.lower() for x in _data_lines("sensitive-pointers.txt")]
 
 
 def ip_reserved(ip):
@@ -67,8 +79,8 @@ def ip_reserved(ip):
     return False
 
 
-def scan_line(text, allowed=frozenset()):
-    """单行扫描 ⇒ 命中类别列表(空列表=干净)。"""
+def scan_line(text, allowed=frozenset(), pointers=()):
+    """单行扫描 ⇒ 命中类别列表(空列表=干净)。pointers=敏感提交编号表。"""
     hits = []
     for m in IP_RE.finditer(text):
         ip = m.group(0)
@@ -81,6 +93,10 @@ def scan_line(text, allowed=frozenset()):
     for mk in MARKERS:
         if mk.lower() in low:
             hits.append(f"订阅/代理配置特征 {mk}")
+    for p in pointers:
+        # 编号的 7 位前缀就够 GitHub 解析 ⇒ 文字含名单编号的任一 ≥7 位前缀即命中
+        if p and any(p[:n] in low for n in range(7, len(p) + 1)):
+            hits.append(f"敏感指针(指向已删除敏感内容的旧提交编号) {p[:12]}")
     return hits
 
 
@@ -104,13 +120,13 @@ def _added_lines(diff_text):
     return out
 
 
-def scan_diff(diff_text, allowed=frozenset()):
+def scan_diff(diff_text, allowed=frozenset(), pointers=()):
     """扫一段 diff 的新增行 ⇒ [ (path, lineno, kinds, line) ]。"""
     hits = []
     for path, lineno, line in _added_lines(diff_text):
         if path is None or path.startswith(SELF_DIR_PREFIX):
             continue  # 自免: 闸自身文件(见 docstring 自举悖论)
-        kinds = scan_line(line, allowed)
+        kinds = scan_line(line, allowed, pointers)
         if kinds:
             hits.append((path, lineno, kinds, line))
     return hits
@@ -132,11 +148,28 @@ def die(hits):
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "--staged"
     allowed = allowlist()
+    pts = pointers()
     if mode == "--staged":
         diff = subprocess.run(["git", "diff", "--cached", "-U0", "--no-color"],
                               capture_output=True, text=True,
                               encoding="utf-8", errors="replace").stdout
-        die(scan_diff(diff, allowed)) if scan_diff(diff, allowed) else None
+        hits = scan_diff(diff, allowed, pts)
+        if hits:
+            die(hits)
+    elif mode == "--scan-file":
+        # API 发布前检查: 扫一个文本文件的全部行(先扫再发), 不依赖 git
+        if len(sys.argv) < 3:
+            print("usage: --scan-file <path>", file=sys.stderr)
+            sys.exit(2)
+        with open(sys.argv[2], encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        hits = []
+        for i, ln in enumerate(content.splitlines(), 1):
+            kinds = scan_line(ln, allowed, pts)
+            if kinds:
+                hits.append(("<file>", i, kinds, ln))
+        if hits:
+            die(hits)
     elif mode == "--pre-push":
         # stdin 每行: <local_ref> <local_sha> <remote_ref> <remote_sha>
         for line in sys.stdin:
@@ -161,7 +194,7 @@ def main():
                     ["git", "diff", remote_sha, local_sha, "-U0", "--no-color"],
                     capture_output=True, text=True, encoding="utf-8",
                     errors="replace").stdout
-            hits = scan_diff(diff, allowed)
+            hits = scan_diff(diff, allowed, pts)
             if hits:
                 print(f"[机器参数闸] 推送范围 {parts[2]} 含命中:", file=sys.stderr)
                 die(hits)
