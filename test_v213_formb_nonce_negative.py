@@ -109,11 +109,14 @@ try:
     check("② initiate: stderr 落 WARNING",
           "WARNING: nonce file delivery failed" in err2.getvalue(), err2.getvalue())
 
-    # ---- 正控制：DATA_DIR 恢复 ⇒ 文件真实落盘（负例确因 DATA_DIR） ----
-    SRV.DATA_DIR = saved_data_dir
+    # ---- 正控制：DATA_DIR 指向测试自备临时目录 ⇒ 文件真实落盘（负例确因 DATA_DIR） ----
+    # Bugbot(PR#61 Medium): 旧正控制恢复真实 data/ 路径——新 checkout data/ 缺失时
+    # 正控制因同一原因失败;data/ 在时还会覆写活板的 nonce 文件。改用测试自备目录。
+    pos_dir = pathlib.Path(tempfile.mkdtemp(prefix="t213-formb-pos-"))
+    SRV.DATA_DIR = pos_dir
     out_ok = SRV.request_form_b(tid, CREATOR, ["fb-p2"], token=TOKEN)
-    delivered = (saved_data_dir / "form_b_nonce.txt")
-    check("正控制: DATA_DIR 恢复后文件真实落盘",
+    delivered = (pos_dir / "form_b_nonce.txt")
+    check("正控制: DATA_DIR 指向可用目录后文件真实落盘",
           delivered.exists() and "[form_b]" in delivered.read_text(encoding="utf-8"),
           str(delivered))
 finally:
