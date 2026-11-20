@@ -174,7 +174,7 @@ def main():
         post_id(srv, t3, m, f"{m} floor")
     assert srv.set_verdict(thread_id=t3, verdict="pass", author="brin", token=tok["brin"]).startswith("Verdict")
     assert srv.set_verdict(thread_id=t3, verdict="object", author="cyr", token=tok["cyr"],
-                           note="hold").startswith("Verdict")
+                           note="hold\nflip: 挂起条件占位(方案 a L1)").startswith("Verdict")
     assert srv.set_verdict(thread_id=t3, verdict="pass", author="anna", token=tok["anna"]).startswith("Verdict")
     check("precondition: active objector keeps the thread open",
           status_of(db, t3) == "open")

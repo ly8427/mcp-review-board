@@ -206,7 +206,8 @@ def main():
           due_tids(body.get("my_comment_due", [])).get(t1) is True,
           f"due={body.get('my_comment_due')}")
     out = srv.set_verdict(thread_id=t1, verdict="object", author="cyr",
-                          token=tok["cyr"], note="A6 probe: flip to object")
+                          token=tok["cyr"],
+                          note="A6 probe: flip to object\nflip: 探针条件占位(方案 a L1)")
     assert out.startswith("Verdict recorded"), out
     body = probe(srv, "anna")
     check("#79 A6: pass→object flip demotes the debt to non-blocking and kills the wake",

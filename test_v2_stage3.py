@@ -121,8 +121,13 @@ def main():
             "thread_id": tid, "verdict": "pass", "author": "a"})
         assert "token" in tool("set_verdict", {
             "thread_id": tid, "verdict": "pass", "author": "a", "token": "wrong"})
-        assert "non-empty note" in tool("set_verdict", {
-            "thread_id": tid, "verdict": "object", "author": "a", "token": tok["a"]})
+        # 方案 a L1: 用非创建者 b——L1.5(创建者末票)在 flip 检查之前,
+        # 创建者先投会被 L1.5 拦截而到不了 flip 检查(set_verdict 不查讨论地板)
+        assert "flip-condition line" in tool("set_verdict", {
+            "thread_id": tid, "verdict": "object", "author": "b", "token": tok["b"], "note": "I disagree"})
+        assert "flip-condition line" in tool("set_verdict", {
+            "thread_id": tid, "verdict": "object", "author": "b", "token": tok["b"],
+            "note": "I disagree\nbut no flip: line here"})
         # reissue path: b's token is unacked (v2.1) and within the rate limit
         # -> wait hint, original token stays valid; if REISSUED capture it
         out = tool("claim_token", {"author": "b"})
@@ -146,7 +151,7 @@ def main():
         assert not out.startswith("ERROR") and "(billed" not in out, out
         tool("set_verdict", {"thread_id": tid, "verdict": "object",
                              "author": "c", "token": tok["c"],
-                             "note": "needs tests"})
+                             "note": "needs tests\nflip: 加上测试后我改投同意"})
         out = tool("set_verdict", {
             "thread_id": tid, "verdict": "pass", "author": "a", "token": tok["a"]})
         assert not out.startswith("ERROR") and "(billed" not in out, out
@@ -176,7 +181,7 @@ def main():
         # AUTO-REOPEN via new object (billed) on resolved
         out = tool("set_verdict", {"thread_id": tid, "verdict": "object",
                                    "author": "a", "token": tok["a"],
-                                   "note": "found edge case"})
+                                   "note": "found edge case\nflip: 补上边界用例后我改回"})
         assert status(tid) == "open"
 
         # bump_revision: creator-only, clears verdicts, resolved -> open
@@ -259,7 +264,8 @@ def main():
             v = "object" if i % 2 == 0 else "pass"
             args = {"thread_id": tid, "verdict": v, "author": "a", "token": tok["a"]}
             if v == "object":
-                args["note"] = "wear down budget"
+                # 方案 a L1: object 票必须带 flip 行, 否则 flip 检查抢在预算闸前拒绝
+                args["note"] = "wear down budget\nflip: 预算判定的格式条件(占位)"
             out = tool("set_verdict", args)
             if out.startswith("ERROR"):
                 assert "budget" in out, out

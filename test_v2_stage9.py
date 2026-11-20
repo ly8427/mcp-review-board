@@ -142,11 +142,11 @@ def main():
         tool("set_verdict", {"thread_id": tid, "verdict": "pass",
                              "author": "a", "token": tok["a"]})
         tool("set_verdict", {"thread_id": tid, "verdict": "object",
-                             "author": "b", "note": "flip when the gap lands",
-                             "token": tok["b"]})
+                             "author": "b", "note": "flip: when the gap lands",
+                             "token": tok["b"]})  # 方案 a L1: note 本身即合法 flip 行
         face = tool("get_thread", {"thread_id": tid})
         assert "a: pass" in face and "[active]" in face, face[:600]
-        assert "b: object" in face and "note: flip when the gap lands" in face, face
+        assert "b: object" in face and "note: flip: when the gap lands" in face, face
         assert "trail: r1:∅→object" in face, face
         assert "auto_resolve" not in face, face  # standing object → no gate fire
 
