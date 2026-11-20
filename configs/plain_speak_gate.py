@@ -329,10 +329,11 @@ def extract_text(payload):
        名单）取到正文才消费——值是裸串取该串；值是容器按 _body_text 取
        text/content/body 正文字段（多块 join，元数据 id/status/type 不冒充
        正文）；role 键存在且值非 assistant（含 JSON null / 非 str）→
-       role_skipped 桶（c8，整键跳过）；
+       role_skipped 桶（c8，整键跳过；**仅 A 档**——item 7 档位先于角色，
+       板 #114 v5 终版）；
        未识别形状 → meta_only 桶（h2 灯）。B 档（其余命中键名的字段，如
        conversation_preview）**永不打回**，进 b-tier-ignored 桶（板 #2073
-       §二；不盲选防键序定成败）。
+       §二；不盲选防键序定成败；item 7 后 role≠assistant 的 B 档键同桶）。
        **诊断契约三句**（板 #2112 §1 定稿，docstring 载）：
        弱形——进入收集面后零跳过 ⇒ stderr 不出现任何桶 token
        （meta_only:/role_skipped:/b-tier-ignored: 皆无）；
@@ -355,12 +356,17 @@ def extract_text(payload):
     reasons = []   # 原因：尾读失败可分原因（双列表之二；与桶分族，④ 丢弃不误伤 ③）
     for k, v in payload.items():
         if re.search(r"response|preview|last|message|assistant|text|output", str(k), re.I):
+            # item 7（板 #114 v5 终版 pi #2200：档位先于角色）——is_a 先判档，
+            # role 专用桶只留给 A 档；B 档 role≠assistant 改投 b-tier-ignored
+            # （「整键跳过」痕会被读成「role 换 assistant 就能被消费」，非 B 档
+            # 性质）。决策面零变化（B 档两路都不进消费面），诊断面必变。
+            is_a = k in ("last_message", "response", "text", "output")
             body = _body_text(v)
-            if body is _ROLE_SKIPPED:
+            if is_a and body is _ROLE_SKIPPED:
                 # c8（板 #2090 §二/#2095 §一 定稿）：有正文但角色不符 → 专用桶，
                 # 不落 meta_only 旧句（「只含元数据」与事实相反=假痕）
                 buckets.setdefault("role_skipped", []).append(k)
-            elif k in ("last_message", "response", "text", "output"):
+            elif is_a:
                 # A 档（板 #2073 §二定稿）：精确消费名单，取到正文才进 keyed；
                 # 容器只含元数据/未识别形状 → meta_only 桶（h2 灯）
                 if body and body.strip():
@@ -371,8 +377,8 @@ def extract_text(payload):
                     or (isinstance(v, str) and v.strip()):
                 # B 档（板 #2073 §二定稿；c7 收集点进桶，#2138 §四）：命中回复
                 # 键名但不在消费面——永不打回、不盲选（防键序定成败，dsh #2070
-                # 反例）；桶行由五出口统一 emit（「成功路径不写 stderr」旧裁
-                # 已被板 #110/V1.1.12 推翻）
+                # 反例）；item 7 后 role≠assistant 的 B 档键也进本桶；
+                # 桶行由五出口统一 emit
                 buckets.setdefault("b-tier-ignored", []).append(k)
     # 显式"最近一条"键优先于其余(V1.1.4 ②;flat 兜底已删——同键内长度选择
     # 正是冒充通道,dsh #2052 §二.3)
