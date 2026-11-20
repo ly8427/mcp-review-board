@@ -329,13 +329,14 @@ def main():
           len(lamp_skips) == 1 and all(re.search(r"reason=creator_delivery_skip_suspended:", n or "")
                                        for n in lamp_skips), f"skips={lamp_skips}")
 
-    # ④ DEBT #38 修复回归（GPT PR#48 审查补边界）：阻断 key 分类不被成员名污染。
-    check("4a 成员名含 suspicious+真实原因 no-entry → ledger_entry_missing",
-          srv._ledger_block_key(["suspicious_bot:no-entry"]) == "ledger_entry_missing")
-    check("4b success-but-still-suspended(suspicious) → ledger_entry_suspicious",
-          srv._ledger_block_key(["sus_ok:success-but-still-suspended(suspicious)"]) == "ledger_entry_suspicious")
-    check("4c reason= 整条路不误吃成员分类逻辑（初值 missing，调用点另提枚举）",
-          srv._ledger_block_key(["reason=no_ledger(本修订内无台账)"]) == "ledger_entry_missing")
+    # ④ DEBT #38/#39 回归：阻断 key 分类不被成员名污染（#39 结构化后=类型面根治，
+    # status 枚举直读；success→"suspicious" 的映射唯一构造点在 _wake_ledger_ok）。
+    check("4a 成员名含 suspicious+真实原因 no-entry → ledger_entry_missing（结构化对）",
+          srv._ledger_block_key([("suspicious_bot", "no-entry")]) == "ledger_entry_missing")
+    check("4b status=suspicious → ledger_entry_suspicious（结构化对）",
+          srv._ledger_block_key([("sus_ok", "suspicious")]) == "ledger_entry_suspicious")
+    check("4c 整条路 pairs=[] 不误吃成员分类逻辑（初值 missing，调用点另提枚举）",
+          srv._ledger_block_key([]) == "ledger_entry_missing")
 
     print("=" * 60)
     print(f"flip-condition fixes: {len(PASS)} passed, {len(FAIL)} failed")
