@@ -27,8 +27,8 @@ import re
 import subprocess
 import sys
 
-IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
-NODE_RE = re.compile(r"\bc55s\d\b", re.IGNORECASE)
+IP_RE = re.compile(r"(?<![0-9.])\d{1,3}(?:\.\d{1,3}){3}(?![0-9.])")
+NODE_RE = re.compile(r"(?<![0-9A-Za-z])c55s\d(?![0-9A-Za-z])", re.IGNORECASE)
 MARKERS = ("vless://", "vmess://", "trojan://", "ssr://", "ss://",
            "guiNDB", "guiConfigs")
 SELF_DIR_PREFIX = "configs/githooks/"
@@ -100,14 +100,44 @@ def scan_line(text, allowed=frozenset(), pointers=()):
     return hits
 
 
+def _unquote_git_path(p):
+    """git 对含空格/非 ASCII 的路径加引号+八进制转义("b/\\346\\226\\207")——还原。"""
+    if p.startswith('"') and p.endswith('"') and len(p) >= 2:
+        body = p[1:-1]
+        out = bytearray()
+        i = 0
+        while i < len(body):
+            ch = body[i]
+            if ch == "\\" and i + 3 < len(body) and body[i + 1] in "0123":
+                try:
+                    out.append(int(body[i + 1:i + 4], 8))
+                    i += 4
+                    continue
+                except ValueError:
+                    pass
+            out.extend(ch.encode("utf-8"))
+            i += 1
+        s = out.decode("utf-8", errors="replace")
+        if s.startswith("b/"):
+            s = s[2:]
+        return s
+    return p
+
+
 def _added_lines(diff_text):
     """从 git diff -U0 输出解析 (path, lineno, line) 三元组(仅新增行)。"""
     out, path, ln = [], None, 0
     for raw in diff_text.splitlines():
         if raw.startswith("diff --git "):
             path = None
-        elif raw.startswith("+++ b/"):
-            path = raw[6:]
+        elif raw.startswith("+++ "):
+            p = raw[4:]
+            if p.startswith("b/"):
+                path = p[2:]
+            elif p.startswith('"b/'):
+                path = _unquote_git_path(p)
+            else:
+                path = None
         elif raw.startswith("@@"):
             # @@ -a,b +c,d @@ ⇒ 新文件起始行 c
             try:
@@ -150,9 +180,11 @@ def main():
     allowed = allowlist()
     pts = pointers()
     if mode == "--staged":
-        diff = subprocess.run(["git", "diff", "--cached", "-U0", "--no-color"],
-                              capture_output=True, text=True,
-                              encoding="utf-8", errors="replace").stdout
+        diff = subprocess.run(
+            ["git", "-c", "core.quotepath=false", "diff", "--cached",
+             "-U0", "--no-color"],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace").stdout
         hits = scan_diff(diff, allowed, pts)
         if hits:
             die(hits)
@@ -172,6 +204,9 @@ def main():
             die(hits)
     elif mode == "--pre-push":
         # stdin 每行: <local_ref> <local_sha> <remote_ref> <remote_sha>
+        # Bugbot #2(2026-11-20): 端点 diff 会漏"中间提交加入、后续提交删除"的
+        # 历史内泄漏(本仓库事故正是此形态——泄漏行进了历史, SHA 直连可达)
+        # ⇒ 改为逐提交扫各自 diff; Bugbot #1: 新分支基准拿不到 ⇒ fail-closed。
         for line in sys.stdin:
             parts = line.split()
             if len(parts) != 4:
@@ -180,24 +215,30 @@ def main():
             if set(local_sha) == {"0"}:
                 continue  # 分支删除, 无内容
             if set(remote_sha) == {"0"}:
-                # 新分支: 扫 local_sha 相对 origin/master 的新增; 无参照则扫全树差异
-                base = subprocess.run(
+                mb = subprocess.run(
                     ["git", "merge-base", "origin/master", local_sha],
-                    capture_output=True, text=True).stdout.strip()
-                rng = [base or "", local_sha]
-                diff = subprocess.run(
-                    ["git", "diff", "-U0", "--no-color"] + rng,
-                    capture_output=True, text=True, encoding="utf-8",
-                    errors="replace").stdout
+                    capture_output=True, text=True)
+                if mb.returncode != 0 or not mb.stdout.strip():
+                    print("[机器参数闸] 无法确定新分支比对基准(merge-base 失败),"
+                          " 拒绝推送(fail-closed)。", file=sys.stderr)
+                    sys.exit(1)
+                rng = mb.stdout.strip() + ".." + local_sha
             else:
+                rng = remote_sha + ".." + local_sha
+            revs = subprocess.run(
+                ["git", "rev-list", rng],
+                capture_output=True, text=True).stdout.split()
+            for sha in revs:
                 diff = subprocess.run(
-                    ["git", "diff", remote_sha, local_sha, "-U0", "--no-color"],
+                    ["git", "-c", "core.quotepath=false", "diff-tree", "-p",
+                     "--root", "--no-commit-id", "-U0", "--no-color", sha],
                     capture_output=True, text=True, encoding="utf-8",
                     errors="replace").stdout
-            hits = scan_diff(diff, allowed, pts)
-            if hits:
-                print(f"[机器参数闸] 推送范围 {parts[2]} 含命中:", file=sys.stderr)
-                die(hits)
+                hits = scan_diff(diff, allowed, pts)
+                if hits:
+                    print(f"[机器参数闸] 推送范围 {parts[2]} 的提交 "
+                          f"{sha[:12]} 含命中:", file=sys.stderr)
+                    die(hits)
     else:
         print(f"unknown mode {mode}", file=sys.stderr)
         sys.exit(2)

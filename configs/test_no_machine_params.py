@@ -76,6 +76,23 @@ check("S5 名单非空且每条>=7位十六进制", len(rl) >= 2 and all(
     len(x) >= 7 and all(c in "0123456789abcdef" for c in x) for x in rl),
     f"entries={len(rl)}")
 
+print("=== 边界与解析加固（Bugbot 二轮 2026-11-20） ===")
+check("B1 中文紧邻 IP 也命中(无分隔符)", hits("地址" + LEAK_IP + "。") != [])
+check("B2 中文紧邻节点标签也命中", hits("押" + NODE + "节点") != [])
+check("B3 正常分隔仍命中(回归)", hits("server " + LEAK_IP + " ok") != [])
+qdiff = ('diff --git a/x b/x\n'
+         '+++ "b/my file.txt"\n'
+         '@@ -0,0 +1 @@\n'
+         '+vles' + 's://in-quoted-path\n')
+hq = nmp.scan_diff(qdiff)
+check("B4 引号路径被解析且命中", len(hq) == 1 and hq[0][0] == "my file.txt", str(hq))
+odiff = ('diff --git a/x b/x\n'
+         '+++ "b/\\346\\226\\207.md"\n'
+         '@@ -0,0 +1 @@\n'
+         '+c55' + 's4 octal\n')
+ho = nmp.scan_diff(odiff)
+check("B5 八进制转义中文名解码", len(ho) == 1 and ho[0][0] == "文.md", str(ho))
+
 print("=== diff 解析与自免 ===")
 diff_sample = ("diff --git a/docs/DEBT.md b/docs/DEBT.md\n"
                "+++ b/docs/DEBT.md\n"
