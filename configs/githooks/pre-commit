@@ -1,0 +1,17 @@
+#!/bin/sh
+# 机器参数闸·提交前(2026-11-20 事故设立)——拦暂存新增行里的公网 IP/节点标签/订阅配置
+# 细节见 no-machine-params.py 头注。解释器探测必须真跑一次(Git Bash 下 python3
+# 可能是 Microsoft Store 占位符, command -v 找得到但跑不动)。
+dir=$(dirname "$0")
+PY=""
+for cand in python3 python; do
+  if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "import sys" >/dev/null 2>&1; then
+    PY="$cand"
+    break
+  fi
+done
+if [ -z "$PY" ]; then
+  echo "[机器参数闸] 找不到可用的 python, 拒绝提交(fail-closed)。装 Python 或修复 PATH 后重试。"
+  exit 1
+fi
+exec "$PY" "$dir/no-machine-params.py" --staged
