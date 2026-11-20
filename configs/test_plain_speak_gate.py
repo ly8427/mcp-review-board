@@ -496,6 +496,84 @@ class TestGateEndToEnd(Harness):
         self.assertEqual(rc_p, 0)
 
 
+# ── 板 #114 v5 终版（pi #2200/dsh #2201 定稿）：环境绕行判据面唯一实现 ──
+# ⑤ 名面只收 getenv/getenvb——**禁并 environ**（g14b 的属性面归 environ(b)，
+# ⑤ 无 inside_fn 豁免，并进去 gate:44 的 os.environ 当天假红＝G3 反向锁的对象）。
+_GETENV_NAMES = ("getenv", "getenvb")
+# ⑥ 常量面（恰等，禁子串——gate docstring 长串含 "os.environ" 字样子串，
+# 子串口径当天假红，dsh #2193 §二）：值面直通车一次覆盖
+# getattr(os,…) / vars(os)[…] / os.__dict__[…] / operator.attrgetter(…) 四形。
+_CONST_FACES = ("environ", "environb", "getenv", "getenvb",
+                "import_module", "importlib", "__import__")
+
+
+def _environ_confined_violations(src):
+    """g14b 判据面唯一实现：os.environ(b) / environ(b).pop|update 只准出现在
+    _gate_env 体内（含 b 后缀同族＝板 #114 dsh #2195 M5/M6）。返回违例消息列表。"""
+    import ast as _ast
+    tree = _ast.parse(src)
+    funcs = [n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef)]
+    inside_fn = {id(n) for fn in funcs
+                 if fn.name == "_gate_env" for n in _ast.walk(fn)}
+    bad = []
+    for node in _ast.walk(tree):
+        if id(node) in inside_fn:
+            continue
+        if isinstance(node, _ast.Attribute) and node.attr in ("environ", "environb"):
+            bad.append("os.environ(b) 出现在 _gate_env 之外（模块级或非入口函数）")
+        if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute) \
+                and node.func.attr in ("pop", "update") \
+                and isinstance(node.func.value, _ast.Attribute) \
+                and node.func.value.attr in ("environ", "environb"):
+            bad.append(f"environ(b).{node.func.attr}() 出现在 _gate_env 之外")
+    return bad
+
+
+def _env_bypass_violations(src):
+    """g16 判据面唯一实现（v5 终版全臂）：返回「臂:消息」列表。
+    ①from os import；②import os as 别名；③getattr(…,常量) 四名；
+    ④__import__/importlib 名字与属性＋④扩 from importlib import（pi #2191）；
+    ⑤名面（Name.id/Attribute.attr ∈ getenv/getenvb，_gate_env 之外）；
+    ⑥常量面（str 常量恰等于 _CONST_FACES 七名，_gate_env 之外）。
+    字面形状封死；动态构造无灯，兜底是评审（#2197 §二口径）。"""
+    import ast as _ast
+    tree = _ast.parse(src)
+    funcs = [n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef)]
+    inside_fn = {id(n) for fn in funcs
+                 if fn.name == "_gate_env" for n in _ast.walk(fn)}
+    bad = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.ImportFrom) and node.module == "os":
+            bad.append("①from os import …（绕过 _gate_env 判据面）")
+        if isinstance(node, _ast.ImportFrom) and node.module == "importlib":
+            bad.append("④扩 from importlib import …（动态导入绕灯，pi #2191）")
+        if isinstance(node, _ast.Import):
+            for a in node.names:
+                if a.name == "os" and a.asname:
+                    bad.append(f"②import os as {a.asname}（别名绕灯）")
+        if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name) \
+                and node.func.id == "getattr" and len(node.args) >= 2 \
+                and isinstance(node.args[1], _ast.Constant) \
+                and node.args[1].value in ("environ", "getenv",
+                                           "environb", "getenvb"):
+            bad.append(f"③getattr(…, \"{node.args[1].value}\") 常量串（动态绕灯）")
+        for attr in ("__import__", "importlib"):
+            if isinstance(node, _ast.Name) and node.id == attr:
+                bad.append(f"④{attr} 名字出现（动态导入绕灯）")
+            if isinstance(node, _ast.Attribute) and node.attr == attr:
+                bad.append(f"④.{attr} 属性出现（动态导入绕灯）")
+        if id(node) in inside_fn:
+            continue
+        if isinstance(node, _ast.Name) and node.id in _GETENV_NAMES:
+            bad.append(f"⑤裸名 {node.id}（_gate_env 之外）")
+        if isinstance(node, _ast.Attribute) and node.attr in _GETENV_NAMES:
+            bad.append(f"⑤属性 .{node.attr}（_gate_env 之外）")
+        if isinstance(node, _ast.Constant) and isinstance(node.value, str) \
+                and node.value in _CONST_FACES:
+            bad.append(f"⑥常量 \"{node.value}\"（值面直通车，恰等口径）")
+    return bad
+
+
 class TestTailReasonsAndWash(unittest.TestCase):
     """GPT round-20/21 §三:七态原因、形状族、洗环境表派生(dsh #2052 §三)。"""
 
@@ -643,70 +721,92 @@ class TestTailReasonsAndWash(unittest.TestCase):
                          f"闸实读环境名数漂移(dsh #2052 §一 = 15): {sorted(gate_names)}")
 
     def test_g14b_environ_confined_to_gate_env(self):
-        # 板 #2073 §四-4（#2070 §四 方向定稿）：闸源码 os.environ 只准出现在
-        # _gate_env() 单一入口——函数体内与**模块级**（含嵌套语句块）出现
-        # os.environ(b) / environ(b).pop / environ(b).update 即红（b 后缀同族
-        # 封堵＝板 #114 dsh #2195 M5）；洗表派生从此有单一锚点（V1.1.11）
-        import ast as _ast
+        # 板 #2073 §四-4：闸源码 os.environ(b) 只准出现在 _gate_env() 单一入口。
+        # 判据面唯一实现=_environ_confined_violations（矩阵格 M5/M6 复用同尺，
+        # 期望侧与证据侧都取字节）；b 后缀同族封堵＝板 #114 dsh #2195 M5。
         with open(GATE, encoding="utf-8") as f:
-            tree = _ast.parse(f.read())
-        funcs = [n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef)]
-        inside_fn = {id(n) for fn in funcs
-                     if fn.name == "_gate_env" for n in _ast.walk(fn)}
-        bad = []
-        for node in _ast.walk(tree):
-            if id(node) in inside_fn:
-                continue
-            if isinstance(node, _ast.Attribute) and node.attr in ("environ", "environb"):
-                bad.append("os.environ(b) 出现在 _gate_env 之外（模块级或非入口函数）")
-            if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute) \
-                    and node.func.attr in ("pop", "update") \
-                    and isinstance(node.func.value, _ast.Attribute) \
-                    and node.func.value.attr in ("environ", "environb"):
-                bad.append(f"environ(b).{node.func.attr}() 出现在 _gate_env 之外")
+            bad = _environ_confined_violations(f.read())
         self.assertEqual(bad, [], "环境读取必须收进 _gate_env() 单一入口")
 
     def test_g16_import_shapes_forbidden(self):
-        # 板 #2141 §四 v3「getenv 灯＋import 形状四条」（PR#38 评审补封）：
-        # 作用域 GATE 非 __file__（测试文件 import importlib 属正常）。
-        # ①from os import … 禁；②仅禁 import os as X（别名绕过 _gate_env；其他模块 as 不在本灯范围）；
-        # ③getattr(…, "environ"|"getenv"|"environb"|"getenvb") 常量串即红；④__import__/importlib 名字出现即红；
-        # ⑤_gate_env 之外 os.getenv(b)(...) / attr in {"getenv","getenvb"} 的调用即红；
-        # ⑥from importlib import … 禁（from-import 盲区，板 #114 pi #2191）；b 后缀名同族封堵（板 #114 dsh #2195）。
-        # 不声称「全部」通道已封（如动态属性名仍可能绕过）。
-        import ast as _ast
-        with open(GATE, encoding="utf-8") as _gf:
-            tree = _ast.parse(_gf.read())
-        funcs = [n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef)]
-        inside_fn = {id(n) for fn in funcs
-                     if fn.name == "_gate_env" for n in _ast.walk(fn)}
-        bad = []
-        for node in _ast.walk(tree):
-            if isinstance(node, _ast.ImportFrom) and node.module == "os":
-                bad.append("from os import …（绕过 _gate_env 判据面）")
-            if isinstance(node, _ast.ImportFrom) and node.module == "importlib":
-                bad.append("from importlib import …（动态导入绕灯，板 #114 pi #2191）")
-            if isinstance(node, _ast.Import):
-                for a in node.names:
-                    if a.name == "os" and a.asname:
-                        bad.append(f"import os as {a.asname}（别名绕灯）")
-            if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name) \
-                    and node.func.id == "getattr" and len(node.args) >= 2 \
-                    and isinstance(node.args[1], _ast.Constant) \
-                    and node.args[1].value in ("environ", "getenv",
-                                               "environb", "getenvb"):
-                bad.append(f"getattr(…, \"{node.args[1].value}\") 常量串（动态绕灯）")
-            for attr in ("__import__", "importlib"):
-                if isinstance(node, _ast.Name) and node.id == attr:
-                    bad.append(f"{attr} 名字出现（动态导入绕灯）")
-                if isinstance(node, _ast.Attribute) and node.attr == attr:
-                    bad.append(f".{attr} 属性出现（动态导入绕灯）")
-            if id(node) in inside_fn:
-                continue
-            if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute) \
-                    and node.func.attr in ("getenv", "getenvb"):
-                bad.append("os.getenv(b)(...) 出现在 _gate_env 之外")
+        # 板 #2141 §四 v3「getenv 灯＋import 形状」承诺兑现（v5 终版判据面，
+        # 板 #114 dsh #2195 §三 7 项 / pi #2200 定版）：唯一实现=
+        # _env_bypass_violations；验收矩阵（test_g16b）用同一把尺喂合成变异
+        # ——期望侧与证据侧都取字节（dsh #2198 §三）。作用域 GATE 非
+        # __file__（测试文件 import importlib 属正常）。
+        with open(GATE, encoding="utf-8") as f:
+            bad = _env_bypass_violations(f.read())
         self.assertEqual(bad, [], "闸源码不得存在环境读取的绕行通道")
+
+    def test_g16b_acceptance_matrix_11_cells(self):
+        # 板 #114 验收矩阵（dsh #2193 §一 8 格 + M5/M6 + G3 反向锁；
+        # pi #2196/#2200 定版）：每个变异格 = 合成 gate 源喂同一把尺，
+        # 断言咬合灯臂出现；绿锁格 = 真 gate 源全臂 0 命中。
+        cells = [
+            ("M1", "import os\nsid = os.getenv('ZCODE_SESSION_ID')",
+             ("⑤",), ()),
+            ("M2", "import os\nsid = getattr(os, 'getenv')('ZCODE_SESSION_ID')",
+             ("③", "⑥"), ()),
+            ("M3", "import os\nsid = vars(os)['environ'].get('ZCODE_SESSION_ID')",
+             ("⑥",), ()),   # 咬合灯仅 ⑥——M3 连 g14b 都绿（dsh #2193 §一 原判）
+            ("M4", "from importlib import import_module\n"
+                   "import_module('os').getenv('X')",
+             ("④扩", "⑤"), ()),
+            ("M5", "import os\nsid = os.getenvb(b'ZCODE_SESSION_ID')",
+             ("⑤",), ()),
+            # M6 咬合灯 = g14b 属性面（非 ⑤——pi #2196 实弹钉死的分工）
+            ("M6", "import os\nsid = os.environb.get(b'X').decode()",
+             (), ("g14b",)),
+            ("C1", "import os\nx = getattr(os, 'environ')",
+             ("③",), ()),            # 防回退：③ 不得被 ⑥ 重构弄丢
+            ("C2", "sid = __import__('os').getenv('X')",
+             ("④", "⑤"), ()),        # 防回退：④ 仍在
+        ]
+        for name, src, must_have, must_have_g14b in cells:
+            hits = _env_bypass_violations(src)
+            joined = " | ".join(hits)
+            for arm in must_have:
+                self.assertTrue(any(h.startswith(arm) for h in hits),
+                                f"{name} 必须被 {arm} 咬住: {joined}")
+            if must_have_g14b:
+                g14b_hits = _environ_confined_violations(src)
+                self.assertTrue(g14b_hits,
+                                f"{name} 必须被 g14b 咬住: {' | '.join(g14b_hits)}")
+        # G3 反向锁（dsh #2195 §二）：⑤ 名面禁并 environ(b)——并进去 = gate
+        # 的 os.environ 当天假红；本锁直接钉名字面，比口头约定可靠。
+        self.assertNotIn("environ", _GETENV_NAMES)
+        self.assertNotIn("environb", _GETENV_NAMES)
+        # G1/G2 绿锁：真 gate 源全臂 0 命中（test_g16/test_g14b 已钉，此处复核）
+        with open(GATE, encoding="utf-8") as f:
+            real = f.read()
+        self.assertEqual(_env_bypass_violations(real), [])
+        self.assertEqual(_environ_confined_violations(real), [])
+
+    def test_c_bucket_tables_single_assembly(self):
+        # (C)（板 #114 dsh #2195 §三 item6 / pi #2200 终版）：三表相等——
+        # {buckets.setdefault 首参常量} == set(_BUCKET_ORDER) == set(_BUCKET_PHRASES)。
+        # 按接收者限定（gate 另有 words.setdefault，首参 Name——不限定接收者
+        # 当天假红，dsh #2195 §三 item6 陷阱(a)）；同时堵 phrase 表漂移
+        # （_emit_diag 的 .get(token, token) 兜底在档）。
+        import ast as _ast
+        with open(GATE, encoding="utf-8") as f:
+            tree = _ast.parse(f.read())
+        consts = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute) \
+                    and node.func.attr == "setdefault" \
+                    and isinstance(node.func.value, _ast.Name) \
+                    and node.func.value.id == "buckets" and node.args \
+                    and isinstance(node.args[0], _ast.Constant):
+                consts.add(node.args[0].value)
+        import importlib.util
+        s = importlib.util.spec_from_file_location("psg_c_tables", GATE)
+        m = importlib.util.module_from_spec(s)
+        s.loader.exec_module(m)
+        self.assertEqual(consts, set(m._BUCKET_ORDER),
+                         f"buckets.setdefault 首参常量集 ≠ _BUCKET_ORDER: {sorted(consts)}")
+        self.assertEqual(set(m._BUCKET_PHRASES), set(m._BUCKET_ORDER),
+                         "phrase 表与序表漂移（(C) 同时堵 .get(token, token) 兜底）")
 
 
 class TestV1112Shapes(Harness):
@@ -828,8 +928,11 @@ class TestV1112Shapes(Harness):
         self.assertIs(m._body_text(rec), m._ROLE_SKIPPED)
 
     def test_j9_multi_key_whole_span_sorted(self):
-        # 多键格（板 #2112 §2 定稿）：整段钉兼排序唯一直接灯。前提：本格
-        # 桶键集恰为 payload 所列（docstring 承诺）。
+        # 多键格（板 #2112 §2 定稿）：整段钉兼排序唯一直接灯。
+        # item 7（板 #114 v5 终版，dsh #2199 §四/pi #2200 定版措辞）：
+        # 档位先于角色——last_message（A 档）保留 role_skipped 桶；
+        # assistant_message（B 档）改投 b-tier-ignored 桶（决策面零变化、
+        # 诊断面必变）。行序由 _BUCKET_ORDER 钉死（role_skipped < b-tier-ignored）。
         self.write_transcript([{"type": "user",
                                 "message": {"role": "user", "content": JARGON}}])
         payload = {**self.stop_payload(),
@@ -837,7 +940,10 @@ class TestV1112Shapes(Harness):
                    "assistant_message": {"role": "user", "content": JARGON}}
         rc, b, err = self.gate(payload)
         self.assertIsNone(b)
-        self.assertIn("role_skipped: assistant_message, last_message", err)
+        self.assertIn("role_skipped: last_message", err)
+        self.assertIn("b-tier-ignored: assistant_message", err)
+        self.assertNotIn("role_skipped: assistant_message", err,
+                         "item 7 后 B 档不得再落 role_skipped 旧桶")
 
     def test_j10_sorted_swap_byte_identical(self):
         # sorted 确定性（板 #2104 §2 I3）：键互换 JSON 序 → stderr 逐字节同。
