@@ -66,9 +66,13 @@ def resolve_watcher_gates(gate_dir=None, gates_file=None, gates_json=None):
     if gates_json is None:
         gates_json = os.environ.get("RB_WATCHER_GATES_JSON", "{}")
     try:
-        gates.update({k: str(v) for k, v in json.loads(gates_json or "{}").items()})
+        _env_gates = json.loads(gates_json or "{}")
     except ValueError:
-        pass  # env JSON 损坏 = 忽略（旧行为是直接炸模块级，这里收窄为不阻断）
+        _env_gates = None  # 损坏 JSON = 忽略（旧行为是直接炸模块级，这里收窄为不阻断）
+    # Bugbot(PR#59 Medium): 合法 JSON 但非对象(null/数组/标量)会过 ValueError 关,
+    # 然后 .items() 抛 AttributeError 炸 import——显式对象判型,非对象一律退默认。
+    if isinstance(_env_gates, dict):
+        gates.update({k: str(v) for k, v in _env_gates.items()})
     return gates
 
 

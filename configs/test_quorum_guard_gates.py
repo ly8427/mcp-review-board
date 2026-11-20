@@ -96,6 +96,15 @@ class ResolveWatcherGatesTest(unittest.TestCase):
                                          gates_json="{broken")
         self.assertEqual(gates["pi"], os.path.join(self.tmp, "rb-pi-watcher.fails"))
 
+    def test_env_json_valid_but_non_object_ignored_no_throw(self):
+        # Bugbot(PR#59 Medium): null/数组/标量是合法 JSON,过 ValueError 关后
+        # .items() 会 AttributeError 炸 import——必须对象判型后退默认。
+        for bad in ("null", "[1,2]", "5", '"str"', "true"):
+            gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file="",
+                                             gates_json=bad)
+            self.assertEqual(gates["pi"], os.path.join(self.tmp, "rb-pi-watcher.fails"),
+                             f"env_json={bad}")
+
     # ---------- 模块级装配冒烟 ----------
     def test_module_level_watcher_gates_is_dict_with_defaults(self):
         for n in DEFAULT_MEMBERS:
