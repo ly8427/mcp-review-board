@@ -279,7 +279,12 @@ def main():
             # DEBT #15 (dsh #1377 §四): 超时路径补 kill——否则孤儿进程占 8779,
             # 下一轮 wait_port 立即成功、全部流量打到上一轮孤儿(另一个 DB)上。
             if not exited:
-                proc.kill()
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    # GPT 外审(PR#63): SIGTERM 与 kill 之间进程可能已自然退出——
+                    # kill 的竞态异常不得覆盖原始测试失败原因(TimeoutExpired 等)。
+                    pass
                 try:
                     proc.wait(timeout=10)
                 except Exception:
