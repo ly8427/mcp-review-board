@@ -268,12 +268,45 @@ def main():
         assert "active quorum unanimous: a pass · b pass" in gate, gate
     finally:
         # dsh #1327 §三-3: 外层也包 —— send_signal/wait 抛也要跑到断言与 rmtree
+        # DEBT #14 (pi #1375 §四): exited 旗标——wait 正常返回才允许终局 DB 读;
+        # 未退净时该读抛 OperationalError 会把 TimeoutExpired 真因顶掉(__context__ 链)。
+        exited = False
         try:
             proc.send_signal(signal.SIGTERM)
             proc.wait(timeout=10)
+            exited = True
         finally:
+            # DEBT #15 (dsh #1377 §四): 超时路径补 kill——否则孤儿进程占 8779,
+            # 下一轮 wait_port 立即成功、全部流量打到上一轮孤儿(另一个 DB)上。
+            if not exited:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    # GPT 外审(PR#63): SIGTERM 与 kill 之间进程可能已自然退出——
+                    # kill 的竞态异常不得覆盖原始测试失败原因(TimeoutExpired 等)。
+                    pass
+                except OSError as _kill_err:
+                    # GPT 外审三轮(PR#63): kill 的其他 OSError(权限等)同样不得
+                    # 覆盖原始异常——记录后继续 wait/poll 路径。
+                    sys.stderr.write(
+                        f"[stage9] WARNING: proc.kill() failed({_kill_err}); "
+                        f"original test exception preserved\n")
+                try:
+                    proc.wait(timeout=10)
+                except Exception as _cleanup_err:
+                    # GPT 外审二轮(PR#63): kill 失败或 kill 后仍不退出 ⇒ 记录清理
+                    # 失败(别让孤儿悄悄留在 8779 上),原始异常链保持不动。
+                    sys.stderr.write(
+                        f"[stage9] WARNING: orphan cleanup incomplete after kill "
+                        f"({_cleanup_err}); rc={proc.poll()!r}\n")
+                # GPT 外审二轮(PR#63): 清理后核实确实退出——没退就再报一条,
+                # 让孤儿在输出里有痕(而不是被 except pass 无声吞掉)。
+                if proc.poll() is None:
+                    sys.stderr.write(
+                        "[stage9] WARNING: child process still alive after "
+                        "kill+wait — orphan on port 8779 likely\n")
             try:
-                if c_suspended:
+                if c_suspended and exited:
                     row = sqlite3.connect(DB).execute(
                         "SELECT last_seen FROM participants WHERE author='c'"
                     ).fetchone()
@@ -281,7 +314,17 @@ def main():
                     assert row is not None and row[0] == SENTINEL, \
                         f"c 复活了 => 本用例前提已破 got={row!r}"
             finally:
-                shutil.rmtree(tmp, ignore_errors=True)
+                # GPT 外审三轮(PR#63): 子进程若仍存活,删其工作目录会让事后排查
+                # 更难——留痕后再清(ignore_errors 保原路径语义)。
+                if proc.poll() is None:
+                    # GPT 外审四轮(PR#63): 子进程仍存活 ⇒ 保留临时目录(删了工作
+                    # 目录会让孤儿排查失去现场;Windows 上还可能文件占用)——
+                    # 目录清理改由确认退出后执行。
+                    sys.stderr.write(
+                        "[stage9] WARNING: child still alive; preserving temp "
+                        f"dir: {tmp}\n")
+                else:
+                    shutil.rmtree(tmp, ignore_errors=True)
     print("✅ STAGE9 TESTS PASSED: verdict read face — seats/never-voted, "
           "notes+trails, auto_resolve tally in gate, bump-cleared vs "
           "never-voted, C3 pure-read, suspended liveness, free-thread "
