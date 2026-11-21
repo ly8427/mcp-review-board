@@ -23,6 +23,7 @@ import os
 import re
 import secrets
 import sqlite3
+import sys
 import time
 import uuid
 from contextlib import contextmanager
@@ -3975,8 +3976,11 @@ def request_form_b(
             try:
                 p = DATA_DIR / "form_b_nonce.txt"
                 p.write_text(line + "\n", encoding="utf-8")
-            except OSError:
-                pass
+            except OSError as _e:
+                # DEBT #25 ②: fail-open 是有意行为（工具仍返 nonce requested、审计行
+                # 仍在——负例测试钉死），但静默吞错让人看不见交付面已降级 ⇒ stderr
+                # 落一条告警（→ server.log），与 stdout 的 nonce 行同屏可查。
+                sys.stderr.write(f"[form_b] WARNING: nonce file delivery failed ({_e}); stdout/log only\n")
             return (f"form_b initiate nonce requested (pre-thread; names={clean}) — "
                     f"delivered to the USER side only. Hand it to "
                     f"create_thread(form_b_nonce='…') with the SAME title and names; "
@@ -4027,8 +4031,11 @@ def request_form_b(
         try:
             p = DATA_DIR / "form_b_nonce.txt"
             p.write_text(line + "\n", encoding="utf-8")
-        except OSError:
-            pass
+        except OSError as _e:
+            # DEBT #25 ②: fail-open 有意保留（工具仍返 nonce requested、审计行
+            # 仍在——负例测试钉死），但静默吞错让人看不见交付面已降级 ⇒ stderr
+            # 落一条告警（→ server.log），与 stdout 的 nonce 行同屏可查。
+            sys.stderr.write(f"[form_b] WARNING: nonce file delivery failed ({_e}); stdout/log only\n")
         return (f"form_b nonce requested for thread #{thread_id} ({clean}) — "
                 f"pending USER confirm. The nonce is delivered to the USER side only "
                 f"(server log / data/form_b_nonce.txt); it is intentionally NOT in this "
