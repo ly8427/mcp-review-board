@@ -194,7 +194,9 @@ def classify(src):
         if tag.startswith("excluded:"):
             excl_forms[id(call)] = (name, tag, _def_body_forms(fdef))
     total = len(_loads_calls(tree))
-    return sites, unclassified, double_tagged, counts, defs_of, guard_flags, excl_forms, total
+    # GPT 外审二轮(PR#65): 返回 tree——调用方需要与 sites/defs_of 同一棵 AST
+    # (T2b 曾另 ast.parse 一棵新树,Windows 3.11 上 id() 复用致跨树错配=CI 红)。
+    return sites, unclassified, double_tagged, counts, defs_of, guard_flags, excl_forms, total, tree
 
 
 def _call_args(call):
@@ -229,8 +231,10 @@ def main():
         src = f.read().decode("utf-8")
     print("β 机械门：单一分区 + 标签制（#1581 定稿）—— 只扫 server.py，零执行面\n")
 
-    sites, unclassified, double_tagged, counts, defs_of, guard_flags, excl_forms, total = classify(src)
-    tree = ast.parse(src)
+    sites, unclassified, double_tagged, counts, defs_of, guard_flags, excl_forms, total, tree = classify(src)
+    # GPT 外审二轮(PR#65): 一律用 classify 返回的同一棵树——旧 main() 另 parse 一棵、
+    # 跨树 id 查询(defs_of.get)全落空,诊断算的是垃圾值;Windows 3.11 id 复用使部分
+    # 查询偶然命中才让 T2b 红。同树后 sites/defs_of/tree 三者同源,诊断才有意义。
 
     print("断言（计数与谓词；数字不进门）")
     check("① unclassified ≡ 0（default-in：表外新站先红）", len(unclassified) == 0, unclassified)
@@ -272,23 +276,25 @@ def main():
     print("\nT2 新掺一个绑定名形态 meta 站（pattern 失明、def 成员制红，#1579 §三）")
     src_t2 = src + ("\n\ndef _t2_injected_bound_name_site(meta_blob):\n"
                     "    return json.loads(meta_blob or \"{}\")\n")
-    s2, u2, d2, c2, df2, *_r2 = classify(src_t2)
+    s2, u2, d2, c2, df2, *_r2, tree2 = classify(src_t2)
     check("T2a 注入站 unclassified ≡ 1（门会红）", len(u2) == 1, u2)
     pat_before, miss_before = _pattern_diagnostic(sites, defs_of, tree)
-    pat_after, _miss2 = _pattern_diagnostic(s2, df2, ast.parse(src_t2))
+    # GPT 外审二轮(PR#65): 必须用 classify 返回的同一棵树——另 ast.parse 的新树
+    # 与 df2 的 id 映射来自不同对象图,Windows 3.11 上 id 复用导致错配(T2b 红)。
+    pat_after, _miss2 = _pattern_diagnostic(s2, df2, tree2)
     check("T2b pattern 锚对注入站失明（可见数不变 = 失明实证）",
           pat_after == pat_before, (pat_before, pat_after))
 
     print("\nT3 来源形态漂移（json.loads 实参内 t[\"quorum\"] → t[\"quorum2\"]：排除钉精确列名）")
     src_t3 = src.replace('json.loads(t["quorum"])', 'json.loads(t["quorum2"])', 1)
-    s3, u3, d3, c3, df3, _gf3, ef3, _t3 = classify(src_t3)
+    s3, u3, d3, c3, df3, *_r3 = classify(src_t3)
     check("T3a 漂移站脱离排除形态 → unclassified ≡ 1（门会红，断言 6 同源）",
           len(u3) == 1, u3)
 
     print("\nT4 删一条守卫站（删 `_invited_never_present` 的 load ⇒ 门必须红：③/⑥ 对空集 vacuous-true、"
           "④ 守恒仍成立，唯 ③b 抓得住，dsh #1595 ②；_invite 已单源入漏斗 #1624，本站是守卫桶末成员）")
     src_t4 = src.replace('json.loads(meta_json or "{}")', '"{}"', 1)
-    s4, u4, d4, c4, df4, gf4, ef4, t4 = classify(src_t4)
+    s4, u4, d4, c4, df4, gf4, ef4, t4, _tree4 = classify(src_t4)
     check("T4a 盲区面实证：删站后 ①/④ 仍绿（unclassified ≡ 0 ∧ 守恒成立）",
           len(u4) == 0 and t4 == c4["funnel"] + c4["guard"] + c4["meta"] + c4["excluded"],
           (u4, t4, c4))
