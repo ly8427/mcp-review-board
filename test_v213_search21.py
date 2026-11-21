@@ -129,6 +129,24 @@ def main():
           res_d_t.get("total_count") == len(res_d_t.get("results", []))
           and res_d_t.get("results_truncated") is False,
           f"total={res_d_t.get('total_count')} ret={len(res_d_t.get('results', []))}")
+    # ①i 超限面(GPT 外审 PR#65): thread 命中>limit 时 total 曾=len(trows)(被 LIMIT
+    # 封顶少计)且 truncated=false——修复后线程面单独精确 COUNT,total=真实命中数。
+    out3 = srv.create_thread(title="overlimit-3f7d alpha third", author="anna")
+    assert out3.startswith("Created"), out3
+    out4 = srv.create_thread(title="overlimit-3f7d beta fourth", author="anna")
+    assert out4.startswith("Created"), out4
+    out5 = srv.create_thread(title="overlimit-3f7d gamma fifth", author="anna")
+    assert out5.startswith("Created"), out5
+    res_o = json.loads(srv.search_comments(terms=["overlimit-3f7d"], hit_type="thread",
+                                           limit=2))
+    check("①i-1 线程命中>limit ⇒ total_count=真实命中数 3(非 LIMIT 封顶的 2)",
+          res_o.get("total_count") == 3, f"total={res_o.get('total_count')}")
+    check("①i-2 超限时 truncated=True(如实告知有截断)",
+          res_o.get("results_truncated") is True
+          and len(res_o.get("results", [])) == 2,
+          f"truncated={res_o.get('results_truncated')} ret={len(res_o.get('results', []))}")
+    check("①i-3 超限面结果集仍全 thread(第 7 钉在超限下不破)",
+          all(h.get("hit_type") == "thread" for h in res_o.get("results", [])))
     r = srv.search_comments(terms=["x"], hit_type="bogus")
     check("①g 非法枚举显式错", "hit_type must be all|comment|thread" in r, r[:120])
 

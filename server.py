@@ -5277,7 +5277,12 @@ def search_comments(
                     "is_self": False,
                     "context": [],
                 })
-            total += len(trows)
+            # GPT 外审(PR#65): total+=len(trows) 受 LIMIT 封顶——线程命中>limit 时
+            # total 少计且 truncated=false(用户被告知无截断)。线程面单独精确 COUNT
+            # (同 WHERE 同参,不带 LIMIT),与评论面 COUNT 对称。
+            total += conn.execute(
+                f"SELECT COUNT(*) FROM threads t WHERE {t_where_sql}",
+                t_params).fetchone()[0]
         return payload("ok", route, results, total=total)
     except sqlite3.Error as e:
         if time.monotonic() >= deadline:
