@@ -66,6 +66,41 @@ class ResolveWatcherGatesTest(unittest.TestCase):
         gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file=f, gates_json="{}")
         self.assertEqual(gates["pi"], os.path.join(self.tmp, "rb-pi-watcher.fails"))
 
+    def test_broken_file_warns_on_stderr(self):
+        # GPT 外审(PR#59 P2): 显式配置损坏 ≠ 未配置——退默认必须 stderr 可观测。
+        import contextlib, io as _io
+        f = self._write("bad.json", "{not valid json")
+        buf = _io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file=f, gates_json="{}")
+        self.assertIn("WARNING: watcher gates file unreadable/broken", buf.getvalue())
+        self.assertIn("explicit=True", buf.getvalue())
+
+    def test_explicit_missing_file_warns(self):
+        # GPT 外审(PR#59 P2): 显式指定的文件不存在=配置面问题 ⇒ 报警(非静默)。
+        import contextlib, io as _io
+        buf = _io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            qg.resolve_watcher_gates(gate_dir=self.tmp,
+                                     gates_file=os.path.join(self.tmp, "nope.json"),
+                                     gates_json="{}")
+        self.assertIn("explicitly configured watcher gates file missing", buf.getvalue())
+
+    def test_unconfigured_default_stays_silent(self):
+        # 仅"从未有过任何文件"(无显式、无 env、默认路径不存在)保持静默=真未配置。
+        import contextlib, io as _io
+        from unittest import mock
+        buf = _io.StringIO()
+        with mock.patch("os.path.expanduser", return_value=self.tmp):
+            with contextlib.redirect_stderr(buf):
+                saved = os.environ.pop("RB_WATCHER_GATES_FILE", None)
+                try:
+                    qg.resolve_watcher_gates(gate_dir=self.tmp, gates_json="{}")
+                finally:
+                    if saved is not None:
+                        os.environ["RB_WATCHER_GATES_FILE"] = saved
+        self.assertEqual(buf.getvalue(), "", f"stderr={buf.getvalue()!r}")
+
     def test_non_object_json_ignored(self):
         f = self._write("list.json", '["pi", "/x/pi.fails"]')
         gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file=f, gates_json="{}")

@@ -52,17 +52,36 @@ def resolve_watcher_gates(gate_dir=None, gates_file=None, gates_json=None):
     """
     gd = gate_dir if gate_dir is not None else GATE_DIR
     gates = {n: os.path.join(gd, f"rb-{n}-watcher.fails") for n in ("claude", "dsh", "pi", "zcode")}
+    _gates_file_explicit = gates_file is not None or bool(
+        os.environ.get("RB_WATCHER_GATES_FILE"))
     if gates_file is None:
         gates_file = os.environ.get("RB_WATCHER_GATES_FILE") or os.path.join(
             os.path.expanduser("~"), ".rb-wake", "watcher-gates.json")
+    # GPT 外审(PR#59 P2): 显式配置损坏 ≠ 未配置——两者混同会让"用户已配好真实
+    # 计数路径、文件后来损坏"的场景静默退回旧 %TEMP% 路径,guard 读假状态计数。
+    # 处置(本版): 显式文件缺失/不可读/损坏 与 默认路径损坏 都 stderr 报警;
+    # 仅"从未有过任何文件"保持静默。完全 fail-closed(拒全部治理调用)爆炸半径
+    # 过大,是否采属创建者决策——已登记 DEBT 行,本版先可观测。
     if gates_file:
         try:
             with open(gates_file, encoding="utf-8") as f:
                 disk = json.load(f)
             if isinstance(disk, dict):
                 gates.update({k: str(v) for k, v in disk.items()})
-        except (OSError, ValueError):
-            pass  # 缺失/损坏/非 JSON 对象 = 退内建默认，不阻断
+        except FileNotFoundError as _e:
+            # GPT 外审(PR#59 P2)语义细化: 默认路径且文件不存在 = 真未配置 → 静默;
+            # 显式路径缺失 → 报警。
+            if _gates_file_explicit:
+                sys.stderr.write(
+                    f"[quorum-guard] WARNING: explicitly configured watcher gates "
+                    f"file missing ({_e}); falling back to built-in defaults "
+                    f"(file={gates_file})\n")
+        except (OSError, ValueError) as _e:
+            # 存在但不可读/损坏/非对象——无论默认还是显式都报警(有人建过又弄坏了)。
+            sys.stderr.write(
+                f"[quorum-guard] WARNING: watcher gates file unreadable/broken "
+                f"({_e}); falling back to built-in defaults "
+                f"(file={gates_file}, explicit={_gates_file_explicit})\n")
     if gates_json is None:
         gates_json = os.environ.get("RB_WATCHER_GATES_JSON", "{}")
     try:
