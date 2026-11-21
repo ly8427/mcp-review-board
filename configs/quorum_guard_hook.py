@@ -68,6 +68,13 @@ def resolve_watcher_gates(gate_dir=None, gates_file=None, gates_json=None):
                 disk = json.load(f)
             if isinstance(disk, dict):
                 gates.update({k: str(v) for k, v in disk.items()})
+            else:
+                # GPT 外审二轮(PR#59): 合法 JSON 但非对象(null/[]/标量)此前静默退
+                # 默认,与注释「损坏/非对象都报警」不一致——补报警,策略不变。
+                sys.stderr.write(
+                    f"[quorum-guard] WARNING: watcher gates file is valid JSON but "
+                    f"not an object ({type(disk).__name__}); falling back to "
+                    f"built-in defaults (file={gates_file})\n")
         except FileNotFoundError as _e:
             # GPT 外审(PR#59 P2)语义细化: 默认路径且文件不存在 = 真未配置 → 静默;
             # 显式路径缺失 → 报警。

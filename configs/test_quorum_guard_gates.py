@@ -131,6 +131,17 @@ class ResolveWatcherGatesTest(unittest.TestCase):
                                          gates_json="{broken")
         self.assertEqual(gates["pi"], os.path.join(self.tmp, "rb-pi-watcher.fails"))
 
+    def test_disk_file_non_object_warns_on_stderr(self):
+        # GPT 外审二轮(PR#59): 合法 JSON 非对象(null/[])此前静默退默认,与注释
+        # 「损坏/非对象都报警」不一致——补报警(策略不变,fail-open 保留)。
+        import contextlib, io as _io
+        f = self._write("nonobj.json", "[]")
+        buf = _io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file=f, gates_json="{}")
+        self.assertIn("not an object", buf.getvalue())
+        self.assertEqual(gates["pi"], os.path.join(self.tmp, "rb-pi-watcher.fails"))
+
     def test_env_json_valid_but_non_object_ignored_no_throw(self):
         # Bugbot(PR#59 Medium): null/数组/标量是合法 JSON,过 ValueError 关后
         # .items() 会 AttributeError 炸 import——必须对象判型后退默认。
