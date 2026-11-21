@@ -317,10 +317,14 @@ def main():
                 # GPT 外审三轮(PR#63): 子进程若仍存活,删其工作目录会让事后排查
                 # 更难——留痕后再清(ignore_errors 保原路径语义)。
                 if proc.poll() is None:
+                    # GPT 外审四轮(PR#63): 子进程仍存活 ⇒ 保留临时目录(删了工作
+                    # 目录会让孤儿排查失去现场;Windows 上还可能文件占用)——
+                    # 目录清理改由确认退出后执行。
                     sys.stderr.write(
-                        "[stage9] WARNING: rmtree while child process still "
-                        "alive — forensics on orphan may be lost\n")
-                shutil.rmtree(tmp, ignore_errors=True)
+                        "[stage9] WARNING: child still alive; preserving temp "
+                        f"dir: {tmp}\n")
+                else:
+                    shutil.rmtree(tmp, ignore_errors=True)
     print("✅ STAGE9 TESTS PASSED: verdict read face — seats/never-voted, "
           "notes+trails, auto_resolve tally in gate, bump-cleared vs "
           "never-voted, C3 pure-read, suspended liveness, free-thread "
