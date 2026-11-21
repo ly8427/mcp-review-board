@@ -44,3 +44,9 @@ configs/repair-gate-state.json.claim
 
 # tmp-test 归档面（board #112 #2235 §4：一次 git add -A 会把 90 处旧措辞命中拖进跟踪面）
 tmp-test*/
+
+# member token copies / credential files (machine-param discipline; instance: configs/rb-token-opencode.txt
+# found untracked+unignored in a clone working tree, board #123 pi census 2026-11-21 — zero tracked files today,
+# this rule keeps any future copy out of git add -A reach)
+configs/*token*
+rb-token*
