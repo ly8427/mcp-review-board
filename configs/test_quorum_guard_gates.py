@@ -50,6 +50,22 @@ class ResolveWatcherGatesTest(unittest.TestCase):
         self.assertEqual(gates["dsh"], os.path.join(self.tmp, "rb-dsh-watcher.fails"))  # 其余保持默认
         self.assertEqual(gates["zcode"], os.path.join(self.tmp, "rb-zcode-watcher.fails"))
 
+    def test_disk_file_tilde_paths_expanded(self):
+        # Bugbot(PR#59 二轮): JSON 成员路径的 ~ 必须展开成用户主目录——文档写
+        # ~/.rb-wake/... 形态,不展开则按字面打开=静默退 %TEMP% 旧路径。
+        import os as _os
+        f = self._write("tilde.json", json.dumps({"pi": "~/.rb-wake/pi-kit.fails"}))
+        gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file=f, gates_json="{}")
+        self.assertEqual(gates["pi"],
+                         _os.path.join(_os.path.expanduser("~"), ".rb-wake", "pi-kit.fails"))
+
+    def test_env_json_tilde_paths_expanded(self):
+        import os as _os
+        gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file="",
+                                         gates_json=json.dumps({"pi": "~/wake/pi.fails"}))
+        self.assertEqual(gates["pi"],
+                         _os.path.join(_os.path.expanduser("~"), "wake", "pi.fails"))
+
     def test_disk_file_can_add_member(self):
         f = self._write("gates.json", json.dumps({"grok": "/w/grok.fails"}))
         gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file=f, gates_json="{}")
@@ -91,7 +107,11 @@ class ResolveWatcherGatesTest(unittest.TestCase):
         import contextlib, io as _io
         from unittest import mock
         buf = _io.StringIO()
-        with mock.patch("os.path.expanduser", return_value=self.tmp):
+        # side_effect 只映射 ~ 开头的路径;无条件 return_value 会把第二轮
+        # expanduser(gates_file)(Bugbot 二轮新增)也劫持成目录本身。
+        with mock.patch("os.path.expanduser",
+                        side_effect=lambda p: (p.replace("~", self.tmp, 1)
+                                               if p and p.startswith("~") else p)):
             with contextlib.redirect_stderr(buf):
                 saved = os.environ.pop("RB_WATCHER_GATES_FILE", None)
                 try:
