@@ -2690,7 +2690,7 @@ LEDGER_ANCHOR_RE = re.compile(r"^\s*wake_ledger:", re.MULTILINE)
 
 
 def _wake_ledger_ok(conn: sqlite3.Connection, thread_id: int,
-                    creator: str | None, suspended: list[str]) -> tuple[bool, list[str]]:
+                    creator: str | None, suspended: list[str]) -> tuple[bool, list[str], list[tuple[str, str]]]:
     """dsh R3 + claude 防活锁 + pi #476 补强 + #49 B/A1：
     - 修订圈定：仅 id > floor_wm 的台账评论有效（rev1 台账放行不了 rev2 关门）；
     - 锚点 ^wake_ledger: 行首；过滤后无锚点评论 = no_ledger，有锚点无条目 = ledger_unparsable；
