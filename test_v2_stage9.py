@@ -285,6 +285,12 @@ def main():
                     # GPT 外审(PR#63): SIGTERM 与 kill 之间进程可能已自然退出——
                     # kill 的竞态异常不得覆盖原始测试失败原因(TimeoutExpired 等)。
                     pass
+                except OSError as _kill_err:
+                    # GPT 外审三轮(PR#63): kill 的其他 OSError(权限等)同样不得
+                    # 覆盖原始异常——记录后继续 wait/poll 路径。
+                    sys.stderr.write(
+                        f"[stage9] WARNING: proc.kill() failed({_kill_err}); "
+                        f"original test exception preserved\n")
                 try:
                     proc.wait(timeout=10)
                 except Exception as _cleanup_err:
@@ -308,6 +314,12 @@ def main():
                     assert row is not None and row[0] == SENTINEL, \
                         f"c 复活了 => 本用例前提已破 got={row!r}"
             finally:
+                # GPT 外审三轮(PR#63): 子进程若仍存活,删其工作目录会让事后排查
+                # 更难——留痕后再清(ignore_errors 保原路径语义)。
+                if proc.poll() is None:
+                    sys.stderr.write(
+                        "[stage9] WARNING: rmtree while child process still "
+                        "alive — forensics on orphan may be lost\n")
                 shutil.rmtree(tmp, ignore_errors=True)
     print("✅ STAGE9 TESTS PASSED: verdict read face — seats/never-voted, "
           "notes+trails, auto_resolve tally in gate, bump-cleared vs "
