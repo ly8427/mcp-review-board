@@ -287,8 +287,18 @@ def main():
                     pass
                 try:
                     proc.wait(timeout=10)
-                except Exception:
-                    pass
+                except Exception as _cleanup_err:
+                    # GPT 外审二轮(PR#63): kill 失败或 kill 后仍不退出 ⇒ 记录清理
+                    # 失败(别让孤儿悄悄留在 8779 上),原始异常链保持不动。
+                    sys.stderr.write(
+                        f"[stage9] WARNING: orphan cleanup incomplete after kill "
+                        f"({_cleanup_err}); rc={proc.poll()!r}\n")
+                # GPT 外审二轮(PR#63): 清理后核实确实退出——没退就再报一条,
+                # 让孤儿在输出里有痕(而不是被 except pass 无声吞掉)。
+                if proc.poll() is None:
+                    sys.stderr.write(
+                        "[stage9] WARNING: child process still alive after "
+                        "kill+wait — orphan on port 8779 likely\n")
             try:
                 if c_suspended and exited:
                     row = sqlite3.connect(DB).execute(
