@@ -68,12 +68,13 @@ def resolve_watcher_gates(gate_dir=None, gates_file=None, gates_json=None):
         # Bugbot(PR#59 二轮): gates_file 与成员路径里的 ~ 波浪线必须展开成用户主
         # 目录——文档/die() 提示写的就是 ~/.rb-wake/... 形态;不展开则按字面打开
         # ⇒ 文件"不存在"⇒ 静默退 %TEMP% 旧路径,正是本改动要治的漂移。
-        gates_file = os.path.expanduser(gates_file)
+        gates_file = os.path.normpath(os.path.expanduser(gates_file))
         try:
             with open(gates_file, encoding="utf-8") as f:
                 disk = json.load(f)
             if isinstance(disk, dict):
-                gates.update({k: os.path.expanduser(str(v)) for k, v in disk.items()})
+                gates.update({k: os.path.normpath(os.path.expanduser(str(v)))
+                             for k, v in disk.items()})
             else:
                 # GPT 外审二轮(PR#59): 合法 JSON 但非对象(null/[]/标量)此前静默退
                 # 默认,与注释「损坏/非对象都报警」不一致——补报警,策略不变。
@@ -104,7 +105,8 @@ def resolve_watcher_gates(gate_dir=None, gates_file=None, gates_json=None):
     # Bugbot(PR#59 Medium): 合法 JSON 但非对象(null/数组/标量)会过 ValueError 关,
     # 然后 .items() 抛 AttributeError 炸 import——显式对象判型,非对象一律退默认。
     if isinstance(_env_gates, dict):
-        gates.update({k: os.path.expanduser(str(v)) for k, v in _env_gates.items()})
+        gates.update({k: os.path.normpath(os.path.expanduser(str(v)))
+                     for k, v in _env_gates.items()})
     return gates
 
 

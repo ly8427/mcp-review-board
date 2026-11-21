@@ -46,7 +46,7 @@ class ResolveWatcherGatesTest(unittest.TestCase):
     def test_disk_file_overrides_single_member(self):
         f = self._write("gates.json", json.dumps({"pi": "/custom/pi-kit.fails"}))
         gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file=f, gates_json="{}")
-        self.assertEqual(gates["pi"], "/custom/pi-kit.fails")  # 覆盖生效
+        self.assertEqual(gates["pi"], os.path.normpath("/custom/pi-kit.fails"))  # 覆盖生效
         self.assertEqual(gates["dsh"], os.path.join(self.tmp, "rb-dsh-watcher.fails"))  # 其余保持默认
         self.assertEqual(gates["zcode"], os.path.join(self.tmp, "rb-zcode-watcher.fails"))
 
@@ -57,19 +57,21 @@ class ResolveWatcherGatesTest(unittest.TestCase):
         f = self._write("tilde.json", json.dumps({"pi": "~/.rb-wake/pi-kit.fails"}))
         gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file=f, gates_json="{}")
         self.assertEqual(gates["pi"],
-                         _os.path.join(_os.path.expanduser("~"), ".rb-wake", "pi-kit.fails"))
+                         os.path.normpath(
+                             _os.path.join(_os.path.expanduser("~"), ".rb-wake", "pi-kit.fails")))
 
     def test_env_json_tilde_paths_expanded(self):
         import os as _os
         gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file="",
                                          gates_json=json.dumps({"pi": "~/wake/pi.fails"}))
         self.assertEqual(gates["pi"],
-                         _os.path.join(_os.path.expanduser("~"), "wake", "pi.fails"))
+                         os.path.normpath(
+                             _os.path.join(_os.path.expanduser("~"), "wake", "pi.fails")))
 
     def test_disk_file_can_add_member(self):
         f = self._write("gates.json", json.dumps({"grok": "/w/grok.fails"}))
         gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file=f, gates_json="{}")
-        self.assertEqual(gates["grok"], "/w/grok.fails")
+        self.assertEqual(gates["grok"], os.path.normpath("/w/grok.fails"))
         self.assertEqual(len(gates), 5)
 
     def test_missing_file_falls_back_to_defaults(self):
@@ -132,7 +134,7 @@ class ResolveWatcherGatesTest(unittest.TestCase):
         try:
             os.environ["RB_WATCHER_GATES_FILE"] = f
             gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_json="{}")
-            self.assertEqual(gates["pi"], "/via-env-file/pi.fails")
+            self.assertEqual(gates["pi"], os.path.normpath("/via-env-file/pi.fails"))
         finally:
             if saved is None:
                 os.environ.pop("RB_WATCHER_GATES_FILE", None)
@@ -144,7 +146,7 @@ class ResolveWatcherGatesTest(unittest.TestCase):
         f = self._write("gates.json", json.dumps({"pi": "/disk/pi.fails"}))
         gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file=f,
                                          gates_json=json.dumps({"pi": "/env/pi.fails"}))
-        self.assertEqual(gates["pi"], "/env/pi.fails")
+        self.assertEqual(gates["pi"], os.path.normpath("/env/pi.fails"))
 
     def test_corrupt_env_json_ignored_no_throw(self):
         gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file="",
