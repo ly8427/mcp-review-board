@@ -72,7 +72,9 @@ def audits(author, action):
 
 TOKEN = "deadbeef"
 CREATOR = "fb-neg"
-BAD_DIR = pathlib.Path(tempfile.gettempdir()) / "no-such-dir-formb-negative"
+# GPT 外审(PR#61): 固定路径可能被其他测试/人工意外创建 ⇒ 每轮独立临时根+其下
+# 必不存在的子目录,DATA_DIR 指向它(失败归因仍是"目录不存在")。
+BAD_DIR = pathlib.Path(tempfile.mkdtemp(prefix="t213-formb-root-")) / "no-such-subdir"
 
 # setup: valid-token creator + open thread
 seed(CREATOR, json.dumps({"token_hash": hashlib.sha256(TOKEN.encode()).hexdigest()}))
