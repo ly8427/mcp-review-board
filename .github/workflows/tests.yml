@@ -49,6 +49,9 @@ jobs:
         run: python configs/test_plain_speak_gate.py
       - name: check-hooks
         run: python configs/test_check_hooks.py
+      # DEBT #22 永久修(PR#59): 闸门表三通道解析+全降级面(显式缺失/损坏报警)
+      - name: quorum guard gates
+        run: python configs/test_quorum_guard_gates.py
       - name: bat encoding
         run: python test_bat_encoding.py
       - name: v2.12 beta gate

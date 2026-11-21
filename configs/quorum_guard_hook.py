@@ -8,7 +8,9 @@ stdin: hook payload JSON。exit 0 放行 / exit 2 阻止（stderr=拒绝理由+�
 其他非零 = fail-closed 视同阻止（必须吐可读理由，R6：不许裸 traceback）。
 
 零绝对路径（跨宿主可移植）：全部配置走环境变量，默认值相对本文件位置推导。
-宿主只需：RB_BOARD（默认 http://localhost:8765）、可选 RB_GATE_DIR / RB_WATCHER_GATES_JSON。
+宿主只需：RB_BOARD（默认 http://localhost:8765）。闸门表配置三通道（后覆盖前）：
+内建默认 < 磁盘配置文件（RB_WATCHER_GATES_FILE，默认 ~/.rb-wake/watcher-gates.json，
+DEBT #22 修法①：宿主会话改不到进程 env，改文件即可）< 进程 env（RB_WATCHER_GATES_JSON，兼容保留）。
 """
 import json
 import os
@@ -31,9 +33,79 @@ REPO = os.environ.get("RB_REPO", os.path.dirname(os.path.dirname(os.path.abspath
 ONBOARDING_MD = os.environ.get("RB_ONBOARDING", os.path.join(REPO, "configs", "onboarding.md"))
 DB_PATH = os.environ.get("RB_DB", os.path.join(REPO, "data", "reviewboard.db"))
 GATE_DIR = os.environ.get("RB_GATE_DIR", tempfile.gettempdir() or "/tmp")
-# 闸门命名约定 rb-<member>-watcher.fails（kit watcher 家族统一约定）
-WATCHER_GATES = {n: os.path.join(GATE_DIR, f"rb-{n}-watcher.fails") for n in ("claude", "dsh", "pi", "zcode")}
-WATCHER_GATES.update({k: str(v) for k, v in json.loads(os.environ.get("RB_WATCHER_GATES_JSON", "{}")).items()})
+
+
+def resolve_watcher_gates(gate_dir=None, gates_file=None, gates_json=None):
+    """闸门表解析（DEBT #22 修法①：配置从"进程环境变量"升级为"持磁盘配置文件"）。
+
+    解析优先级（后者覆盖前者）：
+      1. 内建默认表——rb-<member>-watcher.fails @ GATE_DIR（kit watcher 旧约定/Temp 硬链接面）；
+      2. 磁盘配置文件——RB_WATCHER_GATES_FILE 指定 JSON 文件；未设时默认
+         ~/.rb-wake/watcher-gates.json（本机私有路径，不入 git）。降级语义
+         （GPT 外审三轮修订）：默认路径且文件不存在=真未配置→静默退内建默认；
+         显式路径缺失、文件损坏/非对象 → stderr 报警后退内建默认——
+         绝不因配置面问题阻断板操作（完全 fail-closed 属创建者决策，见码内注）；
+      3. 进程 env JSON——RB_WATCHER_GATES_JSON（旧用法，兼容保留，最高优先）。
+
+    宿主会话改不到进程 env（ZCode 启动时烘焙），此前唯一出路是改 hook 接线；
+    现在改闸门路径只需编辑磁盘 JSON 文件——这正是 DEBT #22 的痛点（pi-watcher
+    kit v1.1.0+ 把计数文件迁到 ~/.rb-wake/ 后，宿主侧无通道跟进默认表）。
+    测试可直接传参（gate_dir/gates_file/gates_json），绕过 env 与真实 home。
+    """
+    gd = gate_dir if gate_dir is not None else GATE_DIR
+    gates = {n: os.path.join(gd, f"rb-{n}-watcher.fails") for n in ("claude", "dsh", "pi", "zcode")}
+    _gates_file_explicit = gates_file is not None or bool(
+        os.environ.get("RB_WATCHER_GATES_FILE"))
+    if gates_file is None:
+        gates_file = os.environ.get("RB_WATCHER_GATES_FILE") or os.path.join(
+            os.path.expanduser("~"), ".rb-wake", "watcher-gates.json")
+    # GPT 外审(PR#59 P2): 显式配置损坏 ≠ 未配置——两者混同会让"用户已配好真实
+    # 计数路径、文件后来损坏"的场景静默退回旧 %TEMP% 路径,guard 读假状态计数。
+    # 处置(本版): 显式文件缺失/不可读/损坏 与 默认路径损坏 都 stderr 报警;
+    # 仅"从未有过任何文件"保持静默。完全 fail-closed(拒全部治理调用)爆炸半径
+    # 过大,是否采属创建者决策——已登记 DEBT 行,本版先可观测。
+    if gates_file:
+        try:
+            with open(gates_file, encoding="utf-8") as f:
+                disk = json.load(f)
+            if isinstance(disk, dict):
+                gates.update({k: str(v) for k, v in disk.items()})
+            else:
+                # GPT 外审二轮(PR#59): 合法 JSON 但非对象(null/[]/标量)此前静默退
+                # 默认,与注释「损坏/非对象都报警」不一致——补报警,策略不变。
+                sys.stderr.write(
+                    f"[quorum-guard] WARNING: watcher gates file is valid JSON but "
+                    f"not an object ({type(disk).__name__}); falling back to "
+                    f"built-in defaults (file={gates_file})\n")
+        except FileNotFoundError as _e:
+            # GPT 外审(PR#59 P2)语义细化: 默认路径且文件不存在 = 真未配置 → 静默;
+            # 显式路径缺失 → 报警。
+            if _gates_file_explicit:
+                sys.stderr.write(
+                    f"[quorum-guard] WARNING: explicitly configured watcher gates "
+                    f"file missing ({_e}); falling back to built-in defaults "
+                    f"(file={gates_file})\n")
+        except (OSError, ValueError) as _e:
+            # 存在但不可读/损坏/非对象——无论默认还是显式都报警(有人建过又弄坏了)。
+            sys.stderr.write(
+                f"[quorum-guard] WARNING: watcher gates file unreadable/broken "
+                f"({_e}); falling back to built-in defaults "
+                f"(file={gates_file}, explicit={_gates_file_explicit})\n")
+    if gates_json is None:
+        gates_json = os.environ.get("RB_WATCHER_GATES_JSON", "{}")
+    try:
+        _env_gates = json.loads(gates_json or "{}")
+    except ValueError:
+        _env_gates = None  # 损坏 JSON = 忽略（旧行为是直接炸模块级，这里收窄为不阻断）
+    # Bugbot(PR#59 Medium): 合法 JSON 但非对象(null/数组/标量)会过 ValueError 关,
+    # 然后 .items() 抛 AttributeError 炸 import——显式对象判型,非对象一律退默认。
+    if isinstance(_env_gates, dict):
+        gates.update({k: str(v) for k, v in _env_gates.items()})
+    return gates
+
+
+# 闸门命名约定 rb-<member>-watcher.fails（kit watcher 家族统一约定）；磁盘/env 配置可逐成员覆盖
+WATCHER_GATES = resolve_watcher_gates()
 SUSPEND_HOURS = float(os.environ.get("RB_SUSPEND_HOURS", "24"))
 # F6 修复（2026-10-21 用户点名"发起者有没有硬约束强迫他开定时任务"）：
 # 本宿主发起者必须维持活跃的轮询打卡——由定时任务每轮 touch 的心跳文件证明。
@@ -123,7 +195,9 @@ def check_quorum_names(names, roster) -> None:
                 # 启动即写 0，存在性即有意义）——fail-closed，不再当"0 次失败"放行。
                 die(f"[quorum-guard fail-closed] '{name}' 的 watcher 闸门文件不存在: {gate_path}\n"
                     f"两种可能: watcher 从未启动(配错) 或 RB_GATE_DIR 指错目录——门分不开这两者,一律拒绝。\n"
-                    f"修复: 启动 {REPO}/configs/{name}-watcher.sh(它会在启动时写入 0),或设 RB_WATCHER_GATES_JSON。")
+                    f"修复: 启动 {REPO}/configs/{name}-watcher.sh(它会在启动时写入 0)，"
+                    f"或把该成员的闸门文件路径写进磁盘配置 RB_WATCHER_GATES_FILE(默认 ~/.rb-wake/watcher-gates.json)，"
+                    f"或设 env RB_WATCHER_GATES_JSON。")
             if n >= 3:
                 die(f"[quorum-guard] '{name}' 的 watcher 闸门已锁死（连续 {n} 次唤醒失败, C1.2）。\n"
                     f"修复（把恢复做成本——先恢复再建帖）:\n"
@@ -131,7 +205,8 @@ def check_quorum_names(names, roster) -> None:
         else:
             die(f"[quorum-guard fail-closed] '{name}' 是 (a) 但本宿主无闸门配置（pi #476 条件2："
                 f"\"无核验手段\"必须拒绝，不得 warn 放行）。\n"
-                f"修复: 在 RB_WATCHER_GATES_JSON 里为 '{name}' 配置闸门文件路径，或从名单移除。")
+                f"修复: 在磁盘配置 RB_WATCHER_GATES_FILE(默认 ~/.rb-wake/watcher-gates.json)或 env "
+                f"RB_WATCHER_GATES_JSON 里为 '{name}' 配置闸门文件路径，或从名单移除。")
 
 
 def _connect():
