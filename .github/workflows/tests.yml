@@ -149,3 +149,6 @@ jobs:
         run: python test_v213_12ac.py
       - name: 2.1 search fine-grain
         run: python test_v213_search21.py
+      # DEBT #25 负例:DATA_DIR 缺失 ⇒ fail-open 行为钉死+stderr 告警(PR#61)
+      - name: form_b nonce negative
+        run: python test_v213_formb_nonce_negative.py
