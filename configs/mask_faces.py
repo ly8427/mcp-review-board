@@ -1232,6 +1232,10 @@ DECLARED = {
         "sink": 'resp:tool:reply_comment', "class": 'closed_domain', "override_reason": None},
     ('request_form_b', 'call:_now_iso()'): {
         "sink": 'resp:tool:request_form_b', "class": 'closed_domain', "override_reason": None},
+    ('request_form_b', 'name:_e'): {
+        # PR#61(DEBT #25)引入的 except OSError as _e 局部名——PR#61 合并时未跑
+        # mask_faces(GPT 外审二轮警告的契约同步缺口现形),PR#64 分支补登记。
+        "sink": 'resp:tool:request_form_b', "class": 'closed_domain', "override_reason": None},
     ('request_form_b', 'call:_secrets.token_hex(16)'): {
         "sink": 'resp:tool:request_form_b', "class": 'closed_domain', "override_reason": None},
     ('request_form_b', 'call:hashlib.sha256(nonce.encode()).hexdigest()'): {
