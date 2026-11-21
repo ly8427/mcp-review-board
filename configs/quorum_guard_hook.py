@@ -41,8 +41,10 @@ def resolve_watcher_gates(gate_dir=None, gates_file=None, gates_json=None):
     解析优先级（后者覆盖前者）：
       1. 内建默认表——rb-<member>-watcher.fails @ GATE_DIR（kit watcher 旧约定/Temp 硬链接面）；
       2. 磁盘配置文件——RB_WATCHER_GATES_FILE 指定 JSON 文件；未设时默认
-         ~/.rb-wake/watcher-gates.json（本机私有路径，不入 git）。文件缺失/损坏/
-         非对象 = 静默退内建默认（与"没配"同语义，绝不因配置面问题阻断板操作）；
+         ~/.rb-wake/watcher-gates.json（本机私有路径，不入 git）。降级语义
+         （GPT 外审三轮修订）：默认路径且文件不存在=真未配置→静默退内建默认；
+         显式路径缺失、文件损坏/非对象 → stderr 报警后退内建默认——
+         绝不因配置面问题阻断板操作（完全 fail-closed 属创建者决策，见码内注）；
       3. 进程 env JSON——RB_WATCHER_GATES_JSON（旧用法，兼容保留，最高优先）。
 
     宿主会话改不到进程 env（ZCode 启动时烘焙），此前唯一出路是改 hook 接线；
