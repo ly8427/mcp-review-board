@@ -141,6 +141,34 @@ class ResolveWatcherGatesTest(unittest.TestCase):
             else:
                 os.environ["RB_WATCHER_GATES_FILE"] = saved
 
+    def test_env_gates_file_tilde_path_expanded_and_read(self):
+        # 用户建议(PR#66): RB_WATCHER_GATES_FILE=~/.rb-wake/watcher-gates.json 是文档
+        # 默认形态——env 值里的 ~ 必须展开成真实主目录,且该文件内容被真实读取;
+        # 若此断链,文档化配置会静默退回内建默认而不报错。
+        import os as _os
+        import shutil as _shutil
+        marker_dir = _os.path.join(_os.path.expanduser("~"),
+                                   f".qg-selftest-{_os.getpid()}")
+        gates_path = _os.path.join(marker_dir, "watcher-gates.json")
+        saved = _os.environ.get("RB_WATCHER_GATES_FILE")
+        try:
+            _os.makedirs(marker_dir, exist_ok=True)
+            with open(gates_path, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"pi": "/from-tilde-env-file/pi.fails"}))
+            _os.environ["RB_WATCHER_GATES_FILE"] = _os.path.join(
+                "~", _os.path.basename(marker_dir), "watcher-gates.json")
+            gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_json="{}")
+            self.assertEqual(gates["pi"],
+                             os.path.normpath("/from-tilde-env-file/pi.fails"))  # 内容被读取
+            self.assertEqual(gates["dsh"],
+                             os.path.join(self.tmp, "rb-dsh-watcher.fails"))  # 其余保持默认
+        finally:
+            if saved is None:
+                _os.environ.pop("RB_WATCHER_GATES_FILE", None)
+            else:
+                _os.environ["RB_WATCHER_GATES_FILE"] = saved
+            _shutil.rmtree(marker_dir, ignore_errors=True)
+
     # ---------- env JSON（最高优先） ----------
     def test_env_json_wins_over_disk_file(self):
         f = self._write("gates.json", json.dumps({"pi": "/disk/pi.fails"}))
