@@ -2691,14 +2691,14 @@ LEDGER_ANCHOR_RE = re.compile(r"^\s*wake_ledger:", re.MULTILINE)
 
 
 def _wake_ledger_ok(conn: sqlite3.Connection, thread_id: int,
-                    creator: str | None, suspended: list[str]) -> tuple[bool, list[str]]:
+                    creator: str | None, suspended: list[str]) -> tuple[bool, list[str], list[tuple[str, str]]]:
     """dsh R3 + claude 防活锁 + pi #476 补强 + #49 B/A1：
     - 修订圈定：仅 id > floor_wm 的台账评论有效（rev1 台账放行不了 rev2 关门）；
     - 锚点 ^wake_ledger: 行首；过滤后无锚点评论 = no_ledger，有锚点无条目 = ledger_unparsable；
     - timeout/error 过门；not-attempted/缺条不过；success 对仍暂缓者机器驳回。"""
     wm, ok, why = _revision_floor(conn, thread_id)
     if not ok:
-        return False, [f"reason=floor_wm_missing: {why}"]
+        return False, [f"reason=floor_wm_missing: {why}"], []
     rows = conn.execute(
         "SELECT id, body FROM comments WHERE thread_id=? AND author=? AND id > ?"
         " ORDER BY id DESC",
@@ -2706,31 +2706,38 @@ def _wake_ledger_ok(conn: sqlite3.Connection, thread_id: int,
     ).fetchall()
     led = next((r for r in rows if LEDGER_ANCHOR_RE.search(r["body"])), None)
     if led is None:
-        return False, ["reason=no_ledger(本修订内无 ^wake_ledger: 锚点的创建者台账)"]
+        return False, ["reason=no_ledger(本修订内无 ^wake_ledger: 锚点的创建者台账)"], []
     entries: dict[str, str] = {}
     for m in LEDGER_RE.finditer(led["body"]):
         entries[m.group("name").lower()] = m.group("result").lower()
     if not entries:
-        return False, ["reason=ledger_unparsable(锚点在但无有效条目;重发结构化台账)"]
+        return False, ["reason=ledger_unparsable(锚点在但无有效条目;重发结构化台账)"], []
     missing = []
+    pairs = []
     for n in suspended:
         r = entries.get(n.lower())
         if r not in ("timeout", "error"):
-            why = "success-but-still-suspended(suspicious)" if r == "success" else f"{r or 'no-entry'}"
+            if r == "success":
+                why = "success-but-still-suspended(suspicious)"
+                pairs.append((n, "suspicious"))
+            else:
+                why = f"{r or 'no-entry'}"
+                pairs.append((n, r or "no-entry"))
             missing.append(f"{n}:{why}")
-    return (not missing), missing
+    # DEBT #39（pi #1379 承诺落地）：返回值升为三元组——(ok, 渲染用字符串, 结构化对)。
+    # missing 字符串仅供人读 note 渲染；分类判定一律走 pairs，不再解析「成员名:状态」。
+    return (not missing), missing, pairs
 
 
-def _ledger_block_key(missing):
-    """v2.9 台账门阻断 key 判定（DEBT #38 修法；GPT PR#48 审查补边界）。
-    逐成员条目形如「成员名:状态」——只检查冒号后的**状态段**：成员名本身
-    含 "suspicious" 不得污染分类（真实原因=无条目时仍是 missing）。
+def _ledger_block_key(pairs):
+    """v2.9 台账门阻断 key 判定（DEBT #38 修法 + DEBT #39 结构化收口）。
+    DEBT #39: 入参从「成员名:状态」字符串列表升为 (member, status) 结构化对——
+    状态枚举直读，消除字符串解析与业务状态的耦合（前科：#38 固定尾 "suspicious"
+    字面量污染判定；b1c7a41 只查冒号后状态段是止血，本函数是根治）。
     整条路（reason= 前缀：no_ledger / ledger_unparsable / floor_wm_missing）
-    无逐名状态段，返回初值 ledger_entry_missing；调用点随后会用条目自身的
-    枚举覆盖该初值。"""
-    member_status = [m.split(":", 1)[1] for m in missing
-                     if not m.startswith("reason=") and ":" in m]
-    return "ledger_entry_suspicious" if any("suspicious" in s for s in member_status) \
+    无逐名对，pairs=[] ⇒ 返回初值 ledger_entry_missing；调用点随后会用条目
+    自身的枚举覆盖该初值（契约不变）。"""
+    return "ledger_entry_suspicious" if any(s == "suspicious" for _, s in pairs) \
         else "ledger_entry_missing"
 
 
@@ -4684,7 +4691,8 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
             # sit suspended requires the creator's ledger of wake attempts —
             # 封死"零尝试躺等计时关门"(#44-F3)。
             if suspended:
-                ok, missing = _wake_ledger_ok(conn, thread_id, t["author"], suspended)
+                # DEBT #39: 三元组返回——分类判定走 pairs，missing 仅供 note 渲染
+                ok, missing, pairs = _wake_ledger_ok(conn, thread_id, t["author"], suspended)
                 if not ok:
                     # DEBT #38 修复（dsh #2178 §三登记 / #2277 §四修法，pi 独立复核）：
                     # ① _key 从 missing 项的**状态段**判定（_ledger_block_key，
@@ -4694,7 +4702,7 @@ def recompute_thread(conn: sqlite3.Connection, thread_id: int) -> None:
                     #   开头，_audit_blocked_once 的 note LIKE 'reason=<action>%'
                     #   永不命中 ⇒ 每次唤起重插重复流水；
                     # ③ 固定尾 "suspicious" 改写为"疑义条目"，防判据再次被常量污染。
-                    _key = _ledger_block_key(missing)
+                    _key = _ledger_block_key(pairs)
                     _tail = (" (timeout/error 过门;缺条/not-attempted/疑义条目 不过;"
                              "锚点=^wake_ledger: 行首;#511 枚举不合并)")
                     if missing and missing[0].startswith("reason="):

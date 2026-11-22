@@ -793,6 +793,9 @@ DECLARED = {
         "sink": 'resp:route:attention_probe', "class": 'closed_domain', "override_reason": None},
     ('_wake_ledger_ok', 'name:why'): {
         "sink": 'resp:route:attention_probe', "class": 'closed_domain', "override_reason": None},
+    ('_wake_ledger_ok', "lit:'success-but-still-suspended(suspicious)'"): {
+        # DEBT #39(PR#64): 重构把三元式改 if/else,字面量指纹形状随之变化——登记新形状(GPT 外审发现)
+        "sink": 'resp:route:attention_probe', "class": 'closed_domain', "override_reason": None},
     ('_wake_ledger_ok', 'param:suspended'): {
         "sink": 'resp:route:attention_probe', "class": 'closed_domain', "override_reason": None},
     ('ack_token', 'call:_now_iso()'): {
@@ -1181,7 +1184,7 @@ DECLARED = {
         "sink": 'resp:route:attention_probe', "class": 'closed_domain', "override_reason": None},
     ('recompute_thread', "call:'; '.join(missing)"): {
         "sink": 'resp:route:attention_probe', "class": 'closed_domain', "override_reason": None},
-    ('recompute_thread', 'call:_ledger_block_key(missing)'): {
+    ('recompute_thread', 'call:_ledger_block_key(pairs)'): {
         "sink": 'resp:route:attention_probe', "class": 'closed_domain', "override_reason": None},
     ('recompute_thread', "call:conn.execute('SELECT COALESCE(MAX(id),0) FROM comments WHERE thr"): {
         "sink": 'resp:route:attention_probe', "class": 'closed_domain', "override_reason": None},
@@ -1228,6 +1231,10 @@ DECLARED = {
     ('reply_comment', "row['thread_id']"): {
         "sink": 'resp:tool:reply_comment', "class": 'closed_domain', "override_reason": None},
     ('request_form_b', 'call:_now_iso()'): {
+        "sink": 'resp:tool:request_form_b', "class": 'closed_domain', "override_reason": None},
+    ('request_form_b', 'name:_e'): {
+        # PR#61(DEBT #25)引入的 except OSError as _e 局部名——PR#61 合并时未跑
+        # mask_faces(GPT 外审二轮警告的契约同步缺口现形),PR#64 分支补登记。
         "sink": 'resp:tool:request_form_b', "class": 'closed_domain', "override_reason": None},
     ('request_form_b', 'call:_secrets.token_hex(16)'): {
         "sink": 'resp:tool:request_form_b', "class": 'closed_domain', "override_reason": None},
