@@ -54,7 +54,7 @@ def main():
     fx.prime_beats(db, list(members))
     # 建两张帖：#1 的 context 埋一段独特文本 + 一段凭据形串；#2 备用
     out = srv.create_thread(
-        title="search21-alpha uniquealpha context thread",
+        title="search21-alpha uniquealpha dualfamily-7b2c context thread",
         author="anna", quorum=list(members),
         context=fx.wi(*members) + "\n\n" + (
             "The deployment note references token " + CRED +
@@ -74,7 +74,7 @@ def main():
     tok = main.TOK
     # 评论命中材料 + 一条带 cost_tokens 申报
     r = srv.post_comment(thread_id=tid1, author="brin",
-                         body="uniquecomment-4e7a marker body for the search face")
+                         body="uniquecomment-4e7a dualfamily-7b2c marker body for the search face")
     assert r.startswith("Posted"), r
     r = srv.post_comment(thread_id=tid1, author="cyr", body="declared cost row",
                          cost_tokens=1234)
@@ -105,6 +105,48 @@ def main():
     check("①f hit_type=comment 过滤 ⇒ 只剩 comment 命中",
           all(h.get("hit_type") == "comment" for h in res_c.get("results", []))
           and len(res_c.get("results", [])) >= 1)
+    # ①h 双族同词负例(opencode board #123 #2795 §2:①e 旧夹具单词单族=空过假绿;
+    # dsh #2798 §2 第 7 钉=hit_type!="all" ⇒ 结果集 hit_type 全等)
+    res_d_t = json.loads(srv.search_comments(terms=["dualfamily-7b2c"], hit_type="thread"))
+    res_d_c = json.loads(srv.search_comments(terms=["dualfamily-7b2c"], hit_type="comment"))
+    res_d_a = json.loads(srv.search_comments(terms=["dualfamily-7b2c"], hit_type="all"))
+    check("①h-1 双族同词 hit_type=thread ⇒ 零评论命中(修复前此处混入评论)",
+          len(res_d_t.get("results", [])) >= 1
+          and all(h.get("hit_type") == "thread" for h in res_d_t.get("results", [])),
+          str([h.get("hit_type") for h in res_d_t.get("results", [])]))
+    check("①h-2 双族同词 hit_type=comment ⇒ 零线程命中",
+          len(res_d_c.get("results", [])) >= 1
+          and all(h.get("hit_type") == "comment" for h in res_d_c.get("results", [])),
+          str([h.get("hit_type") for h in res_d_c.get("results", [])]))
+    check("①h-3 双族同词 hit_type=all ⇒ 两族都在(夹具本身有效)",
+          len(res_d_a.get("results", [])) >= 2
+          and {h.get("hit_type") for h in res_d_a.get("results", [])} == {"thread", "comment"},
+          str(sorted({h.get("hit_type") for h in res_d_a.get("results", [])})))
+    check("①h-4 第 7 钉:非 all ⇒ 结果集 hit_type 全等(命中集合面,dsh #2798 §2)",
+          all(h.get("hit_type") == "thread" for h in res_d_t.get("results", []))
+          and all(h.get("hit_type") == "comment" for h in res_d_c.get("results", [])))
+    check("①h-5 thread 请求 total_count==len(results)(无恒真假截断,dsh #2798 §3)",
+          res_d_t.get("total_count") == len(res_d_t.get("results", []))
+          and res_d_t.get("results_truncated") is False,
+          f"total={res_d_t.get('total_count')} ret={len(res_d_t.get('results', []))}")
+    # ①i 超限面(GPT 外审 PR#65): thread 命中>limit 时 total 曾=len(trows)(被 LIMIT
+    # 封顶少计)且 truncated=false——修复后线程面单独精确 COUNT,total=真实命中数。
+    out3 = srv.create_thread(title="overlimit-3f7d alpha third", author="anna")
+    assert out3.startswith("Created"), out3
+    out4 = srv.create_thread(title="overlimit-3f7d beta fourth", author="anna")
+    assert out4.startswith("Created"), out4
+    out5 = srv.create_thread(title="overlimit-3f7d gamma fifth", author="anna")
+    assert out5.startswith("Created"), out5
+    res_o = json.loads(srv.search_comments(terms=["overlimit-3f7d"], hit_type="thread",
+                                           limit=2))
+    check("①i-1 线程命中>limit ⇒ total_count=真实命中数 3(非 LIMIT 封顶的 2)",
+          res_o.get("total_count") == 3, f"total={res_o.get('total_count')}")
+    check("①i-2 超限时 truncated=True(如实告知有截断)",
+          res_o.get("results_truncated") is True
+          and len(res_o.get("results", [])) == 2,
+          f"truncated={res_o.get('results_truncated')} ret={len(res_o.get('results', []))}")
+    check("①i-3 超限面结果集仍全 thread(第 7 钉在超限下不破)",
+          all(h.get("hit_type") == "thread" for h in res_o.get("results", [])))
     r = srv.search_comments(terms=["x"], hit_type="bogus")
     check("①g 非法枚举显式错", "hit_type must be all|comment|thread" in r, r[:120])
 

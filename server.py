@@ -5197,50 +5197,55 @@ def search_comments(
         # (#2365 §2 — never inside _search_snippet, called up to 150×/query);
         # loader failure = empty set + diag, the face still answers ok.
         registry, _mask_diag = _load_credential_registry(conn)
-        base_sql = (
-            f"SELECT c.id, c.thread_id, c.author, c.body, c.created_at,"
-            f" c.cost_tokens,"
-            f" th.title AS th_title, th.status AS th_status, {rank_sel}"
-            f" FROM {fts_from}{threads_join} WHERE {where_sql}")
-        total = conn.execute(
-            f"SELECT COUNT(*) FROM {fts_from}{threads_join} WHERE {where_sql}",
-            params).fetchone()[0]
-        rows = conn.execute(
-            base_sql + f" ORDER BY {order} LIMIT ?", params + [limit]).fetchall()
+        # DEBT #42(opencode board #123 #2795 §2): hit_type="thread" 时评论面(COUNT+行+循环)整体跳过——
+        # 旧码只门线程分支、评论面无条件执行 ⇒ thread 请求返回评论命中(与 all 逐字段同值);
+        # 且 total 把将被过滤的评论计入 ⇒ results_truncated 塌成恒真假信号。门提到计数行之上(dsh #2798 §3)。
         results = []
-        for r in rows:
-            # Two simple neighbor queries (a parenthesized UNION ALL compound
-            # is a syntax error on SQLite < 3.41 — version-proof beats clever).
-            ctx_rows = conn.execute(
-                "SELECT id, author, body FROM comments"
-                " WHERE thread_id=? AND (created_at, id) < (?, ?)"
-                " ORDER BY created_at DESC, id DESC LIMIT 1",
-                (r["thread_id"], r["created_at"], r["id"]),
-            ).fetchall() + conn.execute(
-                "SELECT id, author, body FROM comments"
-                " WHERE thread_id=? AND (created_at, id) > (?, ?)"
-                " ORDER BY created_at ASC, id ASC LIMIT 1",
-                (r["thread_id"], r["created_at"], r["id"]),
-            ).fetchall()
-            ctx = sorted(ctx_rows, key=lambda n: n["id"])
-            results.append({
-                "hit_type": "comment",
-                "comment_id": r["id"],
-                "thread_id": r["thread_id"],
-                "thread_title": _mask_credential_text(r["th_title"] or "", registry),
-                "thread_status": r["th_status"],
-                "author": r["author"],
-                "timestamp": r["created_at"],
-                "cost_tokens": r["cost_tokens"],
-                "snippet": _search_snippet(r["body"], terms, SEARCH_SNIPPET_CAP, registry),
-                "rank": r["rank"],
-                "is_self": bool(author and r["author"] == author),
-                "context": [
-                    {"comment_id": n["id"], "author": n["author"],
-                     "snippet": _search_snippet(n["body"], terms, SEARCH_CONTEXT_CAP, registry)}
-                    for n in ctx
-                ],
-            })
+        total = 0
+        if hit_type in ("all", "comment"):
+            base_sql = (
+                f"SELECT c.id, c.thread_id, c.author, c.body, c.created_at,"
+                f" c.cost_tokens,"
+                f" th.title AS th_title, th.status AS th_status, {rank_sel}"
+                f" FROM {fts_from}{threads_join} WHERE {where_sql}")
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM {fts_from}{threads_join} WHERE {where_sql}",
+                params).fetchone()[0]
+            rows = conn.execute(
+                base_sql + f" ORDER BY {order} LIMIT ?", params + [limit]).fetchall()
+            for r in rows:
+                # Two simple neighbor queries (a parenthesized UNION ALL compound
+                # is a syntax error on SQLite < 3.41 — version-proof beats clever).
+                ctx_rows = conn.execute(
+                    "SELECT id, author, body FROM comments"
+                    " WHERE thread_id=? AND (created_at, id) < (?, ?)"
+                    " ORDER BY created_at DESC, id DESC LIMIT 1",
+                    (r["thread_id"], r["created_at"], r["id"]),
+                ).fetchall() + conn.execute(
+                    "SELECT id, author, body FROM comments"
+                    " WHERE thread_id=? AND (created_at, id) > (?, ?)"
+                    " ORDER BY created_at ASC, id ASC LIMIT 1",
+                    (r["thread_id"], r["created_at"], r["id"]),
+                ).fetchall()
+                ctx = sorted(ctx_rows, key=lambda n: n["id"])
+                results.append({
+                    "hit_type": "comment",
+                    "comment_id": r["id"],
+                    "thread_id": r["thread_id"],
+                    "thread_title": _mask_credential_text(r["th_title"] or "", registry),
+                    "thread_status": r["th_status"],
+                    "author": r["author"],
+                    "timestamp": r["created_at"],
+                    "cost_tokens": r["cost_tokens"],
+                    "snippet": _search_snippet(r["body"], terms, SEARCH_SNIPPET_CAP, registry),
+                    "rank": r["rank"],
+                    "is_self": bool(author and r["author"] == author),
+                    "context": [
+                        {"comment_id": n["id"], "author": n["author"],
+                         "snippet": _search_snippet(n["body"], terms, SEARCH_CONTEXT_CAP, registry)}
+                        for n in ctx
+                    ],
+                })
         # 票6 ①/#74 §1① thread-hit branch (try-body level — NOT inside the
         # comment loop; 0 comment hits must still yield thread hits):
         # threads_fts MATCH (FTS routes) or LIKE (like_scan); severity_filter
@@ -5287,7 +5292,12 @@ def search_comments(
                     "is_self": False,
                     "context": [],
                 })
-            total += len(trows)
+            # GPT 外审(PR#65): total+=len(trows) 受 LIMIT 封顶——线程命中>limit 时
+            # total 少计且 truncated=false(用户被告知无截断)。线程面单独精确 COUNT
+            # (同 WHERE 同参,不带 LIMIT),与评论面 COUNT 对称。
+            total += conn.execute(
+                f"SELECT COUNT(*) FROM threads t WHERE {t_where_sql}",
+                t_params).fetchone()[0]
         return payload("ok", route, results, total=total)
     except sqlite3.Error as e:
         if time.monotonic() >= deadline:
