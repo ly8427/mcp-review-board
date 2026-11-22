@@ -46,14 +46,32 @@ class ResolveWatcherGatesTest(unittest.TestCase):
     def test_disk_file_overrides_single_member(self):
         f = self._write("gates.json", json.dumps({"pi": "/custom/pi-kit.fails"}))
         gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file=f, gates_json="{}")
-        self.assertEqual(gates["pi"], "/custom/pi-kit.fails")  # 覆盖生效
+        self.assertEqual(gates["pi"], os.path.normpath("/custom/pi-kit.fails"))  # 覆盖生效
         self.assertEqual(gates["dsh"], os.path.join(self.tmp, "rb-dsh-watcher.fails"))  # 其余保持默认
         self.assertEqual(gates["zcode"], os.path.join(self.tmp, "rb-zcode-watcher.fails"))
+
+    def test_disk_file_tilde_paths_expanded(self):
+        # Bugbot(PR#59 二轮): JSON 成员路径的 ~ 必须展开成用户主目录——文档写
+        # ~/.rb-wake/... 形态,不展开则按字面打开=静默退 %TEMP% 旧路径。
+        import os as _os
+        f = self._write("tilde.json", json.dumps({"pi": "~/.rb-wake/pi-kit.fails"}))
+        gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file=f, gates_json="{}")
+        self.assertEqual(gates["pi"],
+                         os.path.normpath(
+                             _os.path.join(_os.path.expanduser("~"), ".rb-wake", "pi-kit.fails")))
+
+    def test_env_json_tilde_paths_expanded(self):
+        import os as _os
+        gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file="",
+                                         gates_json=json.dumps({"pi": "~/wake/pi.fails"}))
+        self.assertEqual(gates["pi"],
+                         os.path.normpath(
+                             _os.path.join(_os.path.expanduser("~"), "wake", "pi.fails")))
 
     def test_disk_file_can_add_member(self):
         f = self._write("gates.json", json.dumps({"grok": "/w/grok.fails"}))
         gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file=f, gates_json="{}")
-        self.assertEqual(gates["grok"], "/w/grok.fails")
+        self.assertEqual(gates["grok"], os.path.normpath("/w/grok.fails"))
         self.assertEqual(len(gates), 5)
 
     def test_missing_file_falls_back_to_defaults(self):
@@ -91,7 +109,11 @@ class ResolveWatcherGatesTest(unittest.TestCase):
         import contextlib, io as _io
         from unittest import mock
         buf = _io.StringIO()
-        with mock.patch("os.path.expanduser", return_value=self.tmp):
+        # side_effect 只映射 ~ 开头的路径;无条件 return_value 会把第二轮
+        # expanduser(gates_file)(Bugbot 二轮新增)也劫持成目录本身。
+        with mock.patch("os.path.expanduser",
+                        side_effect=lambda p: (p.replace("~", self.tmp, 1)
+                                               if p and p.startswith("~") else p)):
             with contextlib.redirect_stderr(buf):
                 saved = os.environ.pop("RB_WATCHER_GATES_FILE", None)
                 try:
@@ -112,19 +134,77 @@ class ResolveWatcherGatesTest(unittest.TestCase):
         try:
             os.environ["RB_WATCHER_GATES_FILE"] = f
             gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_json="{}")
-            self.assertEqual(gates["pi"], "/via-env-file/pi.fails")
+            self.assertEqual(gates["pi"], os.path.normpath("/via-env-file/pi.fails"))
         finally:
             if saved is None:
                 os.environ.pop("RB_WATCHER_GATES_FILE", None)
             else:
                 os.environ["RB_WATCHER_GATES_FILE"] = saved
 
+    def test_env_gates_file_tilde_path_expanded_and_read(self):
+        # 用户建议(PR#66): RB_WATCHER_GATES_FILE=~/.rb-wake/watcher-gates.json 是文档
+        # 默认形态——env 值里的 ~ 必须展开成真实主目录,且该文件内容被真实读取;
+        # 若此断链,文档化配置会静默退回内建默认而不报错。
+        import os as _os
+        import shutil as _shutil
+        marker_dir = _os.path.join(_os.path.expanduser("~"),
+                                   f".qg-selftest-{_os.getpid()}")
+        gates_path = _os.path.join(marker_dir, "watcher-gates.json")
+        saved = _os.environ.get("RB_WATCHER_GATES_FILE")
+        try:
+            _os.makedirs(marker_dir, exist_ok=True)
+            with open(gates_path, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"pi": "/from-tilde-env-file/pi.fails"}))
+            _os.environ["RB_WATCHER_GATES_FILE"] = _os.path.join(
+                "~", _os.path.basename(marker_dir), "watcher-gates.json")
+            gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_json="{}")
+            self.assertEqual(gates["pi"],
+                             os.path.normpath("/from-tilde-env-file/pi.fails"))  # 内容被读取
+            self.assertEqual(gates["dsh"],
+                             os.path.join(self.tmp, "rb-dsh-watcher.fails"))  # 其余保持默认
+        finally:
+            if saved is None:
+                _os.environ.pop("RB_WATCHER_GATES_FILE", None)
+            else:
+                _os.environ["RB_WATCHER_GATES_FILE"] = saved
+            _shutil.rmtree(marker_dir, ignore_errors=True)
+
+    def test_env_gates_file_literal_default_tilde_form_read(self):
+        # 用户建议二式(PR#66): 文档默认字面形态 RB_WATCHER_GATES_FILE=~/.rb-wake/watcher-gates.json
+        # ——把 HOME/USERPROFILE 指到临时目录,使 expanduser("~") 落在沙箱内,
+        # 从而端到端验证字面默认路径,且不触碰真实 ~/.rb-wake/(本机该文件是活配置)。
+        import os as _os
+        import shutil as _shutil
+        sandbox = tempfile.mkdtemp(prefix="qg-home-")
+        wake_dir = _os.path.join(sandbox, ".rb-wake")
+        gates_path = _os.path.join(wake_dir, "watcher-gates.json")
+        saved = {k: _os.environ.get(k) for k in ("HOME", "USERPROFILE", "RB_WATCHER_GATES_FILE")}
+        try:
+            _os.makedirs(wake_dir, exist_ok=True)
+            with open(gates_path, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"dsh": "/literal-default-form/dsh.fails"}))
+            _os.environ["HOME"] = sandbox
+            _os.environ["USERPROFILE"] = sandbox
+            _os.environ["RB_WATCHER_GATES_FILE"] = "~/.rb-wake/watcher-gates.json"
+            gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_json="{}")
+            self.assertEqual(gates["dsh"],
+                             os.path.normpath("/literal-default-form/dsh.fails"))  # 字面默认路径被展开并读取
+            self.assertEqual(gates["pi"],
+                             os.path.join(self.tmp, "rb-pi-watcher.fails"))  # 其余保持默认
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    _os.environ.pop(k, None)
+                else:
+                    _os.environ[k] = v
+            _shutil.rmtree(sandbox, ignore_errors=True)
+
     # ---------- env JSON（最高优先） ----------
     def test_env_json_wins_over_disk_file(self):
         f = self._write("gates.json", json.dumps({"pi": "/disk/pi.fails"}))
         gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file=f,
                                          gates_json=json.dumps({"pi": "/env/pi.fails"}))
-        self.assertEqual(gates["pi"], "/env/pi.fails")
+        self.assertEqual(gates["pi"], os.path.normpath("/env/pi.fails"))
 
     def test_corrupt_env_json_ignored_no_throw(self):
         gates = qg.resolve_watcher_gates(gate_dir=self.tmp, gates_file="",
